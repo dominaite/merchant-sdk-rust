@@ -219,10 +219,14 @@ impl Client {
                 session.raw = checkout.clone();
                 Ok(session)
             }
+            // A replay refusal names the transaction the key collided with. Carry
+            // it so the caller can reconcile with get_status instead of minting a
+            // second payment for the same order.
             _ => Err(Error::refusal(
                 string_field(&payload, "errorCode").unwrap_or_else(|| "UNKNOWN".to_string()),
                 string_field(&payload, "errorMessage")
                     .unwrap_or_else(|| "The checkout session was refused.".to_string()),
+                string_field(&payload, "transactionId"),
             )),
         }
     }

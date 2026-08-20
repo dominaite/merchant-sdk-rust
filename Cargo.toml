@@ -1,6 +1,6 @@
 [package]
 name = "dominaite"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.85"
 description = "Server-side Rust client for the Dominaite merchant API (hosted checkout sessions)."

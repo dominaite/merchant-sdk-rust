@@ -247,7 +247,12 @@ if status.is_paid() { /* fulfil the order */ }
 `dominaite::status` constants). **`succeeded` is the only value that means the customer paid** -
 that is what `is_paid()` answers. `is_terminal()` tells you whether to stop polling, and reports
 a status it does not recognise as NOT terminal, so a value the API adds later makes you keep
-polling instead of closing an open order.
+polling instead of closing an open order. Keep polling on `pending`, `processing` and
+`requires_capture` - none of them is terminal.
+
+`requires_capture` is **not** "unpaid": the payer has already paid and the funds are held
+awaiting capture, which is why `is_paid()` (settled) and `is_terminal()` (finished) both answer
+false for it. Never treat it as an abandoned order.
 
 There is no merchant webhook yet: confirm payment by calling this from your server until it
 reads terminal. Poll after the payer returns to you, or on your order timeout - not in a tight
@@ -279,6 +284,24 @@ Refusal codes on `Error::Refusal`:
 - `IDEMPOTENCY_KEY_REUSED` - same key sent with a different body; use a fresh key.
 
 All five arrive as HTTP 200 with `success: false`, not as an HTTP error status.
+
+### Recovering from a replay refusal
+
+When your idempotency key collides with an earlier attempt, the refusal names the transaction it
+collided with, so you can reconcile instead of minting a second payment:
+
+```rust
+match client.create_checkout_session(&request) {
+    Err(Error::Refusal { transaction_id: Some(id), .. }) => {
+        let status = client.get_status(&id)?;
+        // Now you know what the earlier attempt actually did.
+    }
+    other => { /* ... */ }
+}
+```
+
+`transaction_id` is `None` when the API did not name one (a concurrent-race `DUPLICATE_REQUEST`
+knows the key is taken but not yet by which row), so match on `Some` rather than unwrapping.
 
 ## The three identifiers
 

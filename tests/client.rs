@@ -317,6 +317,52 @@ fn retry_gives_up_and_returns_the_transport_error() {
     assert_eq!(server.requests().len(), 2);
 }
 
+/// Without the transaction id on the refusal, the documented recovery - read it
+/// back with `get_status` - is unreachable from the error, leaving a second
+/// payment as the caller's only option.
+#[test]
+fn a_replay_refusal_carries_the_transaction_id_for_recovery() {
+    let transaction_id = "11111111-2222-4333-8444-555555555555";
+    let server = MockServer::start(vec![Reply::enveloped(&format!(
+        r#"{{"success":false,"transactionId":"{transaction_id}","errorCode":"DUPLICATE_REQUEST","errorMessage":"already open"}}"#
+    ))]);
+
+    let error = client_for(&server)
+        .create_checkout_session(&request())
+        .expect_err("refused");
+
+    match error {
+        Error::Refusal {
+            code,
+            transaction_id: Some(id),
+            ..
+        } => {
+            assert_eq!(code, "DUPLICATE_REQUEST");
+            assert_eq!(id, transaction_id);
+        }
+        other => panic!("expected a refusal carrying the transaction id, got {other}"),
+    }
+}
+
+/// The concurrent-race `DUPLICATE_REQUEST` knows the key is taken, but not yet by
+/// which row - so the id stays optional.
+#[test]
+fn a_refusal_without_a_transaction_id_leaves_it_none() {
+    let server = MockServer::start(vec![refusal("DUPLICATE_REQUEST")]);
+
+    let error = client_for(&server)
+        .create_checkout_session(&request())
+        .expect_err("refused");
+
+    assert!(matches!(
+        error,
+        Error::Refusal {
+            transaction_id: None,
+            ..
+        }
+    ));
+}
+
 #[test]
 fn retry_never_repeats_a_refusal_or_an_auth_failure() {
     let options = RetryOptions {
