@@ -266,6 +266,10 @@ impl CheckoutStatus {
     /// True only for `succeeded`. `refunded` and `partially_refunded` mean the
     /// customer paid and was then (partly) returned, which is a different
     /// question - ask it explicitly if you need it.
+    ///
+    /// `requires_capture` is false here too, but it is NOT "unpaid": the payer
+    /// has already paid and the funds are held awaiting capture. Keep polling it
+    /// rather than treating it as an abandoned order.
     pub fn is_paid(&self) -> bool {
         self.status == status::SUCCEEDED
     }

@@ -31,6 +31,31 @@ pub enum Error {
         code: String,
         /// The human-readable reason from the API.
         message: String,
+        /// The payment this idempotency key collided with, when the API named
+        /// one. That is the recovery path for a replay refusal: read it back
+        /// with [`Client::get_status`](crate::Client::get_status) to find out
+        /// what the earlier attempt did, instead of minting a second payment
+        /// for the same order.
+        ///
+        /// `None` when the API did not name one - notably the concurrent-race
+        /// `DUPLICATE_REQUEST`, which knows a key was taken but not yet by
+        /// which row.
+        ///
+        /// ```no_run
+        /// # use dominaite::{Client, CheckoutSessionRequest, Error};
+        /// # fn main() -> Result<(), Error> {
+        /// # let client = Client::new("dmk_x", "dms_y")?;
+        /// # let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042");
+        /// match client.create_checkout_session(&request) {
+        ///     Err(Error::Refusal { transaction_id: Some(id), .. }) => {
+        ///         let status = client.get_status(&id)?;
+        ///     }
+        ///     _ => {}
+        /// }
+        /// # Ok(())
+        /// # }
+        /// ```
+        transaction_id: Option<String>,
     },
 
     /// The API rejected your credentials or signature (HTTP 401/403). Not
@@ -99,10 +124,15 @@ impl Error {
         }
     }
 
-    pub(crate) fn refusal(code: impl Into<String>, message: impl Into<String>) -> Error {
+    pub(crate) fn refusal(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        transaction_id: Option<String>,
+    ) -> Error {
         Error::Refusal {
             code: code.into(),
             message: message.into(),
+            transaction_id,
         }
     }
 
@@ -135,7 +165,9 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Validation { message } => write!(f, "invalid request: {message}"),
-            Error::Refusal { code, message } => write!(f, "checkout refused ({code}): {message}"),
+            Error::Refusal { code, message, .. } => {
+                write!(f, "checkout refused ({code}): {message}")
+            }
             Error::Auth { code, message } => {
                 write!(f, "authentication failed ({code}): {message}")
             }
