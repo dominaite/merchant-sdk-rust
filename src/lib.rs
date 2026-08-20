@@ -40,6 +40,7 @@ mod client;
 mod error;
 mod signing;
 mod types;
+mod webhooks;
 
 pub use client::{
     Client, ClientBuilder, RetryOptions, DEFAULT_BASE_URL, PING_PATH, SESSIONS_PATH, VERSION,
@@ -47,3 +48,4 @@ pub use client::{
 pub use error::{Error, Result};
 pub use signing::{sha256_hex, sign_request, SignRequest};
 pub use types::{status, CheckoutSession, CheckoutSessionRequest, CheckoutStatus, Customer, Ping};
+pub use webhooks::{verify_webhook, WebhookError, DEFAULT_TOLERANCE_SECS};
