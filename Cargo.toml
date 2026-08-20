@@ -1,0 +1,25 @@
+[package]
+name = "dominaite"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Server-side Rust client for the Dominaite merchant API (hosted checkout sessions)."
+repository = "https://github.com/dominaite/merchant-sdk-rust"
+license = "MIT"
+keywords = ["payments", "checkout", "dominaite"]
+categories = ["api-bindings"]
+readme = "README.md"
+
+[dependencies]
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# rustls: TLS with the ring provider and bundled webpki roots.
+# gzip: some proxies compress regardless of Accept-Encoding, and a raw gzip body
+# would surface as a confusing "non-JSON response".
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+
+[lints.rust]
+missing_docs = "warn"
