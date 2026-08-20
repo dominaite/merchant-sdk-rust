@@ -23,7 +23,7 @@ To work on the SDK itself:
 
 ```sh
 cd dominaite-rust-sdk
-cargo test          # includes both offline signing vectors
+cargo test          # includes the offline signing and webhook vectors
 cargo clippy -- -D warnings
 ```
 
@@ -131,9 +131,6 @@ The launcher renders the form where the script tag sits, so keep the script insi
 container. `cashier_key` and `cashier_token` are per-payment session values, not credentials -
 but HTML-escape them when you template them into the page.
 
-That's the whole integration: the session call, the script tag, and your domain bound to your
-checkout by Dominaite during onboarding.
-
 A runnable version of the above is in `examples/create_session.rs`, using the same three
 environment variables:
 
@@ -141,12 +138,32 @@ environment variables:
 cargo run --example create_session
 ```
 
+### Then find out whether it got paid
+
+Opening the session is half the integration. The widget runs in your customer's browser, so
+your server does not learn the outcome from the call above - something has to tell it.
+
+Register a webhook endpoint, verify every delivery with `verify_webhook`, and fulfil the order
+when `payment.succeeded` arrives. See [Webhooks](#webhooks) for the endpoint setup, the
+signature check and the delivery rules. If you cannot receive inbound requests yet, poll
+`get_status` instead and move to webhooks when you can.
+
+Either way, keep a reconciliation sweep. Webhooks are the fast path, not the guarantee.
+
+So the whole integration is four pieces: the session call, the script tag, verified webhooks
+for confirmation, and your domain bound to your checkout by Dominaite during onboarding.
+
 ## Verify your signing before your first live call
 
 Run `cargo test` before you touch the live API. The SDK signs for you, but the recipe is pinned
 by two offline known-answer vectors shared with the gateway and the dashboard, and the suite
 reproduces both byte-for-byte. If either fails, nothing else matters - every live call will come
 back `INVALID_SIGNATURE`.
+
+`tests/webhooks.rs` pins the other direction the same way: the canonical cross-SDK webhook
+vector, plus a tampered body, a wrong secret, a stale timestamp and a batch of malformed
+headers. That vector is byte-identical across every Dominaite SDK, so a failure there means
+your build disagrees with the gateway about the scheme itself.
 
 `sign_request` is public so you can pin the recipe in your own suite, or debug an
 `INVALID_SIGNATURE` without reading this crate's source:
@@ -235,7 +252,105 @@ A session is valid for about 2 hours. If the payer comes back later, create a ne
 re-rendering the widget for a stored session, read the status first: a completed session's
 widget shows "session is closed or expired", which reads as an error to someone who just paid.
 
-## Status polling
+## Webhooks
+
+Webhooks are how you find out a payment succeeded without asking. Point an endpoint at your
+server on the dashboard's **Webhooks** tab, pick the events you care about, and store the
+`whsec_...` secret it shows you - it is shown exactly once, and regenerating it kills the old
+one.
+
+**Verify the signature before you parse the body.** An unverified webhook is an
+unauthenticated stranger POSTing JSON at your server.
+
+```rust
+use dominaite::{verify_webhook, WebhookError, DEFAULT_TOLERANCE_SECS};
+
+// `body` must be the RAW request body, byte for byte as received.
+match verify_webhook(body, signature_header, &secret, DEFAULT_TOLERANCE_SECS, None) {
+    Ok(()) => {
+        let event: serde_json::Value = serde_json::from_str(body)?;
+        // Dedupe on event["id"], enqueue the work, then answer 2xx.
+    }
+    Err(WebhookError::TimestampOutOfTolerance { .. }) => { /* replay, or your clock drifted */ }
+    Err(_) => { /* wrong secret, or the body was modified in flight */ }
+}
+```
+
+The arguments are `(payload, signature_header, secret, tolerance_secs, now)`. `now` is
+`Option<u64>` unix seconds for tests and pinned vectors; pass `None` in a real handler to read
+the system clock. The MAC comparison is constant-time, and it runs before the timestamp check
+so an unsigned request learns nothing about your tolerance window.
+
+The signature arrives in `X-Webhook-Signature` as `t={unix_seconds},v1={lowercase_hex}`: an
+HMAC-SHA256 over `"{t}.{raw_body}"` keyed with the UTF-8 bytes of your `whsec_` secret. The
+default tolerance is 300 seconds, which matches the server.
+
+Getting the raw body is the part frameworks get wrong. If your handler hands you a parsed
+struct and you re-serialize it to verify, key order or whitespace will differ and every
+delivery will fail as `SignatureMismatch`. Read the bytes before any JSON layer touches them.
+
+### The envelope
+
+Flat JSON, no `success` wrapper - do not branch on a `success` field, there isn't one.
+
+```json
+{
+  "id": "<delivery id - your dedupe key>",
+  "type": "payment.succeeded",
+  "createdAt": "<ISO 8601 UTC instant of the transition>",
+  "data": {
+    "transactionId": "...",
+    "status": "succeeded",
+    "previousStatus": "pending",
+    "kind": "sale",
+    "amount": 8440,
+    "grossAmount": 8701,
+    "surchargeAmount": 261,
+    "currency": "EUR",
+    "originalTransactionId": null,
+    "idempotencyKey": "order-123"
+  }
+}
+```
+
+Amounts are minor units. On `payment.*` events `amount` is what you are PAID (base), while
+`grossAmount` is the card movement; on `payment.refunded` the `amount` is what went back to the
+customer. `surchargeAmount`, `previousStatus`, `kind` and `originalTransactionId` are nullable.
+
+### Events
+
+`payment.succeeded`, `payment.failed`, `payment.requires_capture`, `payment.cancelled`,
+`payment.abandoned`, `payment.refunded`, `payment.disputed`. That is the whole set, exact case;
+registering anything else is rejected.
+
+`payment.succeeded` is the only signal that means money is in hand. `requires_capture` includes
+approved pre-auth holds, `cancelled` is a pre-completion void only, `abandoned` is the sweep's
+verdict on a checkout that was never paid, and `refunded` fires once per refund from the refund
+ledger row rather than from the parent flipping status. `pending` and `processing` are not
+webhooked at all - poll session status if you want in-flight UX.
+
+### Delivery
+
+Delivery is **at-least-once**, so the same event can arrive twice and you must dedupe on `id`.
+Respond 2xx quickly and queue the work; doing it inline is how you end up timing out and
+collecting retries you did not want.
+
+Failed deliveries are retried up to your endpoint's `RetryCount` (default 3, max 10, 0 disables)
+spaced 1m / 5m / 30m / 2h / 12h. An endpoint whose initial attempt and every configured retry
+fail consecutively is auto-disabled; a later successful delivery re-enables it. Disabling an
+endpoint yourself in the dashboard is never overridden. You get at most 25 active endpoints.
+
+### Reconciliation is still mandatory
+
+Webhooks complement your reconciliation sweep, they do not replace it. There are real loss
+windows - there is no publish outbox, and chains parked on a disabled endpoint stay parked - so
+keep a periodic sweep that reads status for orders you believe are unpaid and settles the
+difference. Treat webhooks as the fast path and the sweep as the source of truth.
+
+## Status polling (fallback)
+
+Use this when you cannot receive webhooks - local development with no public URL, or a network
+that will not accept inbound requests - and as the read side of the reconciliation sweep above.
 
 ```rust
 let status = client.get_status(&session.transaction_id)?;
@@ -254,9 +369,8 @@ polling instead of closing an open order. Keep polling on `pending`, `processing
 awaiting capture, which is why `is_paid()` (settled) and `is_terminal()` (finished) both answer
 false for it. Never treat it as an abandoned order.
 
-There is no merchant webhook yet: confirm payment by calling this from your server until it
-reads terminal. Poll after the payer returns to you, or on your order timeout - not in a tight
-loop, the endpoint is rate limited per key.
+Call this from your server, never from the browser, and poll after the payer returns to you or
+on your order timeout - not in a tight loop, the endpoint is rate limited per key.
 
 Every response type also carries `raw` (a `serde_json::Value`) with the unparsed payload, for
 fields the structs do not model yet.
