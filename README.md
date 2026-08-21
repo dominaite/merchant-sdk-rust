@@ -281,9 +281,15 @@ The arguments are `(payload, signature_header, secret, tolerance_secs, now)`. `n
 the system clock. The MAC comparison is constant-time, and it runs before the timestamp check
 so an unsigned request learns nothing about your tolerance window.
 
-The signature arrives in `X-Webhook-Signature` as `t={unix_seconds},v1={lowercase_hex}`: an
+The signature arrives in `X-Webhook-Signature` as `t={digits},v1={64 lowercase hex}`: an
 HMAC-SHA256 over `"{t}.{raw_body}"` keyed with the UTF-8 bytes of your `whsec_` secret. The
 default tolerance is 300 seconds, which matches the server.
+
+The header grammar is closed, and anything outside it is a `MalformedSignature`: no
+whitespace anywhere, exactly one `t` and one `v1` (a repeat rejects the header even when one
+candidate carries a valid MAC), an element without `=` rejects, `t` is one or more raw ASCII
+digits fed verbatim into the signed string, and `v1` is exactly 64 lowercase hex characters.
+Unknown keys are ignored so a future `v2` can roll out alongside `v1`.
 
 Getting the raw body is the part frameworks get wrong. If your handler hands you a parsed
 struct and you re-serialize it to verify, key order or whitespace will differ and every
