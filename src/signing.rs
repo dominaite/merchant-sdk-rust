@@ -1,12 +1,16 @@
 //! The request signing recipe, exported so you can pin it against the offline vectors.
 
+use std::fmt;
+
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+
+use crate::client::REDACTED_SECRET;
 
 /// Everything that goes into one request signature.
 ///
 /// Borrowed strings: nothing here is stored, it is hashed and dropped.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct SignRequest<'a> {
     /// Your API secret (`dms_...`).
     pub secret: &'a str,
@@ -21,6 +25,21 @@ pub struct SignRequest<'a> {
     pub idempotency_key: &'a str,
     /// The exact request body that will be sent. Empty string for GET.
     pub body: &'a str,
+}
+
+/// Hand-written so a debug-logged signing input cannot leak the secret. A derived
+/// one prints it verbatim.
+impl fmt::Debug for SignRequest<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SignRequest")
+            .field("secret", &REDACTED_SECRET)
+            .field("timestamp", &self.timestamp)
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("idempotency_key", &self.idempotency_key)
+            .field("body", &self.body)
+            .finish()
+    }
 }
 
 /// Builds the `X-Signature` value for one request: lowercase hex HMAC-SHA256 over

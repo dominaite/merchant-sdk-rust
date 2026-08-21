@@ -464,6 +464,39 @@ fn credentials_with_the_wrong_prefix_are_rejected_at_construction() {
     ));
 }
 
+/// Debug output ends up in logs, panics, and crash reporters. The secret must not
+/// travel with it.
+#[test]
+fn debug_output_never_carries_the_secret() {
+    let builder = Client::builder(KEY_ID, SECRET);
+    let client = Client::builder(KEY_ID, SECRET).build().expect("built");
+    let signing = SignRequest {
+        secret: SECRET,
+        timestamp: "1755302400",
+        method: "POST",
+        path: SESSIONS_PATH,
+        idempotency_key: "00000000-0000-4000-8000-000000000001",
+        body: "{}",
+    };
+
+    for (label, printed) in [
+        ("ClientBuilder", format!("{builder:?}")),
+        ("Client", format!("{client:?}")),
+        ("SignRequest", format!("{signing:?}")),
+    ] {
+        assert!(
+            !printed.contains(SECRET),
+            "{label} debug output leaks the secret: {printed}"
+        );
+        assert!(
+            printed.contains("redacted"),
+            "{label} debug output does not mark the secret as redacted: {printed}"
+        );
+        // The key id is not a secret, and losing it would make debug output useless.
+        assert!(printed.contains(KEY_ID) || label == "SignRequest", "{label}");
+    }
+}
+
 #[test]
 fn an_empty_base_url_keeps_the_production_default() {
     let client = Client::builder(KEY_ID, SECRET)

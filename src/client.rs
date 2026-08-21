@@ -1,5 +1,6 @@
 //! The client: signing, sending, and mapping responses onto the error taxonomy.
 
+use std::fmt;
 use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -44,8 +45,11 @@ impl Default for RetryOptions {
     }
 }
 
+/// What every `Debug` in this crate prints instead of the API secret.
+pub(crate) const REDACTED_SECRET: &str = "dms_***redacted***";
+
 /// Builds a [`Client`]. Start with [`Client::builder`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientBuilder {
     key_id: String,
     secret: String,
@@ -53,6 +57,21 @@ pub struct ClientBuilder {
     timeout: Duration,
     user_agent: Option<String>,
     agent: Option<ureq::Agent>,
+}
+
+/// Hand-written so a debug-logged builder cannot leak the secret. A derived one
+/// prints it verbatim.
+impl fmt::Debug for ClientBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientBuilder")
+            .field("key_id", &self.key_id)
+            .field("secret", &REDACTED_SECRET)
+            .field("base_url", &self.base_url)
+            .field("timeout", &self.timeout)
+            .field("user_agent", &self.user_agent)
+            .field("agent", &self.agent)
+            .finish()
+    }
 }
 
 impl ClientBuilder {
@@ -149,13 +168,27 @@ impl ClientBuilder {
 ///
 /// Cloning is cheap and shares the underlying connection pool, so one client per
 /// process is the normal shape.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Client {
     key_id: String,
     secret: String,
     base_url: String,
     user_agent: String,
     agent: ureq::Agent,
+}
+
+/// Hand-written so a debug-logged client cannot leak the secret. A derived one
+/// prints it verbatim.
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Client")
+            .field("key_id", &self.key_id)
+            .field("secret", &REDACTED_SECRET)
+            .field("base_url", &self.base_url)
+            .field("user_agent", &self.user_agent)
+            .field("agent", &self.agent)
+            .finish()
+    }
 }
 
 impl Client {
