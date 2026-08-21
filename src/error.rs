@@ -76,6 +76,14 @@ pub enum Error {
     Api {
         /// The HTTP status code.
         status: u16,
+        /// The machine-readable reason when the API sent one, e.g.
+        /// `IDEMPOTENCY_KEY_REQUIRED` on a 400. Input validation answers with a
+        /// code and a real status, unlike a business refusal, which is a 200
+        /// carrying [`Error::Refusal`]. Also on [`Error::code`].
+        ///
+        /// `None` for a response that carried no code, including the ones this
+        /// crate raises itself when a 200 body does not parse.
+        code: Option<String>,
         /// The human-readable reason.
         message: String,
     },
@@ -94,10 +102,12 @@ pub enum Error {
 impl Error {
     /// The machine-readable code, for the variants that carry one.
     ///
-    /// `Refusal` and `Auth` have codes; the rest return `None`.
+    /// `Refusal` and `Auth` always have one, `Api` has one when the API sent it;
+    /// the rest return `None`.
     pub fn code(&self) -> Option<&str> {
         match self {
             Error::Refusal { code, .. } | Error::Auth { code, .. } => Some(code),
+            Error::Api { code, .. } => code.as_deref(),
             _ => None,
         }
     }
@@ -143,9 +153,24 @@ impl Error {
         }
     }
 
+    /// An API error with no machine-readable code: the responses this crate
+    /// raises itself when a 200 body is not what the contract promises.
     pub(crate) fn api(status: u16, message: impl Into<String>) -> Error {
         Error::Api {
             status,
+            code: None,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn api_with_code(
+        status: u16,
+        code: Option<String>,
+        message: impl Into<String>,
+    ) -> Error {
+        Error::Api {
+            status,
+            code,
             message: message.into(),
         }
     }
@@ -171,7 +196,16 @@ impl fmt::Display for Error {
             Error::Auth { code, message } => {
                 write!(f, "authentication failed ({code}): {message}")
             }
-            Error::Api { status, message } => write!(f, "API error (HTTP {status}): {message}"),
+            Error::Api {
+                status,
+                code: Some(code),
+                message,
+            } => write!(f, "API error (HTTP {status}, {code}): {message}"),
+            Error::Api {
+                status, message, ..
+            } => {
+                write!(f, "API error (HTTP {status}): {message}")
+            }
             Error::Transport { message, .. } => write!(f, "transport error: {message}"),
         }
     }

@@ -386,7 +386,7 @@ string where there is one.
 | `Error::Refusal { code, .. }` | HTTP 200 with `success: false`. | Branch on `code`. Do not blind-retry. |
 | `Error::Auth { code, .. }` | 401/403. `code` is `INVALID_API_KEY`, `INVALID_SIGNATURE`, `TIMESTAMP_OUT_OF_RANGE`, or `IP_NOT_ALLOWED`. | Fix the key id, secret, server clock, or allowlist. Never retry-loop. |
 | `Error::Transport { .. }` | Network failure, timeout, or 5xx (`MERCHANT_API_UNAVAILABLE`). The cause is reachable through `source()`. | Retry with the **same** idempotency key. `error.is_retryable()` is true only here. |
-| `Error::Api { status, .. }` | Any other rejecting or unexpected response. | Inspect `status`. A 422 means an idempotency key was replayed with a different body - use a fresh key. A 404 from `get_status` is an unknown transaction id. |
+| `Error::Api { status, code, .. }` | Any other rejecting or unexpected response. `code` carries the API's machine-readable reason when it sent one, e.g. `IDEMPOTENCY_KEY_REQUIRED` on a 400. | Inspect `status` and `code`. A 422 means an idempotency key was replayed with a different body - use a fresh key. A 404 from `get_status` is an unknown transaction id. |
 | `Error::Validation { .. }` | Bad arguments (non-positive amount, missing field, malformed key id). | Fix the call; nothing was sent. |
 
 Refusal codes on `Error::Refusal`:
