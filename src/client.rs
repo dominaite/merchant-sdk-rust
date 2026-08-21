@@ -195,7 +195,8 @@ impl Client {
     /// - [`Error::Auth`]: wrong credentials, bad signature, clock off, IP not
     ///   allowlisted. Fix the config, do not retry.
     /// - [`Error::Refusal`]: the gateway refused the session; inspect `code`.
-    /// - [`Error::Api`]: an unexpected or rejecting response; inspect `status`.
+    /// - [`Error::Api`]: an unexpected or rejecting response; inspect `status`
+    ///   and `code`.
     /// - [`Error::Transport`]: network failure or 5xx. Safe to retry WITH the same
     ///   idempotency key, which is what [`Client::create_checkout_session_with_retry`]
     ///   does.
@@ -421,8 +422,12 @@ fn classify_status(status: u16, code: Option<String>, message: Option<String>) -
             ),
             None,
         ),
-        status => Error::api(
+        // The code is the whole point of a validation rejection
+        // (IDEMPOTENCY_KEY_REQUIRED on a 400), so it travels with the error
+        // instead of being flattened into a status the caller cannot branch on.
+        status => Error::api_with_code(
             status,
+            code,
             message.unwrap_or_else(|| "Request rejected".to_string()),
         ),
     }
