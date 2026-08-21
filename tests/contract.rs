@@ -7,9 +7,9 @@
 //!
 //! What this file asserts: the status vocabulary is exactly the fixture's, each
 //! response type deserializes the fixture's example, each type's serde field set
-//! is exactly the fixture's field list (no extra, none missing), and every
-//! documented session refusal code comes back out of the client as a refusal that
-//! keeps its code.
+//! is exactly the fixture's field list (no extra, none missing), every session
+//! refusal code comes back out of the client as a refusal that keeps its code,
+//! and every validation code comes back as a 400 that keeps its code.
 
 // Only part of the mock server is needed here; the client tests use the rest.
 #[allow(dead_code)]
@@ -308,12 +308,12 @@ fn the_refusal_example_comes_back_as_a_refusal_with_its_transaction() {
 #[test]
 fn every_contract_refusal_code_survives_as_a_refusal() {
     let codes = strings(&contract()["sessionRefusalErrorCodes"]);
-    assert!(!codes.is_empty(), "the contract lists refusal codes");
+    assert_eq!(codes.len(), 5, "the contract lists five refusal codes");
+    assert!(codes.contains(&"PRIOR_ATTEMPT_FAILED".to_string()));
 
-    // An unlisted code rides along: the gateway can add one (it already has
-    // PRIOR_ATTEMPT_FAILED, which this fixture version does not list), and an
-    // unknown code must still arrive as a refusal with its code intact rather
-    // than as a generic API error the caller cannot branch on.
+    // An unlisted code rides along too: the gateway can add one, and it must
+    // still arrive as a refusal with its code intact rather than as a generic
+    // API error the caller cannot branch on.
     for code in codes.iter().map(String::as_str).chain(["A_NEW_CODE"]) {
         let payload =
             format!(r#"{{"success":false,"errorCode":"{code}","errorMessage":"refused"}}"#);
@@ -329,5 +329,41 @@ fn every_contract_refusal_code_survives_as_a_refusal() {
 
         assert_eq!(error.code(), Some(code), "{code} did not survive");
         assert!(!error.is_retryable(), "{code} must never be blind-retried");
+        assert!(
+            matches!(error, Error::Refusal { .. }),
+            "{code} is a business refusal, got {error:?}"
+        );
+    }
+}
+
+/// Validation codes are the other half of the create endpoint's error surface,
+/// and they are a different shape: a real HTTP 400 rather than the 200 with
+/// `success: false` that carries a refusal. Both must stay machine-readable, and
+/// they must not collapse into each other - a caller that treats a rejected
+/// request as a refused payment would go looking for a transaction that was
+/// never created.
+#[test]
+fn every_contract_validation_code_survives_with_its_status() {
+    let codes = strings(&contract()["validationErrorCodes"]);
+    assert!(!codes.is_empty(), "the contract lists validation codes");
+
+    for code in codes.iter().map(String::as_str) {
+        let server = MockServer::start(vec![Reply::error_envelope(400, code, "rejected")]);
+
+        let error = client_for(&server)
+            .create_checkout_session(&dominaite::CheckoutSessionRequest::new(
+                8440,
+                "EUR",
+                "order-1042",
+            ))
+            .expect_err("a validation rejection is not a session");
+
+        assert_eq!(error.code(), Some(code), "{code} did not survive");
+        assert_eq!(error.http_status(), Some(400), "{code} lost its status");
+        assert!(!error.is_retryable(), "{code} will not fix itself");
+        assert!(
+            matches!(error, Error::Api { .. }),
+            "{code} is a rejected request, not a refused payment: got {error:?}"
+        );
     }
 }
