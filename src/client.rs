@@ -1,5 +1,6 @@
 //! The client: signing, sending, and mapping responses onto the error taxonomy.
 
+use std::fmt;
 use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -44,8 +45,13 @@ impl Default for RetryOptions {
     }
 }
 
+/// What every `Debug` in this crate prints instead of the API secret.
+pub(crate) const REDACTED_SECRET: &str = "dms_***redacted***";
+
 /// Builds a [`Client`]. Start with [`Client::builder`].
-#[derive(Debug, Clone)]
+// SECURITY: do not derive Serialize. The secret field would be emitted by any
+// serde-based logger, which is how the Go SDK leaked it through json.Marshal.
+#[derive(Clone)]
 pub struct ClientBuilder {
     key_id: String,
     secret: String,
@@ -53,6 +59,21 @@ pub struct ClientBuilder {
     timeout: Duration,
     user_agent: Option<String>,
     agent: Option<ureq::Agent>,
+}
+
+/// Hand-written so a debug-logged builder cannot leak the secret. A derived one
+/// prints it verbatim.
+impl fmt::Debug for ClientBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientBuilder")
+            .field("key_id", &self.key_id)
+            .field("secret", &REDACTED_SECRET)
+            .field("base_url", &self.base_url)
+            .field("timeout", &self.timeout)
+            .field("user_agent", &self.user_agent)
+            .field("agent", &self.agent)
+            .finish()
+    }
 }
 
 impl ClientBuilder {
@@ -92,6 +113,11 @@ impl ClientBuilder {
     /// Configure it with `http_status_as_error(false)` if you want the SDK to
     /// read error bodies; the SDK maps a status-as-error into the same taxonomy
     /// either way, just without the API's message.
+    ///
+    /// Redirects stay off whatever you pass: every request forces
+    /// `max_redirects(0)` on itself, because following one would send your signed
+    /// headers to a host you never authenticated. A `max_redirects` setting on
+    /// your agent is ignored.
     pub fn agent(mut self, agent: ureq::Agent) -> Self {
         self.agent = Some(agent);
         self
@@ -121,6 +147,11 @@ impl ClientBuilder {
                     .timeout_global(Some(self.timeout))
                     // Read the body on 4xx/5xx: the machine-readable code lives in it.
                     .http_status_as_error(false)
+                    // Never follow a redirect. The signed headers would travel to a
+                    // host we never authenticated, and its answer would be read as
+                    // the API's. With 0, ureq hands the 3xx back as a response
+                    // instead of erroring, and `request` turns it into an error.
+                    .max_redirects(0)
                     .build(),
             )
         });
@@ -139,13 +170,29 @@ impl ClientBuilder {
 ///
 /// Cloning is cheap and shares the underlying connection pool, so one client per
 /// process is the normal shape.
-#[derive(Debug, Clone)]
+// SECURITY: do not derive Serialize. The secret field would be emitted by any
+// serde-based logger, which is how the Go SDK leaked it through json.Marshal.
+#[derive(Clone)]
 pub struct Client {
     key_id: String,
     secret: String,
     base_url: String,
     user_agent: String,
     agent: ureq::Agent,
+}
+
+/// Hand-written so a debug-logged client cannot leak the secret. A derived one
+/// prints it verbatim.
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Client")
+            .field("key_id", &self.key_id)
+            .field("secret", &REDACTED_SECRET)
+            .field("base_url", &self.base_url)
+            .field("user_agent", &self.user_agent)
+            .field("agent", &self.agent)
+            .finish()
+    }
 }
 
 impl Client {
@@ -236,11 +283,18 @@ impl Client {
     /// idempotency key across every attempt.
     ///
     /// Reusing the key is what makes the retry safe. A transport failure leaves
-    /// you not knowing whether the request landed; the API returns the original
-    /// session for a key it has already seen instead of opening a second one.
-    /// Generating a fresh key per attempt would be exactly the double-charge bug
-    /// this method exists to prevent, so the key is pinned once before the first
-    /// attempt.
+    /// you not knowing whether the request landed; a key the API has already seen
+    /// never opens a second session. Generating a fresh key per attempt would be
+    /// exactly the double-charge bug this method exists to prevent, so the key is
+    /// pinned once before the first attempt.
+    ///
+    /// What a replayed key gets back is a refusal, not the original session: the
+    /// API answers HTTP 200 with `success: false` and one of the replay codes
+    /// ([`Error::Refusal`] with `DUPLICATE_REQUEST`, `ALREADY_PROCESSED`,
+    /// `PRIOR_ATTEMPT_FAILED` or `IDEMPOTENCY_KEY_REUSED`). The first attempt's
+    /// cashier key and token are not returned again. When the refusal names a
+    /// transaction id, read it back with [`Client::get_status`] to find out what
+    /// the earlier attempt did.
     ///
     /// Refusals and authentication failures are returned immediately. They will
     /// not change on a retry.
@@ -342,6 +396,16 @@ impl Client {
             .body(body)
             .map_err(|error| Error::validation(format!("Could not build the request: {error}")))?;
 
+        // Forced per request, so it holds for an agent supplied through
+        // ClientBuilder::agent as well - ureq's own default is ten redirects, and
+        // a caller's agent never saw this crate's config. Request-level config
+        // overrides the agent's.
+        let http_request = self
+            .agent
+            .configure_request(http_request)
+            .max_redirects(0)
+            .build();
+
         let mut response = match self.agent.run(http_request) {
             Ok(response) => response,
             // An agent configured with http_status_as_error(true) - a caller's own
@@ -359,6 +423,12 @@ impl Client {
         };
 
         let http_status = response.status().as_u16();
+        // Stop before reading the body: a redirect's body is whatever the
+        // redirecting host wanted to say, and none of it is an API response.
+        if is_redirect(http_status) {
+            return Err(redirect_error(http_status));
+        }
+
         let raw = response.body_mut().read_to_string().map_err(|error| {
             Error::transport(
                 format!("Could not read the Dominaite API response: {error}"),
@@ -408,7 +478,27 @@ fn unwrap_envelope(http_status: u16, raw: &str) -> Result<Value> {
     Err(classify_status(http_status, code, message))
 }
 
+fn is_redirect(status: u16) -> bool {
+    (300..400).contains(&status)
+}
+
+/// A 3xx is a hard stop, never a retry. The Dominaite API does not redirect, so
+/// something else is answering for it, and whatever is at the other end would be
+/// handed the signed headers and believed.
+fn redirect_error(status: u16) -> Error {
+    Error::api(
+        status,
+        "unexpected redirect response; the Dominaite API never redirects",
+    )
+}
+
 fn classify_status(status: u16, code: Option<String>, message: Option<String>) -> Error {
+    // Defence in depth only. ureq does not surface a 3xx as a StatusCode error,
+    // it follows it - what actually stops a redirect is the per-request
+    // max_redirects(0) in `request`.
+    if is_redirect(status) {
+        return redirect_error(status);
+    }
     match status {
         401 | 403 => Error::auth(
             code.unwrap_or_else(|| "UNAUTHORIZED".to_string()),

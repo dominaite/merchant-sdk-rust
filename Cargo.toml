@@ -21,5 +21,9 @@ serde_json = "1"
 # would surface as a confusing "non-JSON response".
 ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
 
+[dev-dependencies]
+# The tests build a caller-supplied agent, which is public API surface.
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+
 [lints.rust]
 missing_docs = "warn"

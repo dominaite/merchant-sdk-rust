@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 pub enum Reply {
     /// A JSON response with this status.
     Json(u16, String),
+    /// A 3xx pointing at `location`, for proving the client does not follow it.
+    Redirect(u16, String),
     /// Accept the connection and hang up without answering, which is what a
     /// network failure looks like to the client.
     HangUp,
@@ -145,6 +147,14 @@ fn serve_one(mut stream: TcpStream, reply: Reply, recorder: &Arc<Mutex<Vec<Recor
 
     match reply {
         Reply::HangUp => {}
+        Reply::Redirect(status, location) => {
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                reason = reason_phrase(status),
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
         Reply::Json(status, payload) => {
             let response = format!(
                 "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{payload}",
@@ -160,6 +170,8 @@ fn serve_one(mut stream: TcpStream, reply: Reply, recorder: &Arc<Mutex<Vec<Recor
 fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        302 => "Found",
+        307 => "Temporary Redirect",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
