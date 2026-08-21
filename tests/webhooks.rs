@@ -5,10 +5,10 @@
 //! signs the deliveries. Do NOT reformat the body - it is signed byte for byte,
 //! and re-indenting it silently changes what is being tested.
 //!
-//! The five cases are the contract: the vector verifies, a tampered body fails,
-//! a wrong secret fails, an out-of-tolerance timestamp fails even with a good
-//! MAC, and malformed headers fail as `MalformedSignature` rather than by
-//! panicking.
+//! The cases are the contract: the vector verifies, a tampered body fails, a
+//! wrong secret fails, an out-of-tolerance timestamp fails even with a good MAC,
+//! and every header outside the grammar fails as `MalformedSignature` rather
+//! than by panicking. The ten shared header vectors live here too.
 
 use dominaite::{verify_webhook, WebhookError, DEFAULT_TOLERANCE_SECS};
 
@@ -117,6 +117,70 @@ fn unknown_fields_are_ignored_so_a_v2_rollout_does_not_break_v1() {
     let header = format!("{HEADER},v2=deadbeef");
 
     assert_eq!(verify_at(BODY, &header, SECRET, NOW), Ok(()));
+}
+
+/// The ten header vectors from WEBHOOKS-CONTRACT.md, pinned in every SDK suite.
+/// They exist because the five verifiers had drifted apart on exactly these
+/// shapes (audit A7); keep them byte-identical across the SDKs.
+#[test]
+fn the_shared_malformed_header_vectors_all_fail() {
+    let mac = "5305bcf1302fdaba8f8c19a20c899e916fb4d2a7d8d547c62529ff87c4697b72";
+    let upper = mac.to_uppercase();
+
+    let cases = [
+        (1, format!("t={TIMESTAMP}")),
+        (2, format!("v1={mac}")),
+        (3, format!("t={TIMESTAMP},v1={upper}")),
+        (4, format!("t={TIMESTAMP},v1={mac},v1={mac}")),
+        (5, format!("t={TIMESTAMP},t={TIMESTAMP},v1={mac}")),
+        (6, format!("t=,v1=garbage,v1={mac}")),
+        (7, format!("t={TIMESTAMP}, v1={mac}")),
+        (8, format!("t=+{TIMESTAMP},v1={mac}")),
+        (9, "garbage".to_string()),
+    ];
+
+    // Collected rather than asserted one at a time, so a regression reports
+    // every vector it broke instead of only the first.
+    let mut accepted = Vec::new();
+    for (number, header) in cases {
+        let result = verify_at(BODY, &header, SECRET, NOW);
+        if !matches!(result, Err(WebhookError::MalformedSignature { .. })) {
+            accepted.push(format!("vector {number} ({header:?}) gave {result:?}"));
+        }
+    }
+
+    assert!(
+        accepted.is_empty(),
+        "expected MalformedSignature for every vector: {}",
+        accepted.join("; ")
+    );
+}
+
+#[test]
+fn the_shared_unknown_key_vector_verifies() {
+    // Vector 10. Unknown keys are reserved for a future scheme version, so they
+    // are ignored rather than rejected.
+    let header = format!("{HEADER},v9=deadbeef");
+
+    assert_eq!(verify_at(BODY, &header, SECRET, NOW), Ok(()));
+}
+
+#[test]
+fn a_leading_zero_timestamp_fails_even_with_a_mac_over_the_stripped_value() {
+    // `01755700000` parsed as a number and printed back is `1755700000`, which
+    // is exactly what the canonical MAC covers. A verifier that reformats `t`
+    // before building the signed string accepts this delivery; the raw substring
+    // is what the platform signed, so the MAC over `01755700000.` cannot match.
+    //
+    // The leading zero is grammatical (digits are digits), so this rejects at
+    // the MAC rather than at the parser.
+    let header = format!("t=0{TIMESTAMP},v1=5305bcf1302fdaba8f8c19a20c899e916fb4d2a7d8d547c62529ff87c4697b72");
+
+    assert_eq!(
+        verify_at(BODY, &header, SECRET, NOW),
+        Err(WebhookError::SignatureMismatch),
+        "a reformatted timestamp must never reach the MAC"
+    );
 }
 
 #[test]

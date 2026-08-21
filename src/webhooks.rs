@@ -27,9 +27,10 @@ pub const DEFAULT_TOLERANCE_SECS: u64 = 300;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WebhookError {
-    /// The signature header was not `t={unix_seconds},v1={lowercase_hex}`. The
-    /// header never reached the crypto: it was missing a field, carried a
-    /// non-numeric timestamp, or held something that was not 32 bytes of hex.
+    /// The signature header was not `t={digits},v1={64 lowercase hex}`. The
+    /// header never reached the crypto: it was missing a field, repeated one,
+    /// carried whitespace, held a `t` that was not raw ASCII digits, or held a
+    /// `v1` that was not exactly 64 lowercase hex characters.
     ///
     /// In production this usually means the wrong header was read off the
     /// request, not an attack.
@@ -89,7 +90,8 @@ impl StdError for WebhookError {}
 ///   pretty-print it, do not round-trip it through a JSON parser, do not let a
 ///   framework re-serialize it. One changed byte is one failed signature.
 /// - `signature_header` is the `X-Webhook-Signature` value
-///   (`t={unix_seconds},v1={lowercase_hex}`).
+///   (`t={digits},v1={64 lowercase hex}`). Unknown keys are ignored; anything
+///   else outside that grammar is rejected.
 /// - `secret` is that endpoint's `whsec_...` secret, used as UTF-8 key bytes.
 /// - `tolerance_secs` bounds `|now - t|`. [`DEFAULT_TOLERANCE_SECS`] mirrors the
 ///   server. Passing `0` accepts only the exact second, which is not what you
@@ -131,10 +133,15 @@ pub fn verify_webhook(
 
     // Only authentic deliveries get this far, so a tolerance failure is a replay
     // rather than a probe.
+    //
+    // `timestamp` is raw digits, so the only way this parse fails is a value too
+    // large for u64. Saturating puts such a delivery outside every tolerance
+    // window, which is the answer we want anyway.
+    let seconds = timestamp.parse::<u64>().unwrap_or(u64::MAX);
     let now = now.unwrap_or_else(unix_seconds);
-    if now.abs_diff(timestamp) > tolerance_secs {
+    if now.abs_diff(seconds) > tolerance_secs {
         return Err(WebhookError::TimestampOutOfTolerance {
-            timestamp,
+            timestamp: seconds,
             now,
             tolerance_secs,
         });
@@ -143,17 +150,25 @@ pub fn verify_webhook(
     Ok(())
 }
 
-struct SignatureHeader {
-    timestamp: u64,
+struct SignatureHeader<'a> {
+    /// The RAW `t` substring off the wire. This, and never a reparsed number,
+    /// is what goes into the signed string.
+    timestamp: &'a str,
     mac: Vec<u8>,
 }
 
-/// Splits `t={unix_seconds},v1={hex}` into its parts.
+/// Splits `t={digits},v1={64 lowercase hex}` into its parts.
 ///
-/// Fields are matched by name rather than by position, so a future scheme that
-/// appends another field (or reorders these two) still verifies. An unknown
-/// field is ignored; a missing or repeated `t`/`v1` is not.
-fn parse_signature_header(header: &str) -> Result<SignatureHeader, WebhookError> {
+/// The grammar is closed: comma-separated `key=value` elements, no whitespace
+/// anywhere, exactly one `t` and one `v1`, and an element without `=` rejects
+/// the whole header. Keys are matched by name rather than by position, so a
+/// future scheme that reorders them still verifies, and unknown keys are
+/// ignored so a `v2` can roll out alongside `v1`.
+fn parse_signature_header(header: &str) -> Result<SignatureHeader<'_>, WebhookError> {
+    if header.contains(|c: char| c.is_ascii_whitespace()) {
+        return Err(malformed("header contains whitespace"));
+    }
+
     let mut timestamp = None;
     let mut mac = None;
 
@@ -165,35 +180,44 @@ fn parse_signature_header(header: &str) -> Result<SignatureHeader, WebhookError>
             )));
         };
 
-        match name.trim() {
+        match name {
             "t" => {
                 if timestamp.is_some() {
                     return Err(malformed("repeated t field"));
                 }
-                let parsed = value.trim().parse::<u64>().map_err(|_| {
-                    malformed(format!(
+                // One or more raw ASCII digits, nothing else: no sign, no
+                // leading zeros stripped, no reformatting. Parsing this into a
+                // number and printing it back would silently accept `+1755700000`
+                // and `01755700000` as the timestamp the platform signed, and
+                // the other SDKs reject both.
+                if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(malformed(format!(
                         "timestamp {:?} is not unix seconds",
                         truncate(value)
-                    ))
-                })?;
-                timestamp = Some(parsed);
+                    )));
+                }
+                timestamp = Some(value);
             }
             "v1" => {
                 if mac.is_some() {
                     return Err(malformed("repeated v1 field"));
                 }
-                let decoded = hex::decode(value.trim())
-                    .map_err(|_| malformed("v1 signature is not hex"))?;
-                if decoded.len() != 32 {
+                if value.len() != 64 {
                     return Err(malformed(format!(
-                        "v1 signature is {} bytes, expected 32",
-                        decoded.len()
+                        "v1 signature is {} characters, expected 64",
+                        value.len()
                     )));
                 }
+                // Uppercase hex decodes fine but the platform never emits it,
+                // so accepting it would widen the accept set for nothing.
+                if !value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                    return Err(malformed("v1 signature is not lowercase hex"));
+                }
+                let decoded = hex::decode(value)
+                    .map_err(|_| malformed("v1 signature is not lowercase hex"))?;
                 mac = Some(decoded);
             }
-            // A scheme version we do not know about yet. Ignoring it lets v2
-            // roll out alongside v1 without breaking this verifier.
+            // A scheme version we do not know about yet.
             _ => {}
         }
     }
