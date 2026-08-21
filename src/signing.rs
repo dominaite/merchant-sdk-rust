@@ -10,6 +10,8 @@ use crate::client::REDACTED_SECRET;
 /// Everything that goes into one request signature.
 ///
 /// Borrowed strings: nothing here is stored, it is hashed and dropped.
+// SECURITY: do not derive Serialize. The secret field would be emitted by any
+// serde-based logger, which is how the Go SDK leaked it through json.Marshal.
 #[derive(Clone, Copy)]
 pub struct SignRequest<'a> {
     /// Your API secret (`dms_...`).

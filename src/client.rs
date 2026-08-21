@@ -49,6 +49,8 @@ impl Default for RetryOptions {
 pub(crate) const REDACTED_SECRET: &str = "dms_***redacted***";
 
 /// Builds a [`Client`]. Start with [`Client::builder`].
+// SECURITY: do not derive Serialize. The secret field would be emitted by any
+// serde-based logger, which is how the Go SDK leaked it through json.Marshal.
 #[derive(Clone)]
 pub struct ClientBuilder {
     key_id: String,
@@ -168,6 +170,8 @@ impl ClientBuilder {
 ///
 /// Cloning is cheap and shares the underlying connection pool, so one client per
 /// process is the normal shape.
+// SECURITY: do not derive Serialize. The secret field would be emitted by any
+// serde-based logger, which is how the Go SDK leaked it through json.Marshal.
 #[derive(Clone)]
 pub struct Client {
     key_id: String,
