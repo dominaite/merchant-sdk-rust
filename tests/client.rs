@@ -464,6 +464,39 @@ fn credentials_with_the_wrong_prefix_are_rejected_at_construction() {
     ));
 }
 
+/// Debug output ends up in logs, panics, and crash reporters. The secret must not
+/// travel with it.
+#[test]
+fn debug_output_never_carries_the_secret() {
+    let builder = Client::builder(KEY_ID, SECRET);
+    let client = Client::builder(KEY_ID, SECRET).build().expect("built");
+    let signing = SignRequest {
+        secret: SECRET,
+        timestamp: "1755302400",
+        method: "POST",
+        path: SESSIONS_PATH,
+        idempotency_key: "00000000-0000-4000-8000-000000000001",
+        body: "{}",
+    };
+
+    for (label, printed) in [
+        ("ClientBuilder", format!("{builder:?}")),
+        ("Client", format!("{client:?}")),
+        ("SignRequest", format!("{signing:?}")),
+    ] {
+        assert!(
+            !printed.contains(SECRET),
+            "{label} debug output leaks the secret: {printed}"
+        );
+        assert!(
+            printed.contains("redacted"),
+            "{label} debug output does not mark the secret as redacted: {printed}"
+        );
+        // The key id is not a secret, and losing it would make debug output useless.
+        assert!(printed.contains(KEY_ID) || label == "SignRequest", "{label}");
+    }
+}
+
 #[test]
 fn an_empty_base_url_keeps_the_production_default() {
     let client = Client::builder(KEY_ID, SECRET)
@@ -473,6 +506,90 @@ fn an_empty_base_url_keeps_the_production_default() {
         .expect("built");
 
     assert_eq!(client.base_url(), dominaite::DEFAULT_BASE_URL);
+}
+
+/// Following a 3xx would hand the signed headers to the redirect target and read
+/// its JSON as an authentic answer, which is a forged session. The gateway never
+/// redirects, so a 3xx stops the call.
+#[test]
+fn a_redirect_is_never_followed() {
+    for status in [302u16, 307] {
+        let target = MockServer::start(vec![create_ok()]);
+        let server = MockServer::start(vec![Reply::Redirect(
+            status,
+            format!("{}{SESSIONS_PATH}", target.base_url()),
+        )]);
+
+        let error = client_for(&server)
+            .create_checkout_session(&request())
+            .expect_err("a redirect must not be followed");
+
+        assert!(matches!(error, Error::Api { .. }), "{status}: {error}");
+        assert_eq!(error.http_status(), Some(status));
+        assert!(
+            error.to_string().contains("redirect"),
+            "{status}: {error} does not name the redirect"
+        );
+        assert!(
+            target.requests().is_empty(),
+            "{status}: the redirect target was hit"
+        );
+        assert_eq!(server.requests().len(), 1);
+    }
+}
+
+/// The redirect policy has to survive a caller's own agent: ureq's default is ten
+/// redirects, and an agent supplied through `ClientBuilder::agent` never went
+/// through the SDK's config. The SDK forces the policy per request instead of
+/// trusting the agent it was handed.
+#[test]
+fn a_caller_supplied_agent_cannot_re_enable_redirects() {
+    let attacker = MockServer::start(vec![create_ok()]);
+    let server = MockServer::start(vec![Reply::Redirect(
+        302,
+        format!("{}{SESSIONS_PATH}", attacker.base_url()),
+    )]);
+
+    // Everything ureq defaults to, including max_redirects = 10.
+    let client = Client::builder(KEY_ID, SECRET)
+        .base_url(format!("{}/api", server.base_url()))
+        .agent(ureq::Agent::new_with_defaults())
+        .build()
+        .expect("valid credentials");
+
+    let error = client
+        .create_checkout_session(&request())
+        .expect_err("a redirect must not be followed");
+
+    assert!(matches!(error, Error::Api { .. }), "{error}");
+    assert_eq!(error.http_status(), Some(302));
+    assert!(
+        attacker.requests().is_empty(),
+        "the signed headers reached the redirect target"
+    );
+}
+
+#[test]
+fn a_redirect_is_not_retried() {
+    let target = MockServer::start(vec![create_ok()]);
+    let server = MockServer::start(vec![Reply::Redirect(
+        302,
+        format!("{}{SESSIONS_PATH}", target.base_url()),
+    )]);
+
+    let error = client_for(&server)
+        .create_checkout_session_with_retry(
+            &request(),
+            RetryOptions {
+                attempts: 3,
+                base_delay: Duration::from_millis(0),
+            },
+        )
+        .expect_err("a redirect must not be followed");
+
+    assert!(!error.is_retryable(), "{error}");
+    assert_eq!(server.requests().len(), 1, "a redirect must not be retried");
+    assert!(target.requests().is_empty());
 }
 
 #[test]
