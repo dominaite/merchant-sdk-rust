@@ -279,11 +279,18 @@ impl Client {
     /// idempotency key across every attempt.
     ///
     /// Reusing the key is what makes the retry safe. A transport failure leaves
-    /// you not knowing whether the request landed; the API returns the original
-    /// session for a key it has already seen instead of opening a second one.
-    /// Generating a fresh key per attempt would be exactly the double-charge bug
-    /// this method exists to prevent, so the key is pinned once before the first
-    /// attempt.
+    /// you not knowing whether the request landed; a key the API has already seen
+    /// never opens a second session. Generating a fresh key per attempt would be
+    /// exactly the double-charge bug this method exists to prevent, so the key is
+    /// pinned once before the first attempt.
+    ///
+    /// What a replayed key gets back is a refusal, not the original session: the
+    /// API answers HTTP 200 with `success: false` and one of the replay codes
+    /// ([`Error::Refusal`] with `DUPLICATE_REQUEST`, `ALREADY_PROCESSED`,
+    /// `PRIOR_ATTEMPT_FAILED` or `IDEMPOTENCY_KEY_REUSED`). The first attempt's
+    /// cashier key and token are not returned again. When the refusal names a
+    /// transaction id, read it back with [`Client::get_status`] to find out what
+    /// the earlier attempt did.
     ///
     /// Refusals and authentication failures are returned immediately. They will
     /// not change on a retry.
