@@ -538,6 +538,37 @@ fn a_redirect_is_never_followed() {
     }
 }
 
+/// The redirect policy has to survive a caller's own agent: ureq's default is ten
+/// redirects, and an agent supplied through `ClientBuilder::agent` never went
+/// through the SDK's config. The SDK forces the policy per request instead of
+/// trusting the agent it was handed.
+#[test]
+fn a_caller_supplied_agent_cannot_re_enable_redirects() {
+    let attacker = MockServer::start(vec![create_ok()]);
+    let server = MockServer::start(vec![Reply::Redirect(
+        302,
+        format!("{}{SESSIONS_PATH}", attacker.base_url()),
+    )]);
+
+    // Everything ureq defaults to, including max_redirects = 10.
+    let client = Client::builder(KEY_ID, SECRET)
+        .base_url(format!("{}/api", server.base_url()))
+        .agent(ureq::Agent::new_with_defaults())
+        .build()
+        .expect("valid credentials");
+
+    let error = client
+        .create_checkout_session(&request())
+        .expect_err("a redirect must not be followed");
+
+    assert!(matches!(error, Error::Api { .. }), "{error}");
+    assert_eq!(error.http_status(), Some(302));
+    assert!(
+        attacker.requests().is_empty(),
+        "the signed headers reached the redirect target"
+    );
+}
+
 #[test]
 fn a_redirect_is_not_retried() {
     let target = MockServer::start(vec![create_ok()]);

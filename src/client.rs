@@ -112,10 +112,10 @@ impl ClientBuilder {
     /// read error bodies; the SDK maps a status-as-error into the same taxonomy
     /// either way, just without the API's message.
     ///
-    /// Set `max_redirects(0)` on it as well. The default agent does, because
-    /// following a redirect would send your signed headers to a host you never
-    /// authenticated; an agent of your own that still follows redirects gives
-    /// that back.
+    /// Redirects stay off whatever you pass: every request forces
+    /// `max_redirects(0)` on itself, because following one would send your signed
+    /// headers to a host you never authenticated. A `max_redirects` setting on
+    /// your agent is ignored.
     pub fn agent(mut self, agent: ureq::Agent) -> Self {
         self.agent = Some(agent);
         self
@@ -392,6 +392,16 @@ impl Client {
             .body(body)
             .map_err(|error| Error::validation(format!("Could not build the request: {error}")))?;
 
+        // Forced per request, so it holds for an agent supplied through
+        // ClientBuilder::agent as well - ureq's own default is ten redirects, and
+        // a caller's agent never saw this crate's config. Request-level config
+        // overrides the agent's.
+        let http_request = self
+            .agent
+            .configure_request(http_request)
+            .max_redirects(0)
+            .build();
+
         let mut response = match self.agent.run(http_request) {
             Ok(response) => response,
             // An agent configured with http_status_as_error(true) - a caller's own
@@ -479,6 +489,9 @@ fn redirect_error(status: u16) -> Error {
 }
 
 fn classify_status(status: u16, code: Option<String>, message: Option<String>) -> Error {
+    // Defence in depth only. ureq does not surface a 3xx as a StatusCode error,
+    // it follows it - what actually stops a redirect is the per-request
+    // max_redirects(0) in `request`.
     if is_redirect(status) {
         return redirect_error(status);
     }

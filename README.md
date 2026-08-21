@@ -213,7 +213,7 @@ signing; a 503 means retry later. Never both at once.
 |---|---|
 | `.base_url(url)` | Point at a non-production environment. Empty and whitespace-only values are ignored, so an unset env var still gives you production. |
 | `.timeout(d)` | Per-request timeout. Defaults to 45s (serverless cold starts can take 10+s). |
-| `.agent(a)` | Your own `ureq::Agent`: proxy-aware transport, custom TLS, a test double. Replaces `.timeout(d)`. |
+| `.agent(a)` | Your own `ureq::Agent`: proxy-aware transport, custom TLS, a test double. Replaces `.timeout(d)`. Redirects stay off regardless of how the agent is configured: the SDK forces `max_redirects(0)` on every request, so signed headers never cross to another host. |
 | `.user_agent(s)` | Appends your identifier to the SDK's User-Agent, which helps when support reads the access logs. |
 
 `Client` is `Clone` and cheap to clone; one per process is the normal shape.
