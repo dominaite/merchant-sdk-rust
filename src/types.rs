@@ -221,6 +221,23 @@ pub mod status {
     pub const REQUIRES_CAPTURE: &str = "requires_capture";
     /// The payer never paid and the session aged out.
     pub const ABANDONED: &str = "abandoned";
+
+    /// The whole vocabulary, in the order the canonical contract lists it. This is
+    /// the enumerable form of the constants above; `tests/contract.rs` pins it
+    /// against the vendored `merchant-api-contract.json`, so a status the API adds
+    /// cannot land in one SDK and be missed here.
+    pub const ALL: [&str; 10] = [
+        PENDING,
+        PROCESSING,
+        SUCCEEDED,
+        FAILED,
+        REFUNDED,
+        PARTIALLY_REFUNDED,
+        CANCELLED,
+        DISPUTED,
+        REQUIRES_CAPTURE,
+        ABANDONED,
+    ];
 }
 
 /// What [`Client::get_status`](crate::Client::get_status) returns.
