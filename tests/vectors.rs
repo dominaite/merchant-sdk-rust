@@ -8,7 +8,7 @@
 use dominaite::{sha256_hex, sign_request, SignRequest};
 
 const SECRET: &str = "dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-const SESSIONS_PATH: &str = "/merchant-api/bridgerpay/checkout/sessions";
+const SESSIONS_PATH: &str = "/merchant-api/checkout/sessions";
 
 #[test]
 fn post_vector_reproduces_byte_for_byte() {
@@ -30,7 +30,7 @@ fn post_vector_reproduces_byte_for_byte() {
 
     assert_eq!(
         signature,
-        "95759958a0a0a9bd3e6e37101c01e8e7fee1166406e4ac2ff488764f5f742cbf"
+        "8f5fba0b29a8eea81b76a0e6d7119e79ec68f586910f77713b045652e5ce9b74"
     );
 }
 
@@ -53,7 +53,7 @@ fn get_vector_signs_empty_idempotency_key_and_empty_body() {
 
     assert_eq!(
         signature,
-        "010635e61caabdb82a031a51fa56999b670b61d57239e5fa3db71a43c731f93d"
+        "70002896ec8411efb7754de6c49c2fd6f35bb2d001966978a2f573de1914e68d"
     );
 }
 
@@ -70,7 +70,7 @@ fn method_is_uppercased_before_signing() {
 
     assert_eq!(
         lowercase,
-        "95759958a0a0a9bd3e6e37101c01e8e7fee1166406e4ac2ff488764f5f742cbf"
+        "8f5fba0b29a8eea81b76a0e6d7119e79ec68f586910f77713b045652e5ce9b74"
     );
 }
 

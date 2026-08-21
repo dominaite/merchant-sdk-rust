@@ -15,7 +15,7 @@ pub const DEFAULT_BASE_URL: &str = "https://api.dominaite.com/payments";
 
 /// The canonical path that gets signed. POST creates a session; GET
 /// `SESSIONS_PATH/{transaction_id}` reads its status.
-pub const SESSIONS_PATH: &str = "/merchant-api/bridgerpay/checkout/sessions";
+pub const SESSIONS_PATH: &str = "/merchant-api/checkout/sessions";
 
 /// The credentials-and-clock smoke test. Creates nothing.
 pub const PING_PATH: &str = "/merchant-api/ping";
