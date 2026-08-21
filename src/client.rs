@@ -92,6 +92,11 @@ impl ClientBuilder {
     /// Configure it with `http_status_as_error(false)` if you want the SDK to
     /// read error bodies; the SDK maps a status-as-error into the same taxonomy
     /// either way, just without the API's message.
+    ///
+    /// Set `max_redirects(0)` on it as well. The default agent does, because
+    /// following a redirect would send your signed headers to a host you never
+    /// authenticated; an agent of your own that still follows redirects gives
+    /// that back.
     pub fn agent(mut self, agent: ureq::Agent) -> Self {
         self.agent = Some(agent);
         self
@@ -121,6 +126,11 @@ impl ClientBuilder {
                     .timeout_global(Some(self.timeout))
                     // Read the body on 4xx/5xx: the machine-readable code lives in it.
                     .http_status_as_error(false)
+                    // Never follow a redirect. The signed headers would travel to a
+                    // host we never authenticated, and its answer would be read as
+                    // the API's. With 0, ureq hands the 3xx back as a response
+                    // instead of erroring, and `request` turns it into an error.
+                    .max_redirects(0)
                     .build(),
             )
         });
@@ -359,6 +369,12 @@ impl Client {
         };
 
         let http_status = response.status().as_u16();
+        // Stop before reading the body: a redirect's body is whatever the
+        // redirecting host wanted to say, and none of it is an API response.
+        if is_redirect(http_status) {
+            return Err(redirect_error(http_status));
+        }
+
         let raw = response.body_mut().read_to_string().map_err(|error| {
             Error::transport(
                 format!("Could not read the Dominaite API response: {error}"),
@@ -408,7 +424,24 @@ fn unwrap_envelope(http_status: u16, raw: &str) -> Result<Value> {
     Err(classify_status(http_status, code, message))
 }
 
+fn is_redirect(status: u16) -> bool {
+    (300..400).contains(&status)
+}
+
+/// A 3xx is a hard stop, never a retry. The Dominaite API does not redirect, so
+/// something else is answering for it, and whatever is at the other end would be
+/// handed the signed headers and believed.
+fn redirect_error(status: u16) -> Error {
+    Error::api(
+        status,
+        "unexpected redirect response; the Dominaite API never redirects",
+    )
+}
+
 fn classify_status(status: u16, code: Option<String>, message: Option<String>) -> Error {
+    if is_redirect(status) {
+        return redirect_error(status);
+    }
     match status {
         401 | 403 => Error::auth(
             code.unwrap_or_else(|| "UNAUTHORIZED".to_string()),

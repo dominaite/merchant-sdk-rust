@@ -475,6 +475,59 @@ fn an_empty_base_url_keeps_the_production_default() {
     assert_eq!(client.base_url(), dominaite::DEFAULT_BASE_URL);
 }
 
+/// Following a 3xx would hand the signed headers to the redirect target and read
+/// its JSON as an authentic answer, which is a forged session. The gateway never
+/// redirects, so a 3xx stops the call.
+#[test]
+fn a_redirect_is_never_followed() {
+    for status in [302u16, 307] {
+        let target = MockServer::start(vec![create_ok()]);
+        let server = MockServer::start(vec![Reply::Redirect(
+            status,
+            format!("{}{SESSIONS_PATH}", target.base_url()),
+        )]);
+
+        let error = client_for(&server)
+            .create_checkout_session(&request())
+            .expect_err("a redirect must not be followed");
+
+        assert!(matches!(error, Error::Api { .. }), "{status}: {error}");
+        assert_eq!(error.http_status(), Some(status));
+        assert!(
+            error.to_string().contains("redirect"),
+            "{status}: {error} does not name the redirect"
+        );
+        assert!(
+            target.requests().is_empty(),
+            "{status}: the redirect target was hit"
+        );
+        assert_eq!(server.requests().len(), 1);
+    }
+}
+
+#[test]
+fn a_redirect_is_not_retried() {
+    let target = MockServer::start(vec![create_ok()]);
+    let server = MockServer::start(vec![Reply::Redirect(
+        302,
+        format!("{}{SESSIONS_PATH}", target.base_url()),
+    )]);
+
+    let error = client_for(&server)
+        .create_checkout_session_with_retry(
+            &request(),
+            RetryOptions {
+                attempts: 3,
+                base_delay: Duration::from_millis(0),
+            },
+        )
+        .expect_err("a redirect must not be followed");
+
+    assert!(!error.is_retryable(), "{error}");
+    assert_eq!(server.requests().len(), 1, "a redirect must not be retried");
+    assert!(target.requests().is_empty());
+}
+
 #[test]
 fn a_non_json_response_is_an_api_error() {
     let server = MockServer::start(vec![Reply::Json(
