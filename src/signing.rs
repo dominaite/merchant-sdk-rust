@@ -69,7 +69,7 @@ impl fmt::Debug for SignRequest<'_> {
 /// });
 /// assert_eq!(
 ///     signature,
-///     "95759958a0a0a9bd3e6e37101c01e8e7fee1166406e4ac2ff488764f5f742cbf"
+///     "8f5fba0b29a8eea81b76a0e6d7119e79ec68f586910f77713b045652e5ce9b74"
 /// );
 /// ```
 pub fn sign_request(request: SignRequest<'_>) -> String {
