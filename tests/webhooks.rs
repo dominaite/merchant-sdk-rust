@@ -208,3 +208,51 @@ fn the_signed_string_joins_timestamp_and_body_with_a_dot() {
         Err(WebhookError::SignatureMismatch)
     );
 }
+
+/// A timing-safe comparison cannot be observed from the outside: a test can only
+/// watch a wrong MAC get rejected, which a byte-by-byte `==` does too, just with
+/// a runtime that leaks how far it got. Rust has no way to monkeypatch the
+/// comparison at runtime either, so the property is pinned where it lives - in
+/// the source.
+///
+/// `Mac::verify_slice` is the hmac crate's constant-time check (it goes through
+/// subtle's `ConstantTimeEq`). Anything that compares the MAC bytes, or their
+/// hex, with `==` or `!=` is the bug this test exists to catch.
+#[test]
+fn the_mac_comparison_stays_constant_time() {
+    let webhooks = read_crate_source("src/webhooks.rs");
+
+    assert!(
+        webhooks.contains("hmac.verify_slice(&mac)"),
+        "src/webhooks.rs no longer verifies the MAC with hmac's constant-time \
+         verify_slice; a hand-rolled comparison leaks the MAC one byte at a time"
+    );
+
+    // The signing side has no comparison at all, and must not grow one.
+    for path in ["src/webhooks.rs", "src/signing.rs"] {
+        let source = read_crate_source(path);
+        for (number, line) in source.lines().enumerate() {
+            // Prose talks about signatures constantly; only code counts.
+            let code = line.split("//").next().unwrap_or("");
+            let compares = code.contains("==") || code.contains("!=");
+            let touches_the_mac = ["mac", "signature", "digest", "finalize", "hex::encode"]
+                .iter()
+                .any(|name| code.contains(name));
+
+            assert!(
+                !(compares && touches_the_mac),
+                "{path}:{} compares MAC material directly: {}\n\
+                 Use hmac's verify_slice (constant-time) instead of == or !=.",
+                number + 1,
+                code.trim()
+            );
+        }
+    }
+}
+
+fn read_crate_source(relative_path: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative_path);
+    std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!("could not read {}: {error}", path.display());
+    })
+}
