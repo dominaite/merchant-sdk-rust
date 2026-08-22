@@ -250,6 +250,8 @@ impl Client {
     /// - [`Error::Auth`]: wrong credentials, bad signature, clock off, IP not
     ///   allowlisted. Fix the config, do not retry.
     /// - [`Error::Refusal`]: the gateway refused the session; inspect `code`.
+    /// - [`Error::RateLimited`]: HTTP 429. Wait, then send it again with the
+    ///   same idempotency key. Not retried for you.
     /// - [`Error::Api`]: an unexpected or rejecting response; inspect `status`
     ///   and `code`.
     /// - [`Error::Transport`]: network failure or 5xx. Safe to retry WITH the same
@@ -341,9 +343,10 @@ impl Client {
     ///
     /// Decide "paid" with [`CheckoutStatus::is_paid`] - `succeeded` is the only
     /// value that means the customer paid. Poll after the payer returns to you,
-    /// or on your order timeout. Not in a tight loop: the endpoint is rate
-    /// limited per key. An unknown transaction id returns [`Error::Api`] with
-    /// status 404.
+    /// or on your order timeout. Not in a tight loop: the platform allows 60
+    /// requests per minute per API key and 120 per minute per IP, and going over
+    /// returns [`Error::RateLimited`]. An unknown transaction id returns
+    /// [`Error::Api`] with status 404.
     pub fn get_status(&self, transaction_id: &str) -> Result<CheckoutStatus> {
         let normalized = transaction_id.trim().to_lowercase();
         if !is_uuid(&normalized) {
@@ -435,6 +438,14 @@ impl Client {
         // redirecting host wanted to say, and none of it is an API response.
         if is_redirect(http_status) {
             return Err(redirect_error(http_status));
+        }
+
+        // Read Retry-After off the response, which means before the body is
+        // consumed. A limiter's body is whatever the edge felt like sending.
+        if http_status == 429 {
+            return Err(Error::RateLimited {
+                retry_after_seconds: retry_after_seconds(response.headers().get("retry-after")),
+            });
         }
 
         // Classify a 5xx on the STATUS, before anything tries to parse the body.
@@ -535,6 +546,16 @@ fn is_loopback_host(rest: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
+/// Reads `Retry-After` when it is the integer-seconds form.
+///
+/// The HTTP-date form is valid HTTP and the platform does not send it. Reading a
+/// date would mean subtracting it from a local clock that may well be the reason
+/// the call is failing, so an unparseable header answers `None` and the caller
+/// backs off on its own schedule.
+fn retry_after_seconds(header: Option<&ureq::http::HeaderValue>) -> Option<u64> {
+    header?.to_str().ok()?.trim().parse::<u64>().ok()
+}
+
 fn is_redirect(status: u16) -> bool {
     (300..400).contains(&status)
 }
@@ -557,6 +578,12 @@ fn classify_status(status: u16, code: Option<String>, message: Option<String>) -
         return redirect_error(status);
     }
     match status {
+        // Reached from the StatusCode path only, where the response - and with
+        // it Retry-After - is already gone. The normal path answers 429 in
+        // `request`, with the header.
+        429 => Error::RateLimited {
+            retry_after_seconds: None,
+        },
         401 | 403 => Error::auth(
             code.unwrap_or_else(|| "UNAUTHORIZED".to_string()),
             message.unwrap_or_else(|| {

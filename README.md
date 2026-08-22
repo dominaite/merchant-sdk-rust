@@ -382,7 +382,8 @@ awaiting capture, which is why `is_paid()` (settled) and `is_terminal()` (finish
 false for it. Never treat it as an abandoned order.
 
 Call this from your server, never from the browser, and poll after the payer returns to you or
-on your order timeout - not in a tight loop, the endpoint is rate limited per key.
+on your order timeout - not in a tight loop. The platform allows 60 requests per minute per API
+key and 120 per minute per IP; over that you get `Error::RateLimited`.
 
 Every response type also carries `raw` (a `serde_json::Value`) with the unparsed payload, for
 fields the structs do not model yet.
@@ -397,7 +398,8 @@ string where there is one.
 |---|---|---|
 | `Error::Refusal { code, .. }` | HTTP 200 with `success: false`. | Branch on `code`. Do not blind-retry. |
 | `Error::Auth { code, .. }` | 401/403. `code` is `INVALID_API_KEY`, `INVALID_SIGNATURE`, `TIMESTAMP_OUT_OF_RANGE`, or `IP_NOT_ALLOWED`. | Fix the key id, secret, server clock, or allowlist. Never retry-loop. |
-| `Error::Transport { .. }` | Network failure, timeout, or 5xx (`MERCHANT_API_UNAVAILABLE`). The cause is reachable through `source()`. | Retry with the **same** idempotency key. `error.is_retryable()` is true only here. |
+| `Error::Transport { .. }` | Network failure, timeout, or 5xx (`MERCHANT_API_UNAVAILABLE`), including a 5xx whose body is an HTML error page from a proxy. The cause is reachable through `source()`. | Retry with the **same** idempotency key. `error.is_retryable()` is true only here. |
+| `Error::RateLimited { retry_after_seconds }` | 429. The platform allows 60 requests per minute per API key and 120 per minute per IP. | Wait `retry_after_seconds` (or back off yourself when it is `None`), then send the request again with the **same** idempotency key. Never auto-retried: `is_retryable()` is false. |
 | `Error::Api { status, code, .. }` | Any other rejecting or unexpected response. `code` carries the API's machine-readable reason when it sent one, e.g. `IDEMPOTENCY_KEY_REQUIRED` on a 400. | Inspect `status` and `code`. A 422 means an idempotency key was replayed with a different body - use a fresh key. A 404 from `get_status` is an unknown transaction id. |
 | `Error::Validation { .. }` | Bad arguments (non-positive amount, missing field, malformed key id). | Fix the call; nothing was sent. |
 

@@ -318,6 +318,102 @@ fn a_non_json_5xx_is_retried_with_the_same_key() {
     );
 }
 
+/// A 429 is its own variant, so a caller can wait out the limiter instead of
+/// reading a generic Api error and hammering it again.
+#[test]
+fn a_429_is_a_rate_limit_error_carrying_retry_after() {
+    let server = MockServer::start(vec![Reply::RateLimited(Some("30".into()))]);
+    let error = client_for(&server)
+        .create_checkout_session(&request())
+        .expect_err("rate limited");
+
+    assert!(
+        matches!(
+            error,
+            Error::RateLimited {
+                retry_after_seconds: Some(30)
+            }
+        ),
+        "{error}"
+    );
+    assert_eq!(error.http_status(), Some(429));
+}
+
+#[test]
+fn a_429_without_a_usable_retry_after_leaves_it_none() {
+    // Absent, an HTTP-date, and junk all mean the same thing: back off on your
+    // own schedule.
+    for header in [
+        None,
+        Some("Wed, 21 Aug 2026 07:28:00 GMT".to_string()),
+        Some("soon".to_string()),
+        Some("-5".to_string()),
+    ] {
+        let label = format!("{header:?}");
+        let server = MockServer::start(vec![Reply::RateLimited(header)]);
+        let error = client_for(&server)
+            .create_checkout_session(&request())
+            .expect_err("rate limited");
+
+        assert!(
+            matches!(
+                error,
+                Error::RateLimited {
+                    retry_after_seconds: None
+                }
+            ),
+            "{label}: {error}"
+        );
+    }
+}
+
+/// A caller's own agent defaults to http_status_as_error(true), which hands the
+/// SDK a StatusCode error with the response, and the Retry-After header, already
+/// gone. The variant still has to be the rate-limit one, not a generic Api error.
+#[test]
+fn a_caller_supplied_agent_still_gets_a_rate_limit_error_on_429() {
+    let server = MockServer::start(vec![Reply::RateLimited(Some("30".into()))]);
+    let client = Client::builder(KEY_ID, SECRET)
+        .base_url(format!("{}/api", server.base_url()))
+        .agent(ureq::Agent::new_with_defaults())
+        .build()
+        .expect("valid credentials");
+
+    let error = client
+        .create_checkout_session(&request())
+        .expect_err("rate limited");
+
+    assert!(
+        matches!(
+            error,
+            Error::RateLimited {
+                retry_after_seconds: None
+            }
+        ),
+        "{error}"
+    );
+    assert!(!error.is_retryable());
+}
+
+/// Retrying into a limiter is what earned the 429, so the retry helper stops at
+/// the first one instead of spending its remaining attempts on it.
+#[test]
+fn a_429_is_never_auto_retried() {
+    let server = MockServer::start(vec![Reply::RateLimited(Some("30".into()))]);
+    let error = client_for(&server)
+        .create_checkout_session_with_retry(
+            &request(),
+            RetryOptions {
+                attempts: 3,
+                base_delay: Duration::from_millis(0),
+            },
+        )
+        .expect_err("rate limited");
+
+    assert!(!error.is_retryable(), "{error}");
+    assert_eq!(server.requests().len(), 1, "a 429 must not be retried");
+}
+
 #[test]
 fn a_dropped_connection_is_a_transport_error() {
     let server = MockServer::start(vec![Reply::HangUp]);

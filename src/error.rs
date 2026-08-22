@@ -88,6 +88,25 @@ pub enum Error {
         message: String,
     },
 
+    /// The API is rate limiting you (HTTP 429).
+    ///
+    /// The platform allows 60 requests per minute per API key and 120 per minute
+    /// per IP. Polling `get_status` in a tight loop is the usual way to hit
+    /// this.
+    ///
+    /// NOT retried automatically, and [`Error::is_retryable`] is false: another
+    /// request into a limiter is what got you here. Wait
+    /// `retry_after_seconds` (or back off on your own schedule when the API did
+    /// not name one), then send it again WITH THE SAME idempotency key, so a
+    /// request that did land cannot become a second payment.
+    RateLimited {
+        /// The `Retry-After` value in seconds, when the API sent one.
+        ///
+        /// `None` when the header was absent, or in the HTTP-date form this SDK
+        /// does not interpret.
+        retry_after_seconds: Option<u64>,
+    },
+
     /// A network-level failure, a timeout, or a 5xx. The request may or may not
     /// have reached the API, so retry WITH THE SAME idempotency key: a retried
     /// key never creates a second payment.
@@ -116,6 +135,7 @@ impl Error {
     pub fn http_status(&self) -> Option<u16> {
         match self {
             Error::Api { status, .. } => Some(*status),
+            Error::RateLimited { .. } => Some(429),
             _ => None,
         }
     }
@@ -205,6 +225,12 @@ impl fmt::Display for Error {
                 status, message, ..
             } => {
                 write!(f, "API error (HTTP {status}): {message}")
+            }
+            Error::RateLimited {
+                retry_after_seconds: Some(seconds),
+            } => write!(f, "rate limited (HTTP 429): retry after {seconds}s"),
+            Error::RateLimited { .. } => {
+                write!(f, "rate limited (HTTP 429): back off and retry")
             }
             Error::Transport { message, .. } => write!(f, "transport error: {message}"),
         }

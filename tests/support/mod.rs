@@ -16,6 +16,9 @@ pub enum Reply {
     Html(u16, String),
     /// A 3xx pointing at `location`, for proving the client does not follow it.
     Redirect(u16, String),
+    /// A 429 carrying a JSON error envelope, plus the `Retry-After` value
+    /// verbatim when there is one.
+    RateLimited(Option<String>),
     /// Accept the connection and hang up without answering, which is what a
     /// network failure looks like to the client.
     HangUp,
@@ -159,17 +162,35 @@ fn serve_one(mut stream: TcpStream, reply: Reply, recorder: &Arc<Mutex<Vec<Recor
             let _ = stream.flush();
         }
         Reply::Json(status, payload) => {
-            write_body(&mut stream, status, "application/json", &payload);
+            write_body(&mut stream, status, "application/json", "", &payload);
         }
         Reply::Html(status, payload) => {
-            write_body(&mut stream, status, "text/html", &payload);
+            write_body(&mut stream, status, "text/html", "", &payload);
+        }
+        Reply::RateLimited(retry_after) => {
+            let extra = retry_after
+                .map(|value| format!("Retry-After: {value}\r\n"))
+                .unwrap_or_default();
+            write_body(
+                &mut stream,
+                429,
+                "application/json",
+                &extra,
+                r#"{"success":false,"error":{"code":"RATE_LIMIT_EXCEEDED","message":"too many requests"}}"#,
+            );
         }
     }
 }
 
-fn write_body(stream: &mut TcpStream, status: u16, content_type: &str, payload: &str) {
+fn write_body(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    extra_headers: &str,
+    payload: &str,
+) {
     let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{payload}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{extra_headers}Content-Length: {length}\r\nConnection: close\r\n\r\n{payload}",
         reason = reason_phrase(status),
         length = payload.len(),
     );
