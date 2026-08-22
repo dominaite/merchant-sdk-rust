@@ -11,6 +11,9 @@ use std::sync::{Arc, Mutex};
 pub enum Reply {
     /// A JSON response with this status.
     Json(u16, String),
+    /// An HTML response with this status, which is what a load balancer or a
+    /// cold function host answers with when it never reached the API.
+    Html(u16, String),
     /// A 3xx pointing at `location`, for proving the client does not follow it.
     Redirect(u16, String),
     /// Accept the connection and hang up without answering, which is what a
@@ -156,15 +159,22 @@ fn serve_one(mut stream: TcpStream, reply: Reply, recorder: &Arc<Mutex<Vec<Recor
             let _ = stream.flush();
         }
         Reply::Json(status, payload) => {
-            let response = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{payload}",
-                reason = reason_phrase(status),
-                length = payload.len(),
-            );
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.flush();
+            write_body(&mut stream, status, "application/json", &payload);
+        }
+        Reply::Html(status, payload) => {
+            write_body(&mut stream, status, "text/html", &payload);
         }
     }
+}
+
+fn write_body(stream: &mut TcpStream, status: u16, content_type: &str, payload: &str) {
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{payload}",
+        reason = reason_phrase(status),
+        length = payload.len(),
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
 }
 
 fn reason_phrase(status: u16) -> &'static str {

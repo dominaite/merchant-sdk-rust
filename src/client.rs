@@ -437,6 +437,18 @@ impl Client {
             return Err(redirect_error(http_status));
         }
 
+        // Classify a 5xx on the STATUS, before anything tries to parse the body.
+        // A 502/503/504 usually comes from a load balancer or a cold function
+        // host, not from the API, so the body is an HTML error page or empty.
+        // Parsing first would turn that into "the API returned a non-JSON
+        // response" - a non-retryable Api error for what is plainly a retryable
+        // outage, and the with_retry helper would give up on the first attempt.
+        // Nothing is lost: classify_status ignores the code and message for a
+        // 5xx anyway.
+        if http_status >= 500 {
+            return Err(classify_status(http_status, None, None));
+        }
+
         let raw = response.body_mut().read_to_string().map_err(|error| {
             Error::transport(
                 format!("Could not read the Dominaite API response: {error}"),

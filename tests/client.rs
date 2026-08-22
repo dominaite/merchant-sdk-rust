@@ -255,6 +255,69 @@ fn a_503_is_a_transport_error_not_a_refusal() {
     assert!(error.is_retryable());
 }
 
+/// A 502/503/504 from a load balancer or a cold function host carries an HTML
+/// error page, not the API's JSON. Classifying on the body would call that a
+/// non-retryable Api error and the retry helper would give up on an outage it
+/// exists to ride out.
+#[test]
+fn a_non_json_5xx_is_still_a_retryable_transport_error() {
+    for status in [500u16, 502, 503, 504] {
+        let server = MockServer::start(vec![Reply::Html(
+            status,
+            "<html><head><title>503 Service Unavailable</title></head></html>".into(),
+        )]);
+        let error = client_for(&server)
+            .create_checkout_session(&request())
+            .expect_err("unavailable");
+
+        assert!(
+            matches!(error, Error::Transport { .. }),
+            "{status}: {error}"
+        );
+        assert!(error.is_retryable(), "{status}: {error}");
+    }
+}
+
+/// The same shape, empty instead of HTML: a proxy that hung up on the API and
+/// answered with nothing at all.
+#[test]
+fn an_empty_bodied_5xx_is_a_transport_error() {
+    let server = MockServer::start(vec![Reply::Html(502, String::new())]);
+    let error = client_for(&server)
+        .create_checkout_session(&request())
+        .expect_err("unavailable");
+
+    assert!(matches!(error, Error::Transport { .. }), "{error}");
+    assert!(error.is_retryable());
+}
+
+/// And it has to be retried, not just labelled retryable.
+#[test]
+fn a_non_json_5xx_is_retried_with_the_same_key() {
+    let server = MockServer::start(vec![
+        Reply::Html(503, "<html>upstream unavailable</html>".into()),
+        create_ok(),
+    ]);
+
+    let session = client_for(&server)
+        .create_checkout_session_with_retry(
+            &request(),
+            RetryOptions {
+                attempts: 3,
+                base_delay: Duration::from_millis(0),
+            },
+        )
+        .expect("second attempt succeeds");
+    assert_eq!(session.transaction_id, TRANSACTION_ID);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].header("Idempotency-Key"),
+        requests[1].header("Idempotency-Key")
+    );
+}
+
 #[test]
 fn a_dropped_connection_is_a_transport_error() {
     let server = MockServer::start(vec![Reply::HangUp]);
