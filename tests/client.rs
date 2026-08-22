@@ -600,6 +600,48 @@ fn bad_arguments_are_rejected_before_anything_is_sent() {
     );
 }
 
+/// The limit is 100 characters, not 100 bytes. Counting bytes cut a Cyrillic
+/// order reference off at 50 and a CJK one at 33, rejecting locally what the API
+/// accepts.
+#[test]
+fn length_limits_count_characters_not_bytes() {
+    let cyrillic = "ж".repeat(100);
+    assert_eq!(cyrillic.len(), 200, "the fixture must be multi-byte");
+
+    let server = MockServer::start(vec![create_ok(), create_ok()]);
+    let client = client_for(&server);
+
+    client
+        .create_checkout_session(&CheckoutSessionRequest::new(2500, "EUR", &cyrillic))
+        .expect("a 100-character order reference is within the limit");
+
+    client
+        .create_checkout_session(&request().idempotency_key(&cyrillic))
+        .expect("a 100-character idempotency key is within the limit");
+
+    // 101 characters is over the limit whichever alphabet it is written in.
+    for (label, over) in [
+        (
+            "order reference",
+            CheckoutSessionRequest::new(2500, "EUR", "ж".repeat(101)),
+        ),
+        (
+            "idempotency key",
+            request().idempotency_key("ж".repeat(101)),
+        ),
+    ] {
+        let error = client
+            .create_checkout_session(&over)
+            .expect_err(&format!("an over-long {label} must be rejected"));
+        assert!(
+            matches!(error, Error::Validation { .. }),
+            "{label}: {error}"
+        );
+    }
+
+    assert_eq!(server.requests().len(), 2, "only the valid calls were sent");
+}
+
 #[test]
 fn a_malformed_transaction_id_never_reaches_the_network() {
     let server = MockServer::start(vec![status_ok()]);

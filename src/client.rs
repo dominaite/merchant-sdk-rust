@@ -625,7 +625,14 @@ fn prepare_session_request(request: &CheckoutSessionRequest) -> Result<(String, 
             "Missing required parameter: order_reference",
         ));
     }
-    if request.order_reference.len() > 100 {
+    // Characters, not bytes. `len()` counts UTF-8 bytes, so a Cyrillic or Greek
+    // order reference hit the limit at 50 characters and a CJK one at 33, and
+    // the caller got a validation error for a reference the API accepts.
+    //
+    // The server counts UTF-16 units and stays the final arbiter, so a reference
+    // built from astral characters (emoji, rarer CJK) can still be rejected
+    // there: each one is a single code point here and two units there.
+    if request.order_reference.chars().count() > 100 {
         return Err(Error::validation(
             "order_reference must be at most 100 characters",
         ));
@@ -635,7 +642,8 @@ fn prepare_session_request(request: &CheckoutSessionRequest) -> Result<(String, 
         Some(key) if key.trim().is_empty() => {
             return Err(Error::validation("idempotency_key must not be empty"))
         }
-        Some(key) if key.len() > 100 => {
+        // Characters, not bytes, for the same reason as order_reference above.
+        Some(key) if key.chars().count() > 100 => {
             return Err(Error::validation(
                 "idempotency_key must be at most 100 characters",
             ))
