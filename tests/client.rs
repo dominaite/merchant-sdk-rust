@@ -508,6 +508,46 @@ fn an_empty_base_url_keeps_the_production_default() {
     assert_eq!(client.base_url(), dominaite::DEFAULT_BASE_URL);
 }
 
+/// Plaintext puts the signed headers and the cashier token on the wire for
+/// anything on the path to read and replay, so the builder refuses to point at
+/// one - except loopback, which never leaves the machine.
+#[test]
+fn a_plaintext_base_url_is_rejected_at_construction() {
+    for bad in [
+        "http://api.dominaite.com/payments",
+        "HTTP://api.dominaite.com/payments",
+        "ftp://api.dominaite.com",
+        "api.dominaite.com/payments",
+        // The host is example.com; "localhost" is only the userinfo.
+        "http://localhost@example.com/payments",
+        "http://127.0.0.1.example.com/payments",
+        "http://notlocalhost/payments",
+    ] {
+        let error = Client::builder(KEY_ID, SECRET)
+            .base_url(bad)
+            .build()
+            .expect_err(&format!("{bad} must be rejected"));
+        assert!(matches!(error, Error::Validation { .. }), "{bad}: {error}");
+    }
+}
+
+#[test]
+fn https_and_loopback_base_urls_are_accepted() {
+    for good in [
+        "https://api.dominaite.com/payments",
+        "HTTPS://api.dominaite.com/payments",
+        "http://localhost:7071/api",
+        "http://127.0.0.1:7071/api",
+        "http://[::1]:7071/api",
+        "http://localhost",
+    ] {
+        Client::builder(KEY_ID, SECRET)
+            .base_url(good)
+            .build()
+            .unwrap_or_else(|error| panic!("{good} must be accepted: {error}"));
+    }
+}
+
 /// Following a 3xx would hand the signed headers to the redirect target and read
 /// its JSON as an authentic answer, which is a forged session. The gateway never
 /// redirects, so a 3xx stops the call.

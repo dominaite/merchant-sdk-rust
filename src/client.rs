@@ -81,6 +81,10 @@ impl ClientBuilder {
     /// whitespace-only values are ignored, so you can pass an unset environment
     /// variable straight through and still get production. Trailing slashes are
     /// trimmed.
+    ///
+    /// The URL has to be `https://`. [`ClientBuilder::build`] rejects anything
+    /// else with [`Error::Validation`], except plain `http://` on a loopback
+    /// host (`localhost`, `127.0.0.1`, `[::1]`) so a local mock still works.
     pub fn base_url(mut self, base_url: impl AsRef<str>) -> Self {
         let trimmed = base_url.as_ref().trim().trim_end_matches('/');
         if !trimmed.is_empty() {
@@ -123,16 +127,20 @@ impl ClientBuilder {
         self
     }
 
-    /// Validates the credentials and builds the client.
+    /// Validates the credentials and the base URL, and builds the client.
     ///
     /// Returns [`Error::Validation`] when either credential has the wrong prefix,
-    /// which catches a swapped key id and secret before anything is sent.
+    /// which catches a swapped key id and secret before anything is sent, and
+    /// when the base URL is not `https://` on a non-loopback host.
     pub fn build(self) -> Result<Client> {
         if !self.key_id.starts_with("dmk_") {
             return Err(Error::validation("key_id must start with dmk_"));
         }
         if !self.secret.starts_with("dms_") {
             return Err(Error::validation("secret must start with dms_"));
+        }
+        if let Some(problem) = base_url_problem(&self.base_url) {
+            return Err(Error::validation(problem));
         }
 
         let mut user_agent = format!("dominaite-rust/{VERSION}");
@@ -476,6 +484,43 @@ fn unwrap_envelope(http_status: u16, raw: &str) -> Result<Value> {
     });
 
     Err(classify_status(http_status, code, message))
+}
+
+/// Why this base URL is not usable, or `None` when it is fine.
+///
+/// The secret itself never travels, but the signed headers and the cashier token
+/// do, and over plaintext both are readable and replayable by anything on the
+/// path. A loopback host is exempt because it never leaves the machine, which is
+/// what makes local mocks and integration tests work.
+fn base_url_problem(base_url: &str) -> Option<String> {
+    // Schemes and hostnames are case-insensitive, so compare on a lowered copy
+    // and keep the original for the message the integrator reads.
+    let lowered = base_url.to_ascii_lowercase();
+    if lowered.starts_with("https://") {
+        return None;
+    }
+    match lowered.strip_prefix("http://") {
+        Some(rest) if is_loopback_host(rest) => None,
+        Some(_) => Some(format!(
+            "base_url must use https://, or http:// with a loopback host: {base_url}"
+        )),
+        None => Some(format!("base_url must start with https://: {base_url}")),
+    }
+}
+
+/// Whether the authority in `rest` (everything after `http://`) is loopback.
+fn is_loopback_host(rest: &str) -> bool {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Only what is after the last `@` is the host. Without this,
+    // `http://localhost@example.com/` reads as loopback and ships the signed
+    // headers to example.com in plaintext.
+    let authority = authority.rsplit('@').next().unwrap_or("");
+    let host = match authority.strip_prefix('[') {
+        // An IPv6 literal is bracketed, and its port sits after the bracket.
+        Some(inside) => inside.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 fn is_redirect(status: u16) -> bool {
