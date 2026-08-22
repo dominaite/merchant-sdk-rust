@@ -460,6 +460,13 @@ impl Client {
             return Err(classify_status(http_status, None, None));
         }
 
+        // Bounded on purpose: `read_to_string` caps at ureq's default 10MB, so a
+        // server that answers with an endless body cannot grow this allocation
+        // until the caller's process is killed. Do NOT reach for
+        // `with_config().limit(...)` here to raise it - a merchant API response
+        // is a few kilobytes, and `an_oversized_response_body_stops_at_the_read_limit`
+        // pins the cap. Hitting it reads as a transport failure, which is right:
+        // nothing usable arrived.
         let raw = response.body_mut().read_to_string().map_err(|error| {
             Error::transport(
                 format!("Could not read the Dominaite API response: {error}"),

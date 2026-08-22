@@ -19,6 +19,9 @@ pub enum Reply {
     /// A 429 carrying a JSON error envelope, plus the `Retry-After` value
     /// verbatim when there is one.
     RateLimited(Option<String>),
+    /// A 200 that announces and then streams this many bytes of filler, for
+    /// proving the client stops reading a body that never ends.
+    Oversized(usize),
     /// Accept the connection and hang up without answering, which is what a
     /// network failure looks like to the client.
     HangUp,
@@ -166,6 +169,26 @@ fn serve_one(mut stream: TcpStream, reply: Reply, recorder: &Arc<Mutex<Vec<Recor
         }
         Reply::Html(status, payload) => {
             write_body(&mut stream, status, "text/html", "", &payload);
+        }
+        Reply::Oversized(length) => {
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n",
+            );
+            if stream.write_all(header.as_bytes()).is_err() {
+                return;
+            }
+            // Chunked writes, so the test does not hold the whole body in
+            // memory, and so the client's read can stop us part way.
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut written = 0;
+            while written < length {
+                let take = chunk.len().min(length - written);
+                if stream.write_all(&chunk[..take]).is_err() {
+                    return;
+                }
+                written += take;
+            }
+            let _ = stream.flush();
         }
         Reply::RateLimited(retry_after) => {
             let extra = retry_after

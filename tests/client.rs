@@ -846,6 +846,36 @@ fn a_non_json_response_is_an_api_error() {
     assert!(matches!(error, Error::Api { .. }), "{error}");
 }
 
+/// A response body is read into memory, so an endless one is an out-of-memory
+/// kill on the caller's server. ureq caps `read_to_string` at 10MB by default;
+/// this pins that the SDK's read path actually inherits the cap, and that
+/// hitting it lands as a retryable transport failure rather than a parse error.
+#[test]
+fn an_oversized_response_body_stops_at_the_read_limit() {
+    let server = MockServer::start(vec![Reply::Oversized(11 * 1024 * 1024)]);
+    let error = client_for(&server)
+        .create_checkout_session(&request())
+        .expect_err("the body is over the limit");
+
+    assert!(matches!(error, Error::Transport { .. }), "{error}");
+    assert!(error.is_retryable(), "{error}");
+}
+
+/// The cap has to be well clear of a real response, or a large but legitimate
+/// payload would fail. 1MB goes through.
+#[test]
+fn a_large_but_reasonable_response_body_is_still_read() {
+    let filler = "x".repeat(1024 * 1024);
+    let server = MockServer::start(vec![Reply::enveloped(&format!(
+        r#"{{"success":true,"checkout":{CHECKOUT},"filler":"{filler}"}}"#
+    ))]);
+
+    let session = client_for(&server)
+        .create_checkout_session(&request())
+        .expect("a 1MB body is under the limit");
+    assert_eq!(session.transaction_id, TRANSACTION_ID);
+}
+
 #[test]
 fn an_unknown_status_keeps_the_payment_open() {
     let server = MockServer::start(vec![Reply::enveloped(
