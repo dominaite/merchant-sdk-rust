@@ -11,8 +11,17 @@ use std::sync::{Arc, Mutex};
 pub enum Reply {
     /// A JSON response with this status.
     Json(u16, String),
+    /// An HTML response with this status, which is what a load balancer or a
+    /// cold function host answers with when it never reached the API.
+    Html(u16, String),
     /// A 3xx pointing at `location`, for proving the client does not follow it.
     Redirect(u16, String),
+    /// A 429 carrying a JSON error envelope, plus the `Retry-After` value
+    /// verbatim when there is one.
+    RateLimited(Option<String>),
+    /// A 200 that announces and then streams this many bytes of filler, for
+    /// proving the client stops reading a body that never ends.
+    Oversized(usize),
     /// Accept the connection and hang up without answering, which is what a
     /// network failure looks like to the client.
     HangUp,
@@ -156,15 +165,60 @@ fn serve_one(mut stream: TcpStream, reply: Reply, recorder: &Arc<Mutex<Vec<Recor
             let _ = stream.flush();
         }
         Reply::Json(status, payload) => {
-            let response = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{payload}",
-                reason = reason_phrase(status),
-                length = payload.len(),
+            write_body(&mut stream, status, "application/json", "", &payload);
+        }
+        Reply::Html(status, payload) => {
+            write_body(&mut stream, status, "text/html", "", &payload);
+        }
+        Reply::Oversized(length) => {
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n",
             );
-            let _ = stream.write_all(response.as_bytes());
+            if stream.write_all(header.as_bytes()).is_err() {
+                return;
+            }
+            // Chunked writes, so the test does not hold the whole body in
+            // memory, and so the client's read can stop us part way.
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut written = 0;
+            while written < length {
+                let take = chunk.len().min(length - written);
+                if stream.write_all(&chunk[..take]).is_err() {
+                    return;
+                }
+                written += take;
+            }
             let _ = stream.flush();
         }
+        Reply::RateLimited(retry_after) => {
+            let extra = retry_after
+                .map(|value| format!("Retry-After: {value}\r\n"))
+                .unwrap_or_default();
+            write_body(
+                &mut stream,
+                429,
+                "application/json",
+                &extra,
+                r#"{"success":false,"error":{"code":"RATE_LIMIT_EXCEEDED","message":"too many requests"}}"#,
+            );
+        }
     }
+}
+
+fn write_body(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    extra_headers: &str,
+    payload: &str,
+) {
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{extra_headers}Content-Length: {length}\r\nConnection: close\r\n\r\n{payload}",
+        reason = reason_phrase(status),
+        length = payload.len(),
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
 }
 
 fn reason_phrase(status: u16) -> &'static str {

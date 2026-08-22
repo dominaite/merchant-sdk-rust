@@ -255,6 +255,165 @@ fn a_503_is_a_transport_error_not_a_refusal() {
     assert!(error.is_retryable());
 }
 
+/// A 502/503/504 from a load balancer or a cold function host carries an HTML
+/// error page, not the API's JSON. Classifying on the body would call that a
+/// non-retryable Api error and the retry helper would give up on an outage it
+/// exists to ride out.
+#[test]
+fn a_non_json_5xx_is_still_a_retryable_transport_error() {
+    for status in [500u16, 502, 503, 504] {
+        let server = MockServer::start(vec![Reply::Html(
+            status,
+            "<html><head><title>503 Service Unavailable</title></head></html>".into(),
+        )]);
+        let error = client_for(&server)
+            .create_checkout_session(&request())
+            .expect_err("unavailable");
+
+        assert!(
+            matches!(error, Error::Transport { .. }),
+            "{status}: {error}"
+        );
+        assert!(error.is_retryable(), "{status}: {error}");
+    }
+}
+
+/// The same shape, empty instead of HTML: a proxy that hung up on the API and
+/// answered with nothing at all.
+#[test]
+fn an_empty_bodied_5xx_is_a_transport_error() {
+    let server = MockServer::start(vec![Reply::Html(502, String::new())]);
+    let error = client_for(&server)
+        .create_checkout_session(&request())
+        .expect_err("unavailable");
+
+    assert!(matches!(error, Error::Transport { .. }), "{error}");
+    assert!(error.is_retryable());
+}
+
+/// And it has to be retried, not just labelled retryable.
+#[test]
+fn a_non_json_5xx_is_retried_with_the_same_key() {
+    let server = MockServer::start(vec![
+        Reply::Html(503, "<html>upstream unavailable</html>".into()),
+        create_ok(),
+    ]);
+
+    let session = client_for(&server)
+        .create_checkout_session_with_retry(
+            &request(),
+            RetryOptions {
+                attempts: 3,
+                base_delay: Duration::from_millis(0),
+            },
+        )
+        .expect("second attempt succeeds");
+    assert_eq!(session.transaction_id, TRANSACTION_ID);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].header("Idempotency-Key"),
+        requests[1].header("Idempotency-Key")
+    );
+}
+
+/// A 429 is its own variant, so a caller can wait out the limiter instead of
+/// reading a generic Api error and hammering it again.
+#[test]
+fn a_429_is_a_rate_limit_error_carrying_retry_after() {
+    let server = MockServer::start(vec![Reply::RateLimited(Some("30".into()))]);
+    let error = client_for(&server)
+        .create_checkout_session(&request())
+        .expect_err("rate limited");
+
+    assert!(
+        matches!(
+            error,
+            Error::RateLimited {
+                retry_after_seconds: Some(30)
+            }
+        ),
+        "{error}"
+    );
+    assert_eq!(error.http_status(), Some(429));
+}
+
+#[test]
+fn a_429_without_a_usable_retry_after_leaves_it_none() {
+    // Absent, an HTTP-date, and junk all mean the same thing: back off on your
+    // own schedule.
+    for header in [
+        None,
+        Some("Wed, 21 Aug 2026 07:28:00 GMT".to_string()),
+        Some("soon".to_string()),
+        Some("-5".to_string()),
+    ] {
+        let label = format!("{header:?}");
+        let server = MockServer::start(vec![Reply::RateLimited(header)]);
+        let error = client_for(&server)
+            .create_checkout_session(&request())
+            .expect_err("rate limited");
+
+        assert!(
+            matches!(
+                error,
+                Error::RateLimited {
+                    retry_after_seconds: None
+                }
+            ),
+            "{label}: {error}"
+        );
+    }
+}
+
+/// A caller's own agent defaults to http_status_as_error(true), which hands the
+/// SDK a StatusCode error with the response, and the Retry-After header, already
+/// gone. The variant still has to be the rate-limit one, not a generic Api error.
+#[test]
+fn a_caller_supplied_agent_still_gets_a_rate_limit_error_on_429() {
+    let server = MockServer::start(vec![Reply::RateLimited(Some("30".into()))]);
+    let client = Client::builder(KEY_ID, SECRET)
+        .base_url(format!("{}/api", server.base_url()))
+        .agent(ureq::Agent::new_with_defaults())
+        .build()
+        .expect("valid credentials");
+
+    let error = client
+        .create_checkout_session(&request())
+        .expect_err("rate limited");
+
+    assert!(
+        matches!(
+            error,
+            Error::RateLimited {
+                retry_after_seconds: None
+            }
+        ),
+        "{error}"
+    );
+    assert!(!error.is_retryable());
+}
+
+/// Retrying into a limiter is what earned the 429, so the retry helper stops at
+/// the first one instead of spending its remaining attempts on it.
+#[test]
+fn a_429_is_never_auto_retried() {
+    let server = MockServer::start(vec![Reply::RateLimited(Some("30".into()))]);
+    let error = client_for(&server)
+        .create_checkout_session_with_retry(
+            &request(),
+            RetryOptions {
+                attempts: 3,
+                base_delay: Duration::from_millis(0),
+            },
+        )
+        .expect_err("rate limited");
+
+    assert!(!error.is_retryable(), "{error}");
+    assert_eq!(server.requests().len(), 1, "a 429 must not be retried");
+}
+
 #[test]
 fn a_dropped_connection_is_a_transport_error() {
     let server = MockServer::start(vec![Reply::HangUp]);
@@ -441,6 +600,48 @@ fn bad_arguments_are_rejected_before_anything_is_sent() {
     );
 }
 
+/// The limit is 100 characters, not 100 bytes. Counting bytes cut a Cyrillic
+/// order reference off at 50 and a CJK one at 33, rejecting locally what the API
+/// accepts.
+#[test]
+fn length_limits_count_characters_not_bytes() {
+    let cyrillic = "ж".repeat(100);
+    assert_eq!(cyrillic.len(), 200, "the fixture must be multi-byte");
+
+    let server = MockServer::start(vec![create_ok(), create_ok()]);
+    let client = client_for(&server);
+
+    client
+        .create_checkout_session(&CheckoutSessionRequest::new(2500, "EUR", &cyrillic))
+        .expect("a 100-character order reference is within the limit");
+
+    client
+        .create_checkout_session(&request().idempotency_key(&cyrillic))
+        .expect("a 100-character idempotency key is within the limit");
+
+    // 101 characters is over the limit whichever alphabet it is written in.
+    for (label, over) in [
+        (
+            "order reference",
+            CheckoutSessionRequest::new(2500, "EUR", "ж".repeat(101)),
+        ),
+        (
+            "idempotency key",
+            request().idempotency_key("ж".repeat(101)),
+        ),
+    ] {
+        let error = client
+            .create_checkout_session(&over)
+            .expect_err(&format!("an over-long {label} must be rejected"));
+        assert!(
+            matches!(error, Error::Validation { .. }),
+            "{label}: {error}"
+        );
+    }
+
+    assert_eq!(server.requests().len(), 2, "only the valid calls were sent");
+}
+
 #[test]
 fn a_malformed_transaction_id_never_reaches_the_network() {
     let server = MockServer::start(vec![status_ok()]);
@@ -506,6 +707,46 @@ fn an_empty_base_url_keeps_the_production_default() {
         .expect("built");
 
     assert_eq!(client.base_url(), dominaite::DEFAULT_BASE_URL);
+}
+
+/// Plaintext puts the signed headers and the cashier token on the wire for
+/// anything on the path to read and replay, so the builder refuses to point at
+/// one - except loopback, which never leaves the machine.
+#[test]
+fn a_plaintext_base_url_is_rejected_at_construction() {
+    for bad in [
+        "http://api.dominaite.com/payments",
+        "HTTP://api.dominaite.com/payments",
+        "ftp://api.dominaite.com",
+        "api.dominaite.com/payments",
+        // The host is example.com; "localhost" is only the userinfo.
+        "http://localhost@example.com/payments",
+        "http://127.0.0.1.example.com/payments",
+        "http://notlocalhost/payments",
+    ] {
+        let error = Client::builder(KEY_ID, SECRET)
+            .base_url(bad)
+            .build()
+            .expect_err(&format!("{bad} must be rejected"));
+        assert!(matches!(error, Error::Validation { .. }), "{bad}: {error}");
+    }
+}
+
+#[test]
+fn https_and_loopback_base_urls_are_accepted() {
+    for good in [
+        "https://api.dominaite.com/payments",
+        "HTTPS://api.dominaite.com/payments",
+        "http://localhost:7071/api",
+        "http://127.0.0.1:7071/api",
+        "http://[::1]:7071/api",
+        "http://localhost",
+    ] {
+        Client::builder(KEY_ID, SECRET)
+            .base_url(good)
+            .build()
+            .unwrap_or_else(|error| panic!("{good} must be accepted: {error}"));
+    }
 }
 
 /// Following a 3xx would hand the signed headers to the redirect target and read
@@ -603,6 +844,36 @@ fn a_non_json_response_is_an_api_error() {
         .expect_err("not JSON");
 
     assert!(matches!(error, Error::Api { .. }), "{error}");
+}
+
+/// A response body is read into memory, so an endless one is an out-of-memory
+/// kill on the caller's server. ureq caps `read_to_string` at 10MB by default;
+/// this pins that the SDK's read path actually inherits the cap, and that
+/// hitting it lands as a retryable transport failure rather than a parse error.
+#[test]
+fn an_oversized_response_body_stops_at_the_read_limit() {
+    let server = MockServer::start(vec![Reply::Oversized(11 * 1024 * 1024)]);
+    let error = client_for(&server)
+        .create_checkout_session(&request())
+        .expect_err("the body is over the limit");
+
+    assert!(matches!(error, Error::Transport { .. }), "{error}");
+    assert!(error.is_retryable(), "{error}");
+}
+
+/// The cap has to be well clear of a real response, or a large but legitimate
+/// payload would fail. 1MB goes through.
+#[test]
+fn a_large_but_reasonable_response_body_is_still_read() {
+    let filler = "x".repeat(1024 * 1024);
+    let server = MockServer::start(vec![Reply::enveloped(&format!(
+        r#"{{"success":true,"checkout":{CHECKOUT},"filler":"{filler}"}}"#
+    ))]);
+
+    let session = client_for(&server)
+        .create_checkout_session(&request())
+        .expect("a 1MB body is under the limit");
+    assert_eq!(session.transaction_id, TRANSACTION_ID);
 }
 
 #[test]

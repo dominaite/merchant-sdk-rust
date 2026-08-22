@@ -81,6 +81,10 @@ impl ClientBuilder {
     /// whitespace-only values are ignored, so you can pass an unset environment
     /// variable straight through and still get production. Trailing slashes are
     /// trimmed.
+    ///
+    /// The URL has to be `https://`. [`ClientBuilder::build`] rejects anything
+    /// else with [`Error::Validation`], except plain `http://` on a loopback
+    /// host (`localhost`, `127.0.0.1`, `[::1]`) so a local mock still works.
     pub fn base_url(mut self, base_url: impl AsRef<str>) -> Self {
         let trimmed = base_url.as_ref().trim().trim_end_matches('/');
         if !trimmed.is_empty() {
@@ -123,16 +127,20 @@ impl ClientBuilder {
         self
     }
 
-    /// Validates the credentials and builds the client.
+    /// Validates the credentials and the base URL, and builds the client.
     ///
     /// Returns [`Error::Validation`] when either credential has the wrong prefix,
-    /// which catches a swapped key id and secret before anything is sent.
+    /// which catches a swapped key id and secret before anything is sent, and
+    /// when the base URL is not `https://` on a non-loopback host.
     pub fn build(self) -> Result<Client> {
         if !self.key_id.starts_with("dmk_") {
             return Err(Error::validation("key_id must start with dmk_"));
         }
         if !self.secret.starts_with("dms_") {
             return Err(Error::validation("secret must start with dms_"));
+        }
+        if let Some(problem) = base_url_problem(&self.base_url) {
+            return Err(Error::validation(problem));
         }
 
         let mut user_agent = format!("dominaite-rust/{VERSION}");
@@ -242,6 +250,8 @@ impl Client {
     /// - [`Error::Auth`]: wrong credentials, bad signature, clock off, IP not
     ///   allowlisted. Fix the config, do not retry.
     /// - [`Error::Refusal`]: the gateway refused the session; inspect `code`.
+    /// - [`Error::RateLimited`]: HTTP 429. Wait, then send it again with the
+    ///   same idempotency key. Not retried for you.
     /// - [`Error::Api`]: an unexpected or rejecting response; inspect `status`
     ///   and `code`.
     /// - [`Error::Transport`]: network failure or 5xx. Safe to retry WITH the same
@@ -333,9 +343,10 @@ impl Client {
     ///
     /// Decide "paid" with [`CheckoutStatus::is_paid`] - `succeeded` is the only
     /// value that means the customer paid. Poll after the payer returns to you,
-    /// or on your order timeout. Not in a tight loop: the endpoint is rate
-    /// limited per key. An unknown transaction id returns [`Error::Api`] with
-    /// status 404.
+    /// or on your order timeout. Not in a tight loop: the platform allows 60
+    /// requests per minute per API key and 120 per minute per IP, and going over
+    /// returns [`Error::RateLimited`]. An unknown transaction id returns
+    /// [`Error::Api`] with status 404.
     pub fn get_status(&self, transaction_id: &str) -> Result<CheckoutStatus> {
         let normalized = transaction_id.trim().to_lowercase();
         if !is_uuid(&normalized) {
@@ -429,6 +440,33 @@ impl Client {
             return Err(redirect_error(http_status));
         }
 
+        // Read Retry-After off the response, which means before the body is
+        // consumed. A limiter's body is whatever the edge felt like sending.
+        if http_status == 429 {
+            return Err(Error::RateLimited {
+                retry_after_seconds: retry_after_seconds(response.headers().get("retry-after")),
+            });
+        }
+
+        // Classify a 5xx on the STATUS, before anything tries to parse the body.
+        // A 502/503/504 usually comes from a load balancer or a cold function
+        // host, not from the API, so the body is an HTML error page or empty.
+        // Parsing first would turn that into "the API returned a non-JSON
+        // response" - a non-retryable Api error for what is plainly a retryable
+        // outage, and the with_retry helper would give up on the first attempt.
+        // Nothing is lost: classify_status ignores the code and message for a
+        // 5xx anyway.
+        if http_status >= 500 {
+            return Err(classify_status(http_status, None, None));
+        }
+
+        // Bounded on purpose: `read_to_string` caps at ureq's default 10MB, so a
+        // server that answers with an endless body cannot grow this allocation
+        // until the caller's process is killed. Do NOT reach for
+        // `with_config().limit(...)` here to raise it - a merchant API response
+        // is a few kilobytes, and `an_oversized_response_body_stops_at_the_read_limit`
+        // pins the cap. Hitting it reads as a transport failure, which is right:
+        // nothing usable arrived.
         let raw = response.body_mut().read_to_string().map_err(|error| {
             Error::transport(
                 format!("Could not read the Dominaite API response: {error}"),
@@ -478,6 +516,53 @@ fn unwrap_envelope(http_status: u16, raw: &str) -> Result<Value> {
     Err(classify_status(http_status, code, message))
 }
 
+/// Why this base URL is not usable, or `None` when it is fine.
+///
+/// The secret itself never travels, but the signed headers and the cashier token
+/// do, and over plaintext both are readable and replayable by anything on the
+/// path. A loopback host is exempt because it never leaves the machine, which is
+/// what makes local mocks and integration tests work.
+fn base_url_problem(base_url: &str) -> Option<String> {
+    // Schemes and hostnames are case-insensitive, so compare on a lowered copy
+    // and keep the original for the message the integrator reads.
+    let lowered = base_url.to_ascii_lowercase();
+    if lowered.starts_with("https://") {
+        return None;
+    }
+    match lowered.strip_prefix("http://") {
+        Some(rest) if is_loopback_host(rest) => None,
+        Some(_) => Some(format!(
+            "base_url must use https://, or http:// with a loopback host: {base_url}"
+        )),
+        None => Some(format!("base_url must start with https://: {base_url}")),
+    }
+}
+
+/// Whether the authority in `rest` (everything after `http://`) is loopback.
+fn is_loopback_host(rest: &str) -> bool {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Only what is after the last `@` is the host. Without this,
+    // `http://localhost@example.com/` reads as loopback and ships the signed
+    // headers to example.com in plaintext.
+    let authority = authority.rsplit('@').next().unwrap_or("");
+    let host = match authority.strip_prefix('[') {
+        // An IPv6 literal is bracketed, and its port sits after the bracket.
+        Some(inside) => inside.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+/// Reads `Retry-After` when it is the integer-seconds form.
+///
+/// The HTTP-date form is valid HTTP and the platform does not send it. Reading a
+/// date would mean subtracting it from a local clock that may well be the reason
+/// the call is failing, so an unparseable header answers `None` and the caller
+/// backs off on its own schedule.
+fn retry_after_seconds(header: Option<&ureq::http::HeaderValue>) -> Option<u64> {
+    header?.to_str().ok()?.trim().parse::<u64>().ok()
+}
+
 fn is_redirect(status: u16) -> bool {
     (300..400).contains(&status)
 }
@@ -500,6 +585,12 @@ fn classify_status(status: u16, code: Option<String>, message: Option<String>) -
         return redirect_error(status);
     }
     match status {
+        // Reached from the StatusCode path only, where the response - and with
+        // it Retry-After - is already gone. The normal path answers 429 in
+        // `request`, with the header.
+        429 => Error::RateLimited {
+            retry_after_seconds: None,
+        },
         401 | 403 => Error::auth(
             code.unwrap_or_else(|| "UNAUTHORIZED".to_string()),
             message.unwrap_or_else(|| {
@@ -541,7 +632,14 @@ fn prepare_session_request(request: &CheckoutSessionRequest) -> Result<(String, 
             "Missing required parameter: order_reference",
         ));
     }
-    if request.order_reference.len() > 100 {
+    // Characters, not bytes. `len()` counts UTF-8 bytes, so a Cyrillic or Greek
+    // order reference hit the limit at 50 characters and a CJK one at 33, and
+    // the caller got a validation error for a reference the API accepts.
+    //
+    // The server counts UTF-16 units and stays the final arbiter, so a reference
+    // built from astral characters (emoji, rarer CJK) can still be rejected
+    // there: each one is a single code point here and two units there.
+    if request.order_reference.chars().count() > 100 {
         return Err(Error::validation(
             "order_reference must be at most 100 characters",
         ));
@@ -551,7 +649,8 @@ fn prepare_session_request(request: &CheckoutSessionRequest) -> Result<(String, 
         Some(key) if key.trim().is_empty() => {
             return Err(Error::validation("idempotency_key must not be empty"))
         }
-        Some(key) if key.len() > 100 => {
+        // Characters, not bytes, for the same reason as order_reference above.
+        Some(key) if key.chars().count() > 100 => {
             return Err(Error::validation(
                 "idempotency_key must be at most 100 characters",
             ))
