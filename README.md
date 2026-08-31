@@ -231,8 +231,9 @@ Every `create_checkout_session` call carries an idempotency key (auto-generated,
 with `.idempotency_key(...)`). Retrying with the same key never opens a second payment - on a
 timeout, retry with the same key rather than generating a new one.
 
-A replayed key does not hand back the original session. If the first attempt did land, the API
-answers HTTP 200 with `success: false` and a replay code, which arrives as `Error::Refusal`
+A replayed key does not hand back the original session. While the first attempt is live (or
+completed, or judged failed), the API answers HTTP 200 with `success: false` and a replay code,
+which arrives as `Error::Refusal`
 (`DUPLICATE_REQUEST`, `ALREADY_PROCESSED`, `PRIOR_ATTEMPT_FAILED`, `IDEMPOTENCY_KEY_REUSED`) - the
 first session's `cashierKey` and `cashierToken` are not returned again. When the refusal names a
 transaction id, read it back with `get_status` to find out what the earlier attempt did; see
@@ -406,7 +407,8 @@ string where there is one.
 Refusal codes on `Error::Refusal`:
 
 - `PAYMENT_PROCESSING_UNAVAILABLE` - card payments are off right now; retry later.
-- `DUPLICATE_REQUEST` - a session for this idempotency key is already open.
+- `DUPLICATE_REQUEST` - a session for this idempotency key is already open, or expired within
+  the last few minutes; re-POST the same key shortly, never a fresh one.
 - `ALREADY_PROCESSED` - this idempotency key's payment already completed.
 - `PRIOR_ATTEMPT_FAILED` - the earlier attempt with this key failed; use a fresh key.
 - `IDEMPOTENCY_KEY_REUSED` - same key sent with a different body; use a fresh key.
@@ -430,6 +432,14 @@ match client.create_checkout_session(&request) {
 
 `transaction_id` is `None` when the API did not name one (a concurrent-race `DUPLICATE_REQUEST`
 knows the key is taken but not yet by which row), so match on `Some` rather than unwrapping.
+
+One replay is not a refusal at all. A session that expired unpaid is superseded: from a few
+minutes past its expiry, calling `create_checkout_session` again with the same key returns an
+ordinary `Ok` with a fresh session (new `transaction_id`, same key), so a customer who comes
+back late just pays. Keep the order-derived key for the life of the order to keep that path
+open. The band is not endless - once the platform has independently closed the attempt (about
+an hour past expiry), the replay answers `PRIOR_ATTEMPT_FAILED` and the key is spent; reconcile
+and use a fresh key.
 
 ## The three identifiers
 
