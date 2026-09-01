@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-use dominaite::status;
+use dominaite::{status, wallet_type};
 
 const WIRE: &str = include_str!("merchant-api-wire-contract.json");
 
@@ -28,6 +28,38 @@ fn strings(value: &Value) -> Vec<&str> {
 fn status_vocabulary_matches_the_gateway_in_order() {
     let wire = wire();
     assert_eq!(status::ALL.to_vec(), strings(&wire["statuses"]));
+}
+
+#[test]
+fn wallet_types_match_the_gateway_in_order() {
+    let wire = wire();
+    assert_eq!(
+        wallet_type::ALL.to_vec(),
+        strings(&wire["wallets"]["walletTypes"])
+    );
+}
+
+#[test]
+fn wallet_reporting_fields_are_payment_method_and_wallet_type_both_optional() {
+    let wire = wire();
+    let fields = wire["wallets"]["reportingFields"]
+        .as_array()
+        .expect("wallets.reportingFields is an array");
+
+    let paths: Vec<&str> = fields
+        .iter()
+        .map(|field| field["path"].as_str().expect("path is a string"))
+        .collect();
+    assert_eq!(paths, ["paymentMethod", "walletType"]);
+
+    for field in fields {
+        assert_eq!(
+            field["required"],
+            Value::Bool(false),
+            "{} must be optional",
+            field["path"]
+        );
+    }
 }
 
 #[test]

@@ -240,6 +240,46 @@ pub mod status {
     ];
 }
 
+/// Payment method category wire values carried by `paymentMethod` in
+/// [`Client::get_status`](crate::Client::get_status) responses and `payment.*`
+/// webhook events.
+///
+/// Reporting data, not a money-flow switch: a wallet payment refunds, captures
+/// and disputes exactly like a plain card payment.
+pub mod payment_method {
+    /// A plain card payment.
+    pub const CARD: &str = "card";
+    /// A wallet payment; `walletType` says which wallet.
+    pub const WALLET: &str = "wallet";
+    /// A bank transfer.
+    pub const BANK_TRANSFER: &str = "bank_transfer";
+    /// A SEPA payment.
+    pub const SEPA: &str = "sepa";
+
+    /// Every payment method category the merchant API reports, in the gateway's
+    /// own order.
+    pub const ALL: [&str; 4] = [CARD, WALLET, BANK_TRANSFER, SEPA];
+}
+
+/// Wallet wire values carried by `walletType` when `paymentMethod` is `"wallet"`.
+///
+/// The field can carry a lower-cased identifier not in this list yet - treat
+/// unknown values as a valid wallet, not an error.
+pub mod wallet_type {
+    /// Apple Pay.
+    pub const APPLE_PAY: &str = "apple_pay";
+    /// Google Pay.
+    pub const GOOGLE_PAY: &str = "google_pay";
+    /// Samsung Pay.
+    pub const SAMSUNG_PAY: &str = "samsung_pay";
+
+    /// The wallets the gateway currently names in `walletType`, in the order the
+    /// published contract lists them; the wire-contract test pins the list.
+    /// Values outside it are wallets the gateway learned about after this crate
+    /// released, still valid.
+    pub const ALL: [&str; 3] = [APPLE_PAY, GOOGLE_PAY, SAMSUNG_PAY];
+}
+
 /// What [`Client::get_status`](crate::Client::get_status) returns.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -264,6 +304,17 @@ pub struct CheckoutStatus {
     /// How much of the amount has been returned, in MINOR units.
     #[serde(default)]
     pub refunded_amount: Option<i64>,
+    /// How the payer paid, one of the [`payment_method`] constants. `None` while
+    /// the payment is still open (no method chosen yet) and on transactions older
+    /// than the field. Also inside `data` on every `payment.*` webhook event.
+    #[serde(default)]
+    pub payment_method: Option<String>,
+    /// Which wallet, when `payment_method` is `"wallet"`, usually one of the
+    /// [`wallet_type`] constants. Values outside that list are valid wallets the
+    /// gateway learned about after this crate released. `None` for non-wallet
+    /// payments. Also inside `data` on every `payment.*` webhook event.
+    #[serde(default)]
+    pub wallet_type: Option<String>,
     /// ISO 8601 creation time.
     #[serde(default)]
     pub created_at: Option<String>,
