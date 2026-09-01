@@ -22,7 +22,9 @@ use serde::de::{self, DeserializeOwned, Deserializer, Visitor};
 use serde::forward_to_deserialize_any;
 use serde_json::Value;
 
-use dominaite::{status, CheckoutSession, CheckoutStatus, Client, Error, Ping};
+use dominaite::{
+    payment_method, status, wallet_type, CheckoutSession, CheckoutStatus, Client, Error, Ping,
+};
 use support::{MockServer, Reply};
 
 const FIXTURE: &str = include_str!("merchant-api-contract.json");
@@ -206,6 +208,11 @@ fn get_status_matches_the_contract() {
     // Null in the example, and null is not zero: nothing was refunded, and the
     // SDK must not invent a 0 that reads as "a refund of nothing happened".
     assert_eq!(parsed.refunded_amount, None);
+    assert_eq!(
+        parsed.payment_method.as_deref(),
+        Some(payment_method::WALLET)
+    );
+    assert_eq!(parsed.wallet_type.as_deref(), Some(wallet_type::APPLE_PAY));
     assert_eq!(
         parsed.created_at.as_deref(),
         Some("2026-08-21T09:15:30.000Z")
