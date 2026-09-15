@@ -270,14 +270,16 @@ let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042").save_card(t
 let session = client.create_checkout_session(&request)?;
 ```
 
-Once that session is paid, `get_status` carries a `payment_method`: an id, the brand, the last
-four digits, the expiry and a status (`active`, `revoked` or `expired`). Persist the id against
-your customer. The full card number never reaches the SDK, and the provider token behind the id
-never leaves the gateway.
+Once that session is paid, `get_status` carries a `stored_payment_method`: an id, the brand,
+the last four digits, the expiry and a status (`active`, `revoked` or `expired`). Persist the id
+against your customer. The full card number never reaches the SDK, and the provider token
+behind the id never leaves the gateway. `brand`, `last4` and the expiry are `Option`s: the
+gateway omits them when the provider did not report them. This is not the gateway's
+`paymentMethod` field (the string category of how the payer paid), which stays on `raw`.
 
 ```rust
 let status = client.get_status(&session.transaction_id)?;
-if let Some(method) = &status.payment_method {
+if let Some(method) = &status.stored_payment_method {
     if method.is_chargeable() {
         store_for_customer(customer_id, &method.id); // pm_...
     }
@@ -290,38 +292,71 @@ and signed exactly like `create_checkout_session` (one is generated when you do 
 pin your own when you retry).
 
 ```rust
-use dominaite::{charge_status, decline_class, ChargeRequest};
+use dominaite::{charge_error_code, charge_status, decline_class, ChargeRequest, Error};
 
-let charge = client.charge_payment_method(
+match client.charge_payment_method(
     &method_id,
     &ChargeRequest::new(2500, "EUR", "order-1043").description("Monthly plan"),
-)?;
-
-match charge.status.as_str() {
-    charge_status::SUCCEEDED => mark_paid(&charge.transaction_id),
-    charge_status::PENDING => poll_later(&charge.transaction_id), // not terminal
-    _ => match charge.decline_class.as_deref() {
-        Some(decline_class::HARD) => stop_charging(&method_id),      // never retry
-        Some(decline_class::SOFT_FUNDS) => retry_in_a_few_days(),
-        Some(decline_class::SOFT_SCA_REQUIRED) => bring_the_payer_back(), // needs a session
-        _ => retry_later(),                                              // soft_other
+) {
+    Ok(charge) => match charge.status.as_str() {
+        charge_status::SUCCEEDED => mark_paid(&charge.transaction_id),
+        charge_status::PENDING => poll_later(&charge.transaction_id), // not terminal
+        charge_status::CANCELLED => nothing_moved(),
+        _ => match charge.decline_class.as_deref() {
+            Some(decline_class::HARD) => stop_charging(&method_id),      // never retry
+            Some(decline_class::SOFT_FUNDS) => retry_in_a_few_days(),
+            Some(decline_class::SOFT_SCA_REQUIRED) => bring_the_payer_back(), // needs a session
+            _ => retry_later(),                                              // soft_other
+        },
     },
+    Err(Error::Charge { code, transaction_id, .. }) => match code.as_str() {
+        // The provider gave no verdict: the charge MAY have happened. Poll the
+        // transaction (or wait for the webhook); never retry under a new key.
+        charge_error_code::CHARGE_OUTCOME_UNKNOWN => poll_later(&transaction_id.unwrap()),
+        charge_error_code::PAYMENT_METHOD_NOT_ACTIVE => ask_for_another_card(),
+        // Nothing was charged; retry later with the SAME key.
+        charge_error_code::DUPLICATE_REQUEST
+        | charge_error_code::PAYMENT_METHOD_CHARGES_DISABLED
+        | charge_error_code::PAYMENT_PROCESSING_UNAVAILABLE => retry_later(),
+        _ => give_up(), // CHARGE_FAILED, IDEMPOTENCY_KEY_REUSED
+    },
+    Err(other) => return Err(other.into()),
 }
 ```
 
-A decline is a result, not an error: HTTP 201 with `status: "failed"` and a `decline_class`
-(`hard`, `soft_funds`, `soft_sca_required` or `soft_other`) plus the provider's `decline_code`.
-`is_paid()` and `is_terminal()` read the same way they do on a session status. What arrives as
-`Error::Refusal` is the gateway refusing to attempt the charge at all: a replayed key, payments
-switched off, or a method that is revoked or expired. Those use the same codes as a session
-refusal, so the handling in [Errors](#errors) applies. A 404 is a method id that is not yours.
+`charge_payment_method` returns `Ok` for HTTP 201 and for HTTP 402 alike. A decline is a result,
+not an error: the 402 charge has `status: "failed"` and a `decline_class` (`hard`, `soft_funds`,
+`soft_sca_required` or `soft_other`) plus the provider's `decline_code`. `is_paid()` and
+`is_terminal()` read the same way they do on a session status; `pending` is the one status
+that is not terminal.
 
-`revoke_payment_method` drops the card: the gateway revokes the token at the provider and marks
-the method `revoked`, and any later charge on it is refused. It is a signed `DELETE` with an
-empty key and an empty body (the same recipe as GET) and resolves on HTTP 204.
+`Error::Charge` is the gateway answering with an error code instead of a charge: HTTP 409
+(`PAYMENT_METHOD_NOT_ACTIVE`, `DUPLICATE_REQUEST`), 422 (`IDEMPOTENCY_KEY_REUSED`), 502
+(`CHARGE_OUTCOME_UNKNOWN`, `CHARGE_FAILED`) or 503 (`PAYMENT_METHOD_CHARGES_DISABLED`,
+`PAYMENT_PROCESSING_UNAVAILABLE`). The variant keeps the status, the code, the message, and the
+charge row when the gateway attached one (always for `CHARGE_OUTCOME_UNKNOWN`, whose
+`transaction_id` is what you poll). A 404 is a method id that is not yours and stays the plain
+`Error::Api` with code `PAYMENT_METHOD_NOT_FOUND`; a 5xx without a gateway code (an HTML page
+from a proxy) stays `Error::Transport`.
+
+`revoke_payment_method` drops the card: the gateway deletes the saved credential at the provider
+and marks the method `revoked`, and any later charge on it is refused with
+`PAYMENT_METHOD_NOT_ACTIVE`. It is a signed `DELETE` with an empty key and an empty body (the
+same recipe as GET) and resolves on HTTP 204, again on an already revoked method. When the
+gateway refuses, nothing changed and you get `Error::Revoke` with the code: `MERCHANT_API_UNAVAILABLE`
+(503, retry later) or `UPSTREAM_CONTRACT_ERROR` (502, contact support with the id). A 404 is
+the plain `Error::Api` with code `VALIDATION_ERROR`.
 
 ```rust
-client.revoke_payment_method(&method_id)?;
+use dominaite::{revoke_error_code, Error};
+
+match client.revoke_payment_method(&method_id) {
+    Ok(()) => forget_for_customer(customer_id),
+    Err(Error::Revoke { code, .. }) if code == revoke_error_code::MERCHANT_API_UNAVAILABLE => {
+        retry_later()
+    }
+    Err(other) => return Err(other.into()),
+}
 ```
 
 Both routes are pinned by known-answer vectors in `tests/vectors.rs` next to the session ones,
@@ -471,9 +506,11 @@ string where there is one.
 |---|---|---|
 | `Error::Refusal { code, .. }` | HTTP 200 with `success: false`. | Branch on `code`. Do not blind-retry. |
 | `Error::Auth { code, .. }` | 401/403. `code` is `INVALID_API_KEY`, `INVALID_SIGNATURE`, `TIMESTAMP_OUT_OF_RANGE`, or `IP_NOT_ALLOWED`. | Fix the key id, secret, server clock, or allowlist. Never retry-loop. |
-| `Error::Transport { .. }` | Network failure, timeout, or 5xx (`MERCHANT_API_UNAVAILABLE`), including a 5xx whose body is an HTML error page from a proxy. The cause is reachable through `source()`. | Retry with the **same** idempotency key. `error.is_retryable()` is true only here. |
+| `Error::Transport { .. }` | Network failure, timeout, or a 5xx without a gateway code, including one whose body is an HTML error page from a proxy. The cause is reachable through `source()`. | Retry with the **same** idempotency key. `error.is_retryable()` is true only here. |
 | `Error::RateLimited { retry_after_seconds }` | 429. The platform allows 60 requests per minute per API key and 120 per minute per IP. | Wait `retry_after_seconds` (or back off yourself when it is `None`), then send the request again with the **same** idempotency key. Never auto-retried: `is_retryable()` is false. |
-| `Error::Api { status, code, .. }` | Any other rejecting or unexpected response. `code` carries the API's machine-readable reason when it sent one, e.g. `IDEMPOTENCY_KEY_REQUIRED` on a 400. | Inspect `status` and `code`. A 422 means an idempotency key was replayed with a different body - use a fresh key. A 404 from `get_status` is an unknown transaction id. |
+| `Error::Charge { status, code, charge, transaction_id, .. }` | `charge_payment_method` got an error code instead of a charge: 409, 422, 502 or 503. | Branch on `code` (see [Stored payment methods](#stored-payment-methods-recurring)). `CHARGE_OUTCOME_UNKNOWN` carries the `transaction_id` to poll; never retry it under a new key. |
+| `Error::Revoke { status, code, .. }` | `revoke_payment_method` was refused: 502 `UPSTREAM_CONTRACT_ERROR` or 503 `MERCHANT_API_UNAVAILABLE`. Nothing changed. | Retry later on 503; contact support on 502. |
+| `Error::Api { status, code, .. }` | Any other rejecting or unexpected response. `code` carries the API's machine-readable reason when it sent one, e.g. `IDEMPOTENCY_KEY_REQUIRED` on a 400, `PAYMENT_METHOD_NOT_FOUND` on a charge 404. | Inspect `status` and `code`. A 404 from `get_status` is an unknown transaction id. |
 | `Error::Validation { .. }` | Bad arguments (non-positive amount, missing field, malformed key id). | Fix the call; nothing was sent. |
 
 Refusal codes on `Error::Refusal`:

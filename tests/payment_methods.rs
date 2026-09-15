@@ -1,6 +1,7 @@
 //! Stored payment methods against the loopback mock: `save_card` on a session,
-//! `payment_method` on its status, then off-session charges and revocation on
-//! `/merchant-api/payment-methods/{id}`. No network, no credentials.
+//! `stored_payment_method` on its status, then off-session charges and
+//! revocation on `/merchant-api/payment-methods/{id}`. No network, no
+//! credentials.
 
 // Only part of the mock server is needed here; the client tests use the rest.
 #[allow(dead_code)]
@@ -9,8 +10,9 @@ mod support;
 use std::time::Duration;
 
 use dominaite::{
-    charge_status, decline_class, payment_method_status, sign_request, ChargeRequest,
-    CheckoutSessionRequest, Client, Error, SignRequest, PAYMENT_METHODS_PATH, SESSIONS_PATH,
+    charge_error_code, charge_status, decline_class, revoke_error_code, sign_request,
+    stored_payment_method_status, ChargeRequest, CheckoutSessionRequest, Client, Error,
+    SignRequest, PAYMENT_METHODS_PATH, SESSIONS_PATH,
 };
 use support::{MockServer, Recorded, Reply};
 
@@ -27,14 +29,32 @@ const CHARGE_SIGNATURE: &str = "9ce9f54efa2533a46aa4493b97b56aeb657f41d6a18f1c00
 const REVOKE_SIGNATURE: &str = "9330100343c4b820504890a09829a193d5815ca39e92160fdfc13d320a802a02";
 
 const CHECKOUT: &str = r#"{"transactionId":"11111111-1111-4111-8111-111111111111","orderId":"dom_42","cashierKey":"ck_live","cashierToken":"ct_live","amount":2500,"currency":"EUR","expiresAt":"2026-08-20T12:00:00Z"}"#;
-const CHARGE: &str = r#"{"chargeId":"chg_1","status":"succeeded","declineClass":null,"declineCode":null,"transactionId":"33333333-3333-4333-8333-333333333333"}"#;
+const CHARGE_ID: &str = "ch_33333333333343338333333333333333";
+const CHARGE_TRANSACTION_ID: &str = "33333333-3333-4333-8333-333333333333";
+const CHARGE: &str = r#"{"chargeId":"ch_33333333333343338333333333333333","status":"succeeded","declineClass":null,"declineCode":null,"transactionId":"33333333-3333-4333-8333-333333333333"}"#;
+
+/// The gateway envelope around a charge answer: `data` when there is a charge
+/// row, `error` when there is a code.
+fn charge_envelope(status: u16, code: Option<(&str, &str)>, data: Option<&str>) -> Reply {
+    let mut parts = vec![format!(r#""success":{}"#, code.is_none())];
+    if let Some(data) = data {
+        parts.push(format!(r#""data":{data}"#));
+    }
+    if let Some((code, message)) = code {
+        parts.push(format!(
+            r#""error":{{"message":"{message}","code":"{code}","statusCode":{status},"timestamp":"2026-09-15T18:02:11.4183920Z"}}"#
+        ));
+    }
+    parts.push(r#""metadata":{"requestId":"c2a1e6d4-3b5f-4c7e-9a8d-1f2e3d4c5b6a"}"#.to_string());
+    Reply::Json(status, format!("{{{}}}", parts.join(",")))
+}
 
 fn create_ok() -> Reply {
     Reply::enveloped(&format!(r#"{{"success":true,"checkout":{CHECKOUT}}}"#))
 }
 
 fn charge_ok() -> Reply {
-    Reply::Json(201, CHARGE.to_string())
+    charge_envelope(201, None, Some(CHARGE))
 }
 
 fn revoke_ok() -> Reply {
@@ -120,47 +140,80 @@ fn a_session_without_save_card_keeps_the_vector_body() {
 
 #[test]
 fn get_status_carries_the_stored_payment_method() {
+    // paymentMethod is the gateway's string category of how the payer paid; it
+    // is not the stored card and stays on `raw` untyped.
     let server = MockServer::start(vec![Reply::enveloped(&format!(
-        r#"{{"transactionId":"{TRANSACTION_ID}","status":"succeeded","amount":2500,"currency":"EUR","paymentMethod":{{"id":"{PAYMENT_METHOD_ID}","brand":"visa","last4":"4242","expiryMonth":12,"expiryYear":2029,"status":"active"}}}}"#
+        r#"{{"transactionId":"{TRANSACTION_ID}","status":"succeeded","amount":2500,"currency":"EUR","paymentMethod":"card","storedPaymentMethod":{{"id":"{PAYMENT_METHOD_ID}","brand":"visa","last4":"4242","expiryMonth":12,"expiryYear":2029,"status":"active"}}}}"#
     ))]);
 
     let status = client_for(&server)
         .get_status(TRANSACTION_ID)
         .expect("status read");
 
-    let method = status.payment_method.expect("a stored payment method");
+    let method = status
+        .stored_payment_method
+        .expect("a stored payment method");
     assert_eq!(method.id, PAYMENT_METHOD_ID);
-    assert_eq!(method.brand, "visa");
-    assert_eq!(method.last4, "4242");
-    assert_eq!((method.expiry_month, method.expiry_year), (12, 2029));
-    assert_eq!(method.status, payment_method_status::ACTIVE);
+    assert_eq!(method.brand.as_deref(), Some("visa"));
+    assert_eq!(method.last4.as_deref(), Some("4242"));
+    assert_eq!(
+        (method.expiry_month, method.expiry_year),
+        (Some(12), Some(2029))
+    );
+    assert_eq!(method.status, stored_payment_method_status::ACTIVE);
     assert!(method.is_chargeable());
+    assert_eq!(status.raw["paymentMethod"], "card");
 }
 
 #[test]
-fn get_status_without_a_saved_card_leaves_payment_method_none() {
+fn get_status_without_a_saved_card_leaves_stored_payment_method_none() {
+    // The gateway omits null fields on the wire, so both spellings must read
+    // the same.
+    for tail in ["", r#","storedPaymentMethod":null"#] {
+        let server = MockServer::start(vec![Reply::enveloped(&format!(
+            r#"{{"transactionId":"{TRANSACTION_ID}","status":"succeeded","amount":2500,"currency":"EUR","paymentMethod":"card"{tail}}}"#
+        ))]);
+
+        let status = client_for(&server)
+            .get_status(TRANSACTION_ID)
+            .expect("status read");
+
+        assert_eq!(status.stored_payment_method, None, "{tail:?}");
+    }
+}
+
+#[test]
+fn a_stored_payment_method_the_provider_did_not_describe_reads_as_none_fields() {
     let server = MockServer::start(vec![Reply::enveloped(&format!(
-        r#"{{"transactionId":"{TRANSACTION_ID}","status":"succeeded","amount":2500,"currency":"EUR","paymentMethod":null}}"#
+        r#"{{"transactionId":"{TRANSACTION_ID}","status":"succeeded","amount":2500,"currency":"EUR","storedPaymentMethod":{{"id":"{PAYMENT_METHOD_ID}","status":"active"}}}}"#
     ))]);
 
     let status = client_for(&server)
         .get_status(TRANSACTION_ID)
         .expect("status read");
 
-    assert_eq!(status.payment_method, None);
+    let method = status.stored_payment_method.expect("present");
+    assert_eq!(method.brand, None);
+    assert_eq!(method.last4, None);
+    assert_eq!(method.expiry_month, None);
+    assert_eq!(method.expiry_year, None);
+    assert!(method.is_chargeable());
 }
 
 #[test]
 fn a_revoked_or_unknown_payment_method_status_is_not_chargeable() {
     for value in ["revoked", "expired", "frozen"] {
         let server = MockServer::start(vec![Reply::enveloped(&format!(
-            r#"{{"transactionId":"{TRANSACTION_ID}","status":"succeeded","amount":2500,"currency":"EUR","paymentMethod":{{"id":"{PAYMENT_METHOD_ID}","brand":"visa","last4":"4242","expiryMonth":12,"expiryYear":2029,"status":"{value}"}}}}"#
+            r#"{{"transactionId":"{TRANSACTION_ID}","status":"succeeded","amount":2500,"currency":"EUR","storedPaymentMethod":{{"id":"{PAYMENT_METHOD_ID}","brand":"visa","last4":"4242","expiryMonth":12,"expiryYear":2029,"status":"{value}"}}}}"#
         ))]);
         let status = client_for(&server)
             .get_status(TRANSACTION_ID)
             .expect("status read");
         assert!(
-            !status.payment_method.expect("present").is_chargeable(),
+            !status
+                .stored_payment_method
+                .expect("present")
+                .is_chargeable(),
             "{value} must not read as chargeable"
         );
     }
@@ -173,17 +226,16 @@ fn charge_payment_method_signs_the_charge_vector_byte_for_byte() {
         .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
         .expect("charged");
 
-    assert_eq!(charge.charge_id, "chg_1");
+    assert_eq!(charge.charge_id, CHARGE_ID);
     assert_eq!(charge.status, charge_status::SUCCEEDED);
     assert!(charge.is_paid());
     assert!(charge.is_terminal());
     assert_eq!(charge.decline_class, None);
     assert_eq!(charge.decline_code, None);
-    assert_eq!(
-        charge.transaction_id,
-        "33333333-3333-4333-8333-333333333333"
-    );
-    assert_eq!(charge.raw["chargeId"], "chg_1");
+    assert_eq!(charge.transaction_id, CHARGE_TRANSACTION_ID);
+    // raw is the unwrapped charge object, not the envelope.
+    assert_eq!(charge.raw["chargeId"], CHARGE_ID);
+    assert!(charge.raw.get("success").is_none());
 
     let recorded = server.only_request();
     assert_eq!(recorded.method, "POST");
@@ -228,17 +280,25 @@ fn charge_payment_method_generates_a_key_and_sends_the_description_last() {
 }
 
 #[test]
-fn a_declined_charge_is_a_result_with_a_decline_class_not_an_error() {
-    // Through the envelope too: the unwrap path must not eat the decline.
-    let server = MockServer::start(vec![Reply::Json(
-        201,
-        r#"{"success":true,"data":{"chargeId":"chg_2","status":"failed","declineClass":"soft_funds","declineCode":"51","transactionId":"33333333-3333-4333-8333-333333333334"}}"#.to_string(),
+fn a_402_decline_is_a_result_with_a_decline_class_not_an_error() {
+    // The envelope says success=false and names CHARGE_DECLINED, but the charge
+    // row is right there: a decline is a result, not an error.
+    let server = MockServer::start(vec![charge_envelope(
+        402,
+        Some((
+            "CHARGE_DECLINED",
+            "The payment provider declined the charge.",
+        )),
+        Some(
+            r#"{"chargeId":"ch_33333333333343338333333333333334","status":"failed","declineClass":"soft_funds","declineCode":"51","transactionId":"33333333-3333-4333-8333-333333333334"}"#,
+        ),
     )]);
 
     let charge = client_for(&server)
         .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
         .expect("a decline is a result");
 
+    assert_eq!(charge.charge_id, "ch_33333333333343338333333333333334");
     assert_eq!(charge.status, charge_status::FAILED);
     assert!(!charge.is_paid());
     assert!(charge.is_terminal());
@@ -247,14 +307,34 @@ fn a_declined_charge_is_a_result_with_a_decline_class_not_an_error() {
         Some(decline_class::SOFT_FUNDS)
     );
     assert_eq!(charge.decline_code.as_deref(), Some("51"));
+    assert_eq!(
+        charge.transaction_id,
+        "33333333-3333-4333-8333-333333333334"
+    );
+}
+
+#[test]
+fn a_200_replay_is_returned_as_the_charge() {
+    // A durable replay of the same key answers 200 with the original charge.
+    let server = MockServer::start(vec![charge_envelope(200, None, Some(CHARGE))]);
+
+    let charge = client_for(&server)
+        .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
+        .expect("a replay is the charge");
+
+    assert_eq!(charge.charge_id, CHARGE_ID);
+    assert!(charge.is_paid());
 }
 
 #[test]
 fn a_pending_charge_is_not_terminal_and_neither_is_an_unknown_status() {
     for value in ["pending", "reviewing"] {
-        let server = MockServer::start(vec![Reply::Json(
+        let server = MockServer::start(vec![charge_envelope(
             201,
-            format!(r#"{{"chargeId":"chg_3","status":"{value}","transactionId":"t"}}"#),
+            None,
+            Some(&format!(
+                r#"{{"chargeId":"{CHARGE_ID}","status":"{value}","transactionId":"{CHARGE_TRANSACTION_ID}"}}"#
+            )),
         )]);
         let charge = client_for(&server)
             .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
@@ -264,52 +344,125 @@ fn a_pending_charge_is_not_terminal_and_neither_is_an_unknown_status() {
             !charge.is_terminal(),
             "{value} must keep the caller polling"
         );
+        // Absent on the wire reads as None, like null.
+        assert_eq!(charge.decline_class, None);
+        assert_eq!(charge.decline_code, None);
     }
 }
 
 #[test]
-fn a_charge_the_gateway_refuses_to_attempt_is_a_refusal_with_its_code() {
-    let server = MockServer::start(vec![Reply::enveloped(
-        r#"{"success":false,"errorCode":"ALREADY_PROCESSED","errorMessage":"Already charged","transactionId":"33333333-3333-4333-8333-333333333333"}"#,
+fn a_cancelled_charge_is_terminal_and_not_paid() {
+    let server = MockServer::start(vec![charge_envelope(
+        201,
+        None,
+        Some(&format!(
+            r#"{{"chargeId":"{CHARGE_ID}","status":"cancelled","transactionId":"{CHARGE_TRANSACTION_ID}"}}"#
+        )),
+    )]);
+    let charge = client_for(&server)
+        .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
+        .expect("a charge");
+    assert_eq!(charge.status, charge_status::CANCELLED);
+    assert!(!charge.is_paid());
+    assert!(charge.is_terminal());
+}
+
+#[test]
+fn charge_outcome_unknown_carries_the_transaction_to_poll() {
+    let server = MockServer::start(vec![charge_envelope(
+        502,
+        Some((
+            "CHARGE_OUTCOME_UNKNOWN",
+            "The payment provider gave no verdict.",
+        )),
+        Some(&format!(
+            r#"{{"chargeId":"{CHARGE_ID}","status":"pending","declineClass":null,"declineCode":null,"transactionId":"{CHARGE_TRANSACTION_ID}"}}"#
+        )),
     )]);
 
     let error = client_for(&server)
         .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
-        .expect_err("a refusal is not a charge");
+        .expect_err("no verdict is not a charge");
 
+    // Never blind-retried: the money may have moved.
     assert!(!error.is_retryable());
+    assert_eq!(error.http_status(), Some(502));
+    assert_eq!(
+        error.code(),
+        Some(charge_error_code::CHARGE_OUTCOME_UNKNOWN)
+    );
+    assert_eq!(
+        error.to_string(),
+        "charge error (HTTP 502, CHARGE_OUTCOME_UNKNOWN): The payment provider gave no verdict."
+    );
     match error {
-        Error::Refusal {
+        Error::Charge {
+            status,
             code,
+            message,
+            charge,
             transaction_id,
-            ..
+            raw,
         } => {
-            assert_eq!(code, "ALREADY_PROCESSED");
-            assert_eq!(
-                transaction_id.as_deref(),
-                Some("33333333-3333-4333-8333-333333333333")
-            );
+            assert_eq!(status, 502);
+            assert_eq!(code, charge_error_code::CHARGE_OUTCOME_UNKNOWN);
+            assert_eq!(message, "The payment provider gave no verdict.");
+            let charge = charge.expect("the charge row is attached");
+            assert_eq!(charge.charge_id, CHARGE_ID);
+            assert_eq!(charge.status, charge_status::PENDING);
+            assert_eq!(charge.decline_class, None);
+            assert_eq!(transaction_id.as_deref(), Some(CHARGE_TRANSACTION_ID));
+            assert_eq!(raw["success"], false);
+            assert_eq!(raw["error"]["code"], "CHARGE_OUTCOME_UNKNOWN");
+            assert_eq!(raw["data"]["chargeId"], CHARGE_ID);
         }
-        other => panic!("expected a refusal, got {other:?}"),
+        other => panic!("expected a charge error, got {other:?}"),
     }
 }
 
 #[test]
-fn a_payload_without_a_charge_id_is_a_refusal_whatever_success_says() {
-    let server = MockServer::start(vec![Reply::enveloped(r#"{"success":true}"#)]);
-    let error = client_for(&server)
-        .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
-        .expect_err("no charge id, no charge");
-    assert!(matches!(error, Error::Refusal { .. }), "{error:?}");
-    assert_eq!(error.code(), Some("UNKNOWN"));
+fn charge_errors_without_data_have_no_charge() {
+    for (status, code) in [
+        (409, charge_error_code::PAYMENT_METHOD_NOT_ACTIVE),
+        (409, charge_error_code::DUPLICATE_REQUEST),
+        (422, charge_error_code::IDEMPOTENCY_KEY_REUSED),
+        (502, charge_error_code::CHARGE_FAILED),
+        (503, charge_error_code::PAYMENT_METHOD_CHARGES_DISABLED),
+        (503, charge_error_code::PAYMENT_PROCESSING_UNAVAILABLE),
+        // The gateway can add a code; it must still arrive typed.
+        (409, "A_NEW_CODE"),
+    ] {
+        let server =
+            MockServer::start(vec![charge_envelope(status, Some((code, "refused")), None)]);
+        let error = client_for(&server)
+            .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
+            .expect_err(code);
+
+        assert!(!error.is_retryable(), "{code}");
+        assert_eq!(error.http_status(), Some(status), "{code}");
+        assert_eq!(error.code(), Some(code));
+        match error {
+            Error::Charge {
+                charge,
+                transaction_id,
+                raw,
+                ..
+            } => {
+                assert!(charge.is_none(), "{code}");
+                assert_eq!(transaction_id, None, "{code}");
+                assert_eq!(raw["error"]["code"], code);
+            }
+            other => panic!("{code}: expected a charge error, got {other:?}"),
+        }
+    }
 }
 
 #[test]
 fn a_charge_against_a_method_that_is_not_yours_is_a_404_api_error() {
     let server = MockServer::start(vec![Reply::error_envelope(
         404,
-        "NOT_FOUND",
-        "No such payment method",
+        "PAYMENT_METHOD_NOT_FOUND",
+        "No stored payment method with this id.",
     )]);
     let error = client_for(&server)
         .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
@@ -317,17 +470,53 @@ fn a_charge_against_a_method_that_is_not_yours_is_a_404_api_error() {
 
     assert!(matches!(error, Error::Api { .. }), "{error:?}");
     assert_eq!(error.http_status(), Some(404));
-    assert_eq!(error.code(), Some("NOT_FOUND"));
+    assert_eq!(error.code(), Some("PAYMENT_METHOD_NOT_FOUND"));
 }
 
 #[test]
-fn a_5xx_on_a_charge_is_a_retryable_transport_error() {
-    let server = MockServer::start(vec![Reply::Html(503, "<h1>down</h1>".to_string())]);
+fn a_charge_keeps_the_generic_errors_for_the_generic_statuses() {
+    // A 400 with a code is input validation, not a charge outcome.
+    let server = MockServer::start(vec![Reply::error_envelope(
+        400,
+        "IDEMPOTENCY_KEY_REQUIRED",
+        "Idempotency-Key is required",
+    )]);
     let error = client_for(&server)
         .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
-        .expect_err("down");
-    assert!(matches!(error, Error::Transport { .. }), "{error:?}");
-    assert!(error.is_retryable());
+        .expect_err("rejected");
+    assert!(matches!(error, Error::Api { .. }), "{error:?}");
+    assert_eq!(error.http_status(), Some(400));
+    assert_eq!(error.code(), Some("IDEMPOTENCY_KEY_REQUIRED"));
+
+    // A 5xx without a gateway code is an outage, whatever the body looks like.
+    for reply in [
+        Reply::Html(503, "<h1>down</h1>".to_string()),
+        Reply::Json(503, r#"{"success":false}"#.to_string()),
+        Reply::Json(502, String::new()),
+    ] {
+        let server = MockServer::start(vec![reply.clone()]);
+        let error = client_for(&server)
+            .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
+            .expect_err("down");
+        assert!(
+            matches!(error, Error::Transport { .. }),
+            "{reply:?}: {error:?}"
+        );
+        assert!(error.is_retryable(), "{reply:?}");
+    }
+}
+
+#[test]
+fn a_201_without_a_charge_body_is_an_api_error() {
+    for body in [r#"{"success":true}"#, r#"{"success":true,"data":{}}"#] {
+        let server = MockServer::start(vec![Reply::Json(201, body.to_string())]);
+        let error = client_for(&server)
+            .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
+            .expect_err("no charge id, no charge");
+        assert!(matches!(error, Error::Api { .. }), "{body}: {error:?}");
+        assert_eq!(error.http_status(), Some(201), "{body}");
+        assert_eq!(error.code(), None, "{body}");
+    }
 }
 
 #[test]
@@ -451,21 +640,71 @@ fn revoke_payment_method_signs_the_revoke_vector_and_resolves_on_204() {
 }
 
 #[test]
-fn revoke_payment_method_maps_a_404_and_a_5xx() {
-    let server = MockServer::start(vec![Reply::error_envelope(
+fn revoke_payment_method_returns_revoke_errors_for_coded_failures() {
+    for (status, code, message) in [
+        (
+            502,
+            revoke_error_code::UPSTREAM_CONTRACT_ERROR,
+            "The payment provider refused to delete the stored credential.",
+        ),
+        (
+            503,
+            revoke_error_code::MERCHANT_API_UNAVAILABLE,
+            "The payment provider is unavailable. Nothing changed; retry later.",
+        ),
+        (502, "A_NEW_CODE", "refused"),
+    ] {
+        let server = MockServer::start(vec![Reply::error_envelope(status, code, message)]);
+        let error = client_for(&server)
+            .revoke_payment_method(PAYMENT_METHOD_ID)
+            .expect_err(code);
+
+        assert!(!error.is_retryable(), "{code}");
+        assert_eq!(error.http_status(), Some(status), "{code}");
+        assert_eq!(error.code(), Some(code));
+        assert_eq!(
+            error.to_string(),
+            format!("revoke error (HTTP {status}, {code}): {message}")
+        );
+        match error {
+            Error::Revoke { raw, .. } => {
+                assert_eq!(raw["success"], false);
+                assert_eq!(raw["error"]["code"], code);
+            }
+            other => panic!("{code}: expected a revoke error, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn revoke_payment_method_maps_a_404_and_a_codeless_5xx() {
+    // The gateway's 404 for an id that is not yours is a VALIDATION_ERROR
+    // envelope; it stays the generic API error with that code.
+    let server = MockServer::start(vec![Reply::Json(
         404,
-        "NOT_FOUND",
-        "No such payment method",
+        format!(
+            r#"{{"success":false,"error":{{"message":"Validation failed","code":"VALIDATION_ERROR","statusCode":404,"validationErrors":[{{"field":"id","message":"'{PAYMENT_METHOD_ID}' not found","code":"VALIDATION_FAILED"}}]}}}}"#
+        ),
     )]);
     let error = client_for(&server)
         .revoke_payment_method(PAYMENT_METHOD_ID)
         .expect_err("not found");
     assert!(matches!(error, Error::Api { .. }), "{error:?}");
     assert_eq!(error.http_status(), Some(404));
+    assert_eq!(error.code(), Some("VALIDATION_ERROR"));
 
-    let server = MockServer::start(vec![Reply::Json(503, r#"{"success":false}"#.to_string())]);
-    let error = client_for(&server)
-        .revoke_payment_method(PAYMENT_METHOD_ID)
-        .expect_err("down");
-    assert!(matches!(error, Error::Transport { .. }), "{error:?}");
+    for reply in [
+        Reply::Json(503, r#"{"success":false}"#.to_string()),
+        Reply::Html(503, "<h1>down</h1>".to_string()),
+    ] {
+        let server = MockServer::start(vec![reply.clone()]);
+        let error = client_for(&server)
+            .revoke_payment_method(PAYMENT_METHOD_ID)
+            .expect_err("down");
+        assert!(
+            matches!(error, Error::Transport { .. }),
+            "{reply:?}: {error:?}"
+        );
+        assert!(error.is_retryable());
+    }
 }

@@ -93,9 +93,10 @@ pub struct CheckoutSessionRequest {
     /// Ask the gateway to keep the card on file once this payment is approved, so
     /// you can charge it again later with
     /// [`Client::charge_payment_method`](crate::Client::charge_payment_method).
-    /// The stored method shows up on [`CheckoutStatus::payment_method`] after the
-    /// payment succeeds; a declined first payment stores nothing. The card details
-    /// themselves never reach you: you get an id, a brand and the last four digits.
+    /// The stored method shows up on [`CheckoutStatus::stored_payment_method`]
+    /// after the payment succeeds; a declined first payment stores nothing. The
+    /// card details themselves never reach you: you get an id, a brand and the
+    /// last four digits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub save_card: Option<bool>,
 
@@ -290,12 +291,18 @@ pub struct CheckoutStatus {
     #[serde(default)]
     pub expires_at: Option<String>,
     /// The card kept on file for this payment. Present once a session created
-    /// with [`CheckoutSessionRequest::save_card`] has succeeded; `None`
-    /// otherwise. Store `payment_method.id` against your customer - it is what
-    /// [`Client::charge_payment_method`](crate::Client::charge_payment_method)
+    /// with [`CheckoutSessionRequest::save_card`] has been approved, and it stays
+    /// present after a revoke with status `revoked`; `None` (absent on the wire)
+    /// until then, for sessions without `save_card`, and for declined or
+    /// abandoned ones. Store `stored_payment_method.id` against your customer -
+    /// it is what [`Client::charge_payment_method`](crate::Client::charge_payment_method)
     /// takes.
+    ///
+    /// Not to be confused with the gateway's `paymentMethod` field, which is the
+    /// string category of how the payer paid (`card`, `wallet`, ...) and stays
+    /// on [`CheckoutStatus::raw`] untyped.
     #[serde(default)]
-    pub payment_method: Option<PaymentMethod>,
+    pub stored_payment_method: Option<StoredPaymentMethod>,
 
     /// The unparsed payload, for fields this struct does not model yet.
     #[serde(skip)]
@@ -360,12 +367,12 @@ pub struct Ping {
     pub raw: Value,
 }
 
-/// Stored payment method status wire values, on [`PaymentMethod::status`].
-pub mod payment_method_status {
+/// Stored payment method status wire values, on [`StoredPaymentMethod::status`].
+pub mod stored_payment_method_status {
     /// Chargeable.
     pub const ACTIVE: &str = "active";
     /// What [`Client::revoke_payment_method`](crate::Client::revoke_payment_method)
-    /// leaves behind. A charge on it is refused.
+    /// leaves behind. A charge on it is refused with `PAYMENT_METHOD_NOT_ACTIVE`.
     pub const REVOKED: &str = "revoked";
     /// The card's expiry date has passed.
     pub const EXPIRED: &str = "expired";
@@ -376,35 +383,38 @@ pub mod payment_method_status {
 }
 
 /// A card kept on file. Never the card number, never the PSP token - only what
-/// you may show a customer.
+/// you may show a customer. `brand`, `last4` and the expiry are `None` when the
+/// provider did not report them (the gateway omits null fields on the wire; the
+/// SDK reads absent as `None`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PaymentMethod {
-    /// Opaque id, `pm_...` - the handle you charge and revoke with.
+pub struct StoredPaymentMethod {
+    /// Opaque id: `pm_` followed by 32 hex characters, case-sensitive. The
+    /// handle you charge and revoke with.
     pub id: String,
     /// Card brand as the gateway reports it, e.g. `"visa"`, `"mastercard"`.
     #[serde(default)]
-    pub brand: String,
+    pub brand: Option<String>,
     /// Last four digits of the card number, for display only.
     #[serde(default)]
-    pub last4: String,
+    pub last4: Option<String>,
     /// 1 to 12.
     #[serde(default)]
-    pub expiry_month: u8,
+    pub expiry_month: Option<u8>,
     /// Four digits, e.g. 2029.
     #[serde(default)]
-    pub expiry_year: u16,
-    /// One of the [`payment_method_status`] constants. Compare with
-    /// [`PaymentMethod::is_chargeable`] rather than by hand.
+    pub expiry_year: Option<u16>,
+    /// One of the [`stored_payment_method_status`] constants. Compare with
+    /// [`StoredPaymentMethod::is_chargeable`] rather than by hand.
     pub status: String,
 }
 
-impl PaymentMethod {
+impl StoredPaymentMethod {
     /// True only for `active`. An unrecognised status is reported as NOT
     /// chargeable, so a status the API adds later never charges a card the
     /// gateway would refuse anyway.
     pub fn is_chargeable(&self) -> bool {
-        self.status == payment_method_status::ACTIVE
+        self.status == stored_payment_method_status::ACTIVE
     }
 }
 
@@ -476,15 +486,18 @@ impl ChargeRequest {
 pub mod charge_status {
     /// The card was charged.
     pub const SUCCEEDED: &str = "succeeded";
-    /// The issuer declined; see [`PaymentMethodCharge::decline_class`](crate::PaymentMethodCharge::decline_class).
+    /// The issuer declined (HTTP 402); see
+    /// [`PaymentMethodCharge::decline_class`](crate::PaymentMethodCharge::decline_class).
     pub const FAILED: &str = "failed";
     /// Not terminal: poll [`Client::get_status`](crate::Client::get_status)
     /// with the charge's transaction id.
     pub const PENDING: &str = "pending";
+    /// An authorization voided before capture; no money moved.
+    pub const CANCELLED: &str = "cancelled";
 
     /// The whole vocabulary, in the order the canonical contract lists it. Treat
     /// a value outside it as still open.
-    pub const ALL: [&str; 3] = [SUCCEEDED, FAILED, PENDING];
+    pub const ALL: [&str; 4] = [SUCCEEDED, FAILED, PENDING, CANCELLED];
 }
 
 /// Decline class wire values, on [`PaymentMethodCharge::decline_class`](crate::PaymentMethodCharge::decline_class). Coarse
@@ -505,21 +518,26 @@ pub mod decline_class {
 }
 
 /// What [`Client::charge_payment_method`](crate::Client::charge_payment_method)
-/// returns. A decline is a result, not an error: `status` is `failed` and
-/// `decline_class` says what to do next.
+/// returns, for a placed charge (HTTP 201) and for a provider decline (HTTP 402,
+/// `status` `failed`) alike. A decline is a result, not an error: `decline_class`
+/// says what to do next. Also carried on [`Error::Charge`](crate::Error::Charge)
+/// when the gateway attached the charge row to its answer.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaymentMethodCharge {
-    /// The charge id.
+    /// `ch_` followed by 32 hex characters. Store it against the order; it is
+    /// what support asks for.
     pub charge_id: String,
     /// One of the [`charge_status`] constants. Compare with
     /// [`PaymentMethodCharge::is_paid`] and [`PaymentMethodCharge::is_terminal`]
     /// rather than by hand.
     pub status: String,
-    /// One of the [`decline_class`] constants, present when `status` is `failed`.
+    /// One of the [`decline_class`] constants, set on a 402 decline; `None`
+    /// everywhere else (the SDK reads absent as `None`).
     #[serde(default)]
     pub decline_class: Option<String>,
     /// The raw decline code, for your logs; branch on `decline_class` instead.
+    /// `None` when `decline_class` is.
     #[serde(default)]
     pub decline_code: Option<String>,
     /// The transaction the charge created; readable with
@@ -527,7 +545,8 @@ pub struct PaymentMethodCharge {
     #[serde(default)]
     pub transaction_id: String,
 
-    /// The unparsed payload, for fields this struct does not model yet.
+    /// The unwrapped charge object as the gateway sent it, for fields this
+    /// struct does not model yet.
     #[serde(skip)]
     pub raw: Value,
 }
@@ -545,7 +564,7 @@ impl PaymentMethodCharge {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.status.as_str(),
-            charge_status::SUCCEEDED | charge_status::FAILED
+            charge_status::SUCCEEDED | charge_status::FAILED | charge_status::CANCELLED
         )
     }
 }

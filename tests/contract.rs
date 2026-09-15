@@ -11,7 +11,10 @@
 //! refusal code comes back out of the client as a refusal that keeps its code,
 //! every validation code comes back as a 400 that keeps its code, and the
 //! stored-payment-method vocabularies, field sets and examples (the saved-card
-//! status, a succeeded and a declined charge, the bodiless revoke) match too.
+//! status, a 201 charge, a 402 decline, every coded charge and revoke error,
+//! the bodiless revoke) match too. Every example is pushed through the client
+//! twice: as spelled, and with its null members removed, because the gateway
+//! omits null fields on the wire.
 
 // Only part of the mock server is needed here; the client tests use the rest.
 #[allow(dead_code)]
@@ -25,8 +28,9 @@ use serde::forward_to_deserialize_any;
 use serde_json::Value;
 
 use dominaite::{
-    charge_status, decline_class, payment_method_status, status, ChargeRequest, CheckoutSession,
-    CheckoutStatus, Client, Error, PaymentMethod, PaymentMethodCharge, Ping,
+    charge_error_code, charge_status, decline_class, revoke_error_code, status,
+    stored_payment_method_status, ChargeRequest, CheckoutSession, CheckoutStatus, Client, Error,
+    PaymentMethodCharge, Ping, StoredPaymentMethod,
 };
 use support::{MockServer, Reply};
 
@@ -52,6 +56,42 @@ fn strings(value: &Value) -> Vec<String> {
 
 fn endpoint(name: &str) -> Value {
     contract()["endpoints"][name].clone()
+}
+
+/// The example with every null object member removed, recursively: the
+/// gateway's serializer omits nulls, so this is what actually crosses the wire.
+fn without_nulls(value: &Value) -> Value {
+    match value {
+        Value::Object(members) => Value::Object(
+            members
+                .iter()
+                .filter(|(_, member)| !member.is_null())
+                .map(|(key, member)| (key.clone(), without_nulls(member)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(without_nulls).collect()),
+        other => other.clone(),
+    }
+}
+
+/// An example in both wire forms, labelled.
+fn both_wire_forms(example: &Value) -> [(&'static str, Value); 2] {
+    [
+        ("as spelled", example.clone()),
+        ("without nulls", without_nulls(example)),
+    ]
+}
+
+/// The sorted member names of a JSON object.
+fn keys(value: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = value
+        .as_object()
+        .expect("an object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
 }
 
 /// The serde field names a response struct declares, in declaration order and
@@ -375,12 +415,16 @@ fn every_contract_validation_code_survives_with_its_status() {
 
 const PAYMENT_METHOD_ID: &str = "pm_0123456789abcdef0123456789abcdef";
 
+fn charge_request() -> ChargeRequest {
+    ChargeRequest::new(2500, "EUR", "order-1043")
+}
+
 #[test]
-fn the_payment_method_status_vocabulary_is_exactly_the_contracts() {
+fn the_stored_payment_method_status_vocabulary_is_exactly_the_contracts() {
     assert_eq!(
-        payment_method_status::ALL.to_vec(),
-        strings(&contract()["paymentMethodStatusVocabulary"]),
-        "the SDK payment method status vocabulary drifted from the contract"
+        stored_payment_method_status::ALL.to_vec(),
+        strings(&contract()["storedPaymentMethodStatusVocabulary"]),
+        "the SDK stored payment method status vocabulary drifted from the contract"
     );
 }
 
@@ -397,39 +441,89 @@ fn the_charge_vocabularies_are_exactly_the_contracts() {
         strings(&contract["declineClassVocabulary"]),
         "the SDK decline class vocabulary drifted from the contract"
     );
+    assert_eq!(
+        charge_error_code::ALL.to_vec(),
+        strings(&contract["chargeErrorCodes"]),
+        "the SDK charge error codes drifted from the contract"
+    );
+    assert_eq!(
+        revoke_error_code::ALL.to_vec(),
+        strings(&contract["revokeErrorCodes"]),
+        "the SDK revoke error codes drifted from the contract"
+    );
 }
 
 #[test]
-fn the_payment_method_object_matches_the_contract() {
+fn the_stored_payment_method_object_matches_the_contract() {
     let get_status = endpoint("getStatus");
-    assert_fields::<PaymentMethod>(
-        "PaymentMethod",
-        &strings(&get_status["paymentMethodFields"]),
+    assert_fields::<StoredPaymentMethod>(
+        "StoredPaymentMethod",
+        &strings(&get_status["storedPaymentMethodFields"]),
     );
 
-    let example = get_status["savedCardExample"].clone();
-    let parsed: CheckoutStatus = serde_json::from_value(example).expect("deserializes");
+    for (form, example) in both_wire_forms(&get_status["savedCardExample"]) {
+        let parsed: CheckoutStatus =
+            serde_json::from_value(example).unwrap_or_else(|error| panic!("{form}: {error}"));
 
-    // The saved-card example is the plain example plus a paymentMethod: nothing
-    // else may move when a card was stored.
-    assert_eq!(parsed.status, status::SUCCEEDED);
-    assert_eq!(parsed.order_reference.as_deref(), Some("order-1042"));
-    let method = parsed
-        .payment_method
-        .expect("the example carries a payment method");
-    assert_eq!(method.id, PAYMENT_METHOD_ID);
-    assert_eq!(method.brand, "visa");
-    assert_eq!(method.last4, "4242");
-    assert_eq!(method.expiry_month, 12);
-    assert_eq!(method.expiry_year, 2029);
-    assert_eq!(method.status, payment_method_status::ACTIVE);
-    assert!(method.is_chargeable());
+        // The saved-card example is the plain example plus a storedPaymentMethod:
+        // nothing else may move when a card was stored.
+        assert_eq!(parsed.status, status::SUCCEEDED, "{form}");
+        assert_eq!(parsed.order_reference.as_deref(), Some("order-1042"));
+        let method = parsed
+            .stored_payment_method
+            .unwrap_or_else(|| panic!("{form}: the example carries a stored payment method"));
+        assert_eq!(method.id, PAYMENT_METHOD_ID);
+        assert_eq!(method.brand.as_deref(), Some("visa"));
+        assert_eq!(method.last4.as_deref(), Some("4242"));
+        assert_eq!(method.expiry_month, Some(12));
+        assert_eq!(method.expiry_year, Some(2029));
+        assert_eq!(method.status, stored_payment_method_status::ACTIVE);
+        assert!(method.is_chargeable());
+    }
 }
 
 #[test]
-fn every_payment_method_status_round_trips_and_only_active_is_chargeable() {
-    for value in strings(&contract()["paymentMethodStatusVocabulary"]) {
-        let method: PaymentMethod = serde_json::from_value(serde_json::json!({
+fn the_status_example_without_a_saved_card_reads_none_in_both_wire_forms() {
+    let get_status = endpoint("getStatus");
+    assert!(
+        get_status["example"]["storedPaymentMethod"].is_null(),
+        "the plain example has no stored card"
+    );
+
+    for (form, example) in both_wire_forms(&get_status["example"]) {
+        let server = MockServer::start(vec![Reply::enveloped(&example.to_string())]);
+        let parsed = client_for(&server)
+            .get_status("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0")
+            .unwrap_or_else(|error| panic!("{form}: {error}"));
+        assert_eq!(parsed.stored_payment_method, None, "{form}");
+    }
+}
+
+#[test]
+fn a_stored_payment_method_with_null_details_reads_none_in_both_wire_forms() {
+    let bare = serde_json::json!({
+        "id": PAYMENT_METHOD_ID,
+        "brand": null,
+        "last4": null,
+        "expiryMonth": null,
+        "expiryYear": null,
+        "status": "active",
+    });
+    for (form, example) in both_wire_forms(&bare) {
+        let method: StoredPaymentMethod =
+            serde_json::from_value(example).unwrap_or_else(|error| panic!("{form}: {error}"));
+        assert_eq!(method.brand, None, "{form}");
+        assert_eq!(method.last4, None, "{form}");
+        assert_eq!(method.expiry_month, None, "{form}");
+        assert_eq!(method.expiry_year, None, "{form}");
+        assert!(method.is_chargeable(), "{form}");
+    }
+}
+
+#[test]
+fn every_stored_payment_method_status_round_trips_and_only_active_is_chargeable() {
+    for value in strings(&contract()["storedPaymentMethodStatusVocabulary"]) {
+        let method: StoredPaymentMethod = serde_json::from_value(serde_json::json!({
             "id": PAYMENT_METHOD_ID,
             "brand": "visa",
             "last4": "4242",
@@ -441,7 +535,7 @@ fn every_payment_method_status_round_trips_and_only_active_is_chargeable() {
         assert_eq!(method.status, value);
         assert_eq!(
             method.is_chargeable(),
-            value == payment_method_status::ACTIVE,
+            value == stored_payment_method_status::ACTIVE,
             "{value}"
         );
     }
@@ -456,22 +550,44 @@ fn charge_payment_method_matches_the_contract() {
         "/merchant-api/payment-methods/{paymentMethodId}/charges"
     );
     assert_eq!(charge["httpStatus"], 201);
+    assert_eq!(charge["declinedHttpStatus"], 402);
     assert_fields::<PaymentMethodCharge>("PaymentMethodCharge", &strings(&charge["fields"]));
 
-    // Both examples carry exactly the declared fields, nulls included.
+    // Both examples are envelopes whose data carries exactly the declared
+    // fields, nulls included.
+    let mut fields = strings(&charge["fields"]);
+    fields.sort();
     for name in ["successExample", "declinedExample"] {
-        let mut keys: Vec<String> = charge[name]
-            .as_object()
-            .expect("an object")
-            .keys()
-            .cloned()
-            .collect();
-        let mut fields = strings(&charge["fields"]);
-        keys.sort();
-        fields.sort();
         assert_eq!(
-            keys, fields,
+            keys(&charge[name]["data"]),
+            fields,
             "{name} does not carry exactly the declared fields"
+        );
+    }
+    assert_eq!(charge["successExample"]["success"], true);
+    assert_eq!(charge["declinedExample"]["success"], false);
+    assert_eq!(
+        charge["declinedExample"]["error"]["code"],
+        "CHARGE_DECLINED"
+    );
+}
+
+#[test]
+fn every_charge_status_round_trips_and_only_succeeded_is_paid() {
+    for value in strings(&contract()["chargeStatusVocabulary"]) {
+        let mut data = endpoint("chargePaymentMethod")["successExample"]["data"].clone();
+        data["status"] = Value::String(value.clone());
+        let charge: PaymentMethodCharge = serde_json::from_value(data).expect("deserializes");
+        assert_eq!(charge.status, value);
+        assert_eq!(
+            charge.is_paid(),
+            value == charge_status::SUCCEEDED,
+            "{value}"
+        );
+        assert_eq!(
+            charge.is_terminal(),
+            value != charge_status::PENDING,
+            "{value}: only pending keeps the caller polling"
         );
     }
 }
@@ -479,76 +595,166 @@ fn charge_payment_method_matches_the_contract() {
 #[test]
 fn the_charge_success_example_comes_back_as_a_paid_charge() {
     let charge = endpoint("chargePaymentMethod");
-    let server = MockServer::start(vec![Reply::Json(201, charge["successExample"].to_string())]);
+    for (form, example) in both_wire_forms(&charge["successExample"]) {
+        let server = MockServer::start(vec![Reply::Json(201, example.to_string())]);
 
-    let result = client_for(&server)
-        .charge_payment_method(
-            PAYMENT_METHOD_ID,
-            &ChargeRequest::new(2500, "EUR", "order-1043"),
-        )
-        .expect("the success example is a charge");
+        let result = client_for(&server)
+            .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
+            .unwrap_or_else(|error| panic!("{form}: the success example is a charge: {error}"));
 
-    assert_eq!(result.charge_id, "chg_7a8b9c0d1e2f3a4b");
-    assert_eq!(result.status, charge_status::SUCCEEDED);
-    assert_eq!(result.decline_class, None);
-    assert_eq!(result.decline_code, None);
-    assert_eq!(
-        result.transaction_id,
-        "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
-    );
-    assert!(result.is_paid());
-    assert!(result.is_terminal());
+        assert_eq!(result.charge_id, "ch_1a2b3c4d5e6f4a7b8c9d0e1f2a3b4c5d");
+        assert_eq!(result.status, charge_status::SUCCEEDED);
+        assert_eq!(result.decline_class, None, "{form}");
+        assert_eq!(result.decline_code, None, "{form}");
+        assert_eq!(
+            result.transaction_id,
+            "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+        );
+        assert!(result.is_paid());
+        assert!(result.is_terminal());
+        assert_eq!(
+            result.raw, example["data"],
+            "{form}: raw is the charge object"
+        );
+    }
 }
 
 #[test]
 fn the_charge_declined_example_comes_back_as_a_failed_charge_not_an_error() {
     let charge = endpoint("chargePaymentMethod");
-    let server = MockServer::start(vec![Reply::Json(
-        201,
-        charge["declinedExample"].to_string(),
-    )]);
+    for (form, example) in both_wire_forms(&charge["declinedExample"]) {
+        let server = MockServer::start(vec![Reply::Json(402, example.to_string())]);
 
-    let result = client_for(&server)
-        .charge_payment_method(
-            PAYMENT_METHOD_ID,
-            &ChargeRequest::new(2500, "EUR", "order-1043"),
-        )
-        .expect("a decline is a result");
+        let result = client_for(&server)
+            .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
+            .unwrap_or_else(|error| panic!("{form}: a decline is a result: {error}"));
 
-    assert_eq!(result.charge_id, "chg_7a8b9c0d1e2f3a4c");
-    assert_eq!(result.status, charge_status::FAILED);
-    assert_eq!(
-        result.decline_class.as_deref(),
-        Some(decline_class::SOFT_FUNDS)
-    );
-    assert_eq!(result.decline_code.as_deref(), Some("51"));
-    assert_eq!(
-        result.transaction_id,
-        "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5e"
-    );
-    assert!(!result.is_paid());
-    assert!(result.is_terminal());
-    assert!(
-        decline_class::ALL.contains(&result.decline_class.as_deref().unwrap()),
-        "the example's decline class is inside the vocabulary"
-    );
+        assert_eq!(result.charge_id, "ch_1a2b3c4d5e6f4a7b8c9d0e1f2a3b4c5e");
+        assert_eq!(result.status, charge_status::FAILED);
+        assert_eq!(
+            result.decline_class.as_deref(),
+            Some(decline_class::SOFT_FUNDS)
+        );
+        assert_eq!(result.decline_code.as_deref(), Some("51"));
+        assert_eq!(
+            result.transaction_id,
+            "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5e"
+        );
+        assert!(!result.is_paid());
+        assert!(result.is_terminal());
+        assert!(
+            decline_class::ALL.contains(&result.decline_class.as_deref().unwrap()),
+            "the example's decline class is inside the vocabulary"
+        );
+    }
 }
 
 #[test]
-fn every_charge_refusal_code_survives_as_a_refusal() {
-    // The charge endpoint reuses the create endpoint's refusal shape.
-    for code in strings(&contract()["sessionRefusalErrorCodes"]) {
-        let server = MockServer::start(vec![Reply::enveloped(&format!(
-            r#"{{"success":false,"errorCode":"{code}","errorMessage":"refused","transactionId":"1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"}}"#
-        ))]);
+fn every_charge_error_example_comes_back_as_a_charge_error() {
+    let charge = endpoint("chargePaymentMethod");
+    let examples = charge["errorExamples"].as_array().expect("an array");
+    // Eight examples for seven codes: CHARGE_FAILED is spelled both with and
+    // without an attached charge row.
+    assert_eq!(
+        examples.len(),
+        8,
+        "the contract lists eight charge error examples"
+    );
+    let codes = strings(&contract()["chargeErrorCodes"]);
+    let mut seen: Vec<String> = examples
+        .iter()
+        .map(|example| example["code"].as_str().expect("a code").to_string())
+        .collect();
+    seen.sort();
+    seen.dedup();
+    let mut expected = codes.clone();
+    expected.sort();
+    assert_eq!(seen, expected, "every charge error code has an example");
+
+    for example in examples {
+        let http_status = example["httpStatus"].as_u64().expect("a status") as u16;
+        let code = example["code"].as_str().expect("a code");
+        assert!(codes.contains(&code.to_string()), "{code} is a listed code");
+        assert_eq!(example["body"]["error"]["code"], code);
+        let expects_charge = example["body"]["data"]["chargeId"].is_string();
+
+        for (form, body) in both_wire_forms(&example["body"]) {
+            let label = format!("{code} ({http_status}, {form})");
+            let server = MockServer::start(vec![Reply::Json(http_status, body.to_string())]);
+            let error = client_for(&server)
+                .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
+                .expect_err(&label);
+
+            assert!(!error.is_retryable(), "{label}");
+            assert_eq!(error.http_status(), Some(http_status), "{label}");
+            assert_eq!(error.code(), Some(code), "{label}");
+            match error {
+                Error::Charge {
+                    status,
+                    code: got,
+                    message,
+                    charge,
+                    transaction_id,
+                    raw,
+                } => {
+                    assert_eq!(status, http_status, "{label}");
+                    assert_eq!(got, code, "{label}");
+                    assert_eq!(message, example["body"]["error"]["message"], "{label}");
+                    assert_eq!(raw, body, "{label}: raw is the whole envelope");
+                    if expects_charge {
+                        let charge = charge.unwrap_or_else(|| panic!("{label}: charge attached"));
+                        assert_eq!(charge.charge_id, example["body"]["data"]["chargeId"]);
+                        assert_eq!(charge.status, example["body"]["data"]["status"]);
+                        assert_eq!(charge.decline_class, None, "{label}");
+                        assert_eq!(charge.decline_code, None, "{label}");
+                        assert_eq!(
+                            transaction_id.as_deref(),
+                            example["body"]["data"]["transactionId"].as_str(),
+                            "{label}"
+                        );
+                    } else {
+                        assert!(charge.is_none(), "{label}: no data, no charge");
+                        assert_eq!(transaction_id, None, "{label}");
+                    }
+                }
+                other => panic!("{label}: expected a charge error, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn the_charge_outcome_unknown_example_names_the_transaction_to_poll() {
+    let example = endpoint("chargePaymentMethod")["errorExamples"][0].clone();
+    assert_eq!(example["code"], charge_error_code::CHARGE_OUTCOME_UNKNOWN);
+
+    let server = MockServer::start(vec![Reply::Json(502, example["body"].to_string())]);
+    let error = client_for(&server)
+        .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
+        .expect_err("no verdict is not a charge");
+
+    match error {
+        Error::Charge {
+            transaction_id: Some(id),
+            ..
+        } => assert_eq!(id, "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5f"),
+        other => panic!("expected the transaction to poll, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_charge_not_found_example_is_an_api_error_with_its_code() {
+    let example = endpoint("chargePaymentMethod")["notFoundExample"].clone();
+    assert_eq!(example["httpStatus"], 404);
+
+    for (form, body) in both_wire_forms(&example["body"]) {
+        let server = MockServer::start(vec![Reply::Json(404, body.to_string())]);
         let error = client_for(&server)
-            .charge_payment_method(
-                PAYMENT_METHOD_ID,
-                &ChargeRequest::new(2500, "EUR", "order-1043"),
-            )
-            .expect_err(&format!("{code} must not come back as a charge"));
-        assert!(matches!(error, Error::Refusal { .. }), "{code}: {error:?}");
-        assert_eq!(error.code(), Some(code.as_str()));
+            .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
+            .expect_err("not found");
+        assert!(matches!(error, Error::Api { .. }), "{form}: {error:?}");
+        assert_eq!(error.http_status(), Some(404), "{form}");
+        assert_eq!(error.code(), Some("PAYMENT_METHOD_NOT_FOUND"), "{form}");
     }
 }
 
@@ -574,4 +780,69 @@ fn revoke_payment_method_matches_the_contract() {
     assert_eq!(recorded.method, "DELETE");
     assert_eq!(recorded.body, "");
     assert_eq!(recorded.header("Idempotency-Key"), None);
+}
+
+#[test]
+fn every_revoke_error_example_comes_back_as_a_revoke_error() {
+    let revoke = endpoint("revokePaymentMethod");
+    let examples = revoke["errorExamples"].as_array().expect("an array");
+    assert_eq!(
+        examples.len(),
+        2,
+        "the contract lists two revoke error examples"
+    );
+    let codes = strings(&contract()["revokeErrorCodes"]);
+
+    for example in examples {
+        let http_status = example["httpStatus"].as_u64().expect("a status") as u16;
+        let code = example["code"].as_str().expect("a code");
+        assert!(codes.contains(&code.to_string()), "{code} is a listed code");
+
+        for (form, body) in both_wire_forms(&example["body"]) {
+            let label = format!("{code} ({http_status}, {form})");
+            let server = MockServer::start(vec![Reply::Json(http_status, body.to_string())]);
+            let error = client_for(&server)
+                .revoke_payment_method(PAYMENT_METHOD_ID)
+                .expect_err(&label);
+
+            assert!(!error.is_retryable(), "{label}");
+            assert_eq!(error.http_status(), Some(http_status), "{label}");
+            assert_eq!(error.code(), Some(code), "{label}");
+            match error {
+                Error::Revoke {
+                    status,
+                    code: got,
+                    message,
+                    raw,
+                } => {
+                    assert_eq!(status, http_status, "{label}");
+                    assert_eq!(got, code, "{label}");
+                    assert_eq!(message, example["body"]["error"]["message"], "{label}");
+                    assert_eq!(raw, body, "{label}: raw is the whole envelope");
+                }
+                other => panic!("{label}: expected a revoke error, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn the_revoke_not_found_example_is_a_validation_error_api_error() {
+    let example = endpoint("revokePaymentMethod")["notFoundExample"].clone();
+    assert_eq!(example["httpStatus"], 404);
+    assert_eq!(example["code"], "VALIDATION_ERROR");
+    assert_eq!(
+        example["body"]["error"]["validationErrors"][0]["field"],
+        "id"
+    );
+
+    for (form, body) in both_wire_forms(&example["body"]) {
+        let server = MockServer::start(vec![Reply::Json(404, body.to_string())]);
+        let error = client_for(&server)
+            .revoke_payment_method(PAYMENT_METHOD_ID)
+            .expect_err("not found");
+        assert!(matches!(error, Error::Api { .. }), "{form}: {error:?}");
+        assert_eq!(error.http_status(), Some(404), "{form}");
+        assert_eq!(error.code(), Some("VALIDATION_ERROR"), "{form}");
+    }
 }
