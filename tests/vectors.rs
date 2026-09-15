@@ -94,3 +94,65 @@ fn the_idempotency_key_is_inside_the_signature() {
          request could be replayed with a fresh key to mint extra sessions"
     );
 }
+
+// Stored-payment-method vectors, same secret and timestamp. The charge vector is
+// the only POST besides sessions and the only one whose canonical path carries a
+// resource id; the revoke vector pins that DELETE signs an empty key and an
+// empty body exactly like GET. Shared byte-for-byte with the gateway's
+// MerchantApiRequestAuthenticator tests.
+const PAYMENT_METHODS_PATH: &str = "/merchant-api/payment-methods";
+const PAYMENT_METHOD_ID: &str = "pm_0123456789abcdef0123456789abcdef";
+
+#[test]
+fn charge_vector_signs_a_post_with_a_body_and_a_key_on_the_payment_methods_path() {
+    let body = r#"{"amount":2500,"currency":"EUR","orderReference":"order-1043"}"#;
+
+    assert_eq!(
+        sha256_hex(body),
+        "641a0d2b08f88ebc458dca49410dede0a166359a5030bff5c977e507f13ab828"
+    );
+
+    let signature = sign_request(SignRequest {
+        secret: SECRET,
+        timestamp: "1755302400",
+        method: "POST",
+        path: &format!("{PAYMENT_METHODS_PATH}/{PAYMENT_METHOD_ID}/charges"),
+        idempotency_key: "00000000-0000-4000-8000-000000000003",
+        body,
+    });
+
+    assert_eq!(
+        signature,
+        "9ce9f54efa2533a46aa4493b97b56aeb657f41d6a18f1c008c7fd412029aebf9"
+    );
+}
+
+#[test]
+fn revoke_vector_signs_a_delete_with_an_empty_key_and_an_empty_body() {
+    let path = format!("{PAYMENT_METHODS_PATH}/{PAYMENT_METHOD_ID}");
+    let signature = sign_request(SignRequest {
+        secret: SECRET,
+        timestamp: "1755302400",
+        method: "DELETE",
+        path: &path,
+        idempotency_key: "",
+        body: "",
+    });
+
+    assert_eq!(
+        signature,
+        "9330100343c4b820504890a09829a193d5815ca39e92160fdfc13d320a802a02"
+    );
+
+    // Same recipe as the GET vector: only the method moved, so the signature
+    // must move too.
+    let as_get = sign_request(SignRequest {
+        secret: SECRET,
+        timestamp: "1755302400",
+        method: "GET",
+        path: &path,
+        idempotency_key: "",
+        body: "",
+    });
+    assert_ne!(signature, as_get, "the method is inside the signature");
+}

@@ -259,6 +259,78 @@ A session is valid for about 2 hours. If the payer comes back later, create a ne
 re-rendering the widget for a stored session, read the status first: a completed session's
 widget shows "session is closed or expired", which reads as an error to someone who just paid.
 
+## Stored payment methods (recurring)
+
+A session can ask the payer to save their card for later. Set `save_card(true)` on the request;
+nothing else about the session changes, and a request without it sends the exact same bytes as
+before (the flag is omitted, not sent as `false`).
+
+```rust
+let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042").save_card(true);
+let session = client.create_checkout_session(&request)?;
+```
+
+Once that session is paid, `get_status` carries a `payment_method`: an id, the brand, the last
+four digits, the expiry and a status (`active`, `revoked` or `expired`). Persist the id against
+your customer. The full card number never reaches the SDK, and the provider token behind the id
+never leaves the gateway.
+
+```rust
+let status = client.get_status(&session.transaction_id)?;
+if let Some(method) = &status.payment_method {
+    if method.is_chargeable() {
+        store_for_customer(customer_id, &method.id); // pm_...
+    }
+}
+```
+
+Charge the stored card later, off-session, with `charge_payment_method`. The call takes the
+same amount, currency and order reference as a session, and an idempotency key that is required
+and signed exactly like `create_checkout_session` (one is generated when you do not pass one;
+pin your own when you retry).
+
+```rust
+use dominaite::{charge_status, decline_class, ChargeRequest};
+
+let charge = client.charge_payment_method(
+    &method_id,
+    &ChargeRequest::new(2500, "EUR", "order-1043").description("Monthly plan"),
+)?;
+
+match charge.status.as_str() {
+    charge_status::SUCCEEDED => mark_paid(&charge.transaction_id),
+    charge_status::PENDING => poll_later(&charge.transaction_id), // not terminal
+    _ => match charge.decline_class.as_deref() {
+        Some(decline_class::HARD) => stop_charging(&method_id),      // never retry
+        Some(decline_class::SOFT_FUNDS) => retry_in_a_few_days(),
+        Some(decline_class::SOFT_SCA_REQUIRED) => bring_the_payer_back(), // needs a session
+        _ => retry_later(),                                              // soft_other
+    },
+}
+```
+
+A decline is a result, not an error: HTTP 201 with `status: "failed"` and a `decline_class`
+(`hard`, `soft_funds`, `soft_sca_required` or `soft_other`) plus the provider's `decline_code`.
+`is_paid()` and `is_terminal()` read the same way they do on a session status. What arrives as
+`Error::Refusal` is the gateway refusing to attempt the charge at all: a replayed key, payments
+switched off, or a method that is revoked or expired. Those use the same codes as a session
+refusal, so the handling in [Errors](#errors) applies. A 404 is a method id that is not yours.
+
+`revoke_payment_method` drops the card: the gateway revokes the token at the provider and marks
+the method `revoked`, and any later charge on it is refused. It is a signed `DELETE` with an
+empty key and an empty body (the same recipe as GET) and resolves on HTTP 204.
+
+```rust
+client.revoke_payment_method(&method_id)?;
+```
+
+Both routes are pinned by known-answer vectors in `tests/vectors.rs` next to the session ones,
+shared byte-for-byte with the gateway: the charge vector signs
+`POST /merchant-api/payment-methods/pm_0123456789abcdef0123456789abcdef/charges` with key
+`00000000-0000-4000-8000-000000000003` and body
+`{"amount":2500,"currency":"EUR","orderReference":"order-1043"}`, the revoke vector signs the
+`DELETE` with nothing else.
+
 ## Webhooks
 
 Webhooks are how you find out a payment succeeded without asking. Point an endpoint at your

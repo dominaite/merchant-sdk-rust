@@ -125,8 +125,8 @@ pub fn verify_webhook(
     let SignatureHeader { timestamp, mac } = parse_signature_header(signature_header)?;
 
     // HMAC accepts a key of any length, so this cannot fail.
-    let mut hmac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-        .expect("HMAC accepts keys of any length");
+    let mut hmac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
     hmac.update(format!("{timestamp}.{payload}").as_bytes());
     hmac.verify_slice(&mac)
         .map_err(|_| WebhookError::SignatureMismatch)?;
@@ -210,7 +210,10 @@ fn parse_signature_header(header: &str) -> Result<SignatureHeader<'_>, WebhookEr
                 }
                 // Uppercase hex decodes fine but the platform never emits it,
                 // so accepting it would widen the accept set for nothing.
-                if !value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                if !value
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                {
                     return Err(malformed("v1 signature is not lowercase hex"));
                 }
                 let decoded = hex::decode(value)

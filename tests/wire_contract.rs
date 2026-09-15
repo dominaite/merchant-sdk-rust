@@ -33,5 +33,9 @@ fn status_vocabulary_matches_the_gateway_in_order() {
 #[test]
 fn the_contract_still_lists_this_sdk() {
     let wire = wire();
-    assert!(strings(&wire["sdks"]).contains(&"rust"), "sdks: {}", wire["sdks"]);
+    assert!(
+        strings(&wire["sdks"]).contains(&"rust"),
+        "sdks: {}",
+        wire["sdks"]
+    );
 }

@@ -90,6 +90,14 @@ pub struct CheckoutSessionRequest {
     /// Free-text description.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Ask the gateway to keep the card on file once this payment is approved, so
+    /// you can charge it again later with
+    /// [`Client::charge_payment_method`](crate::Client::charge_payment_method).
+    /// The stored method shows up on [`CheckoutStatus::payment_method`] after the
+    /// payment succeeds; a declined first payment stores nothing. The card details
+    /// themselves never reach you: you get an id, a brand and the last four digits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub save_card: Option<bool>,
 
     /// Auto-generated when unset. It travels in the header and in the signature,
     /// never in the body. Retrying with the same key never creates a second
@@ -119,6 +127,7 @@ impl CheckoutSessionRequest {
             language: None,
             theme: None,
             description: None,
+            save_card: None,
             idempotency_key: None,
             extra: Map::new(),
         }
@@ -151,6 +160,13 @@ impl CheckoutSessionRequest {
     /// Sets the description.
     pub fn description(mut self, value: impl Into<String>) -> Self {
         self.description = Some(value.into());
+        self
+    }
+
+    /// Keeps the card on file once this payment succeeds. See
+    /// [`CheckoutSessionRequest::save_card`].
+    pub fn save_card(mut self, value: bool) -> Self {
+        self.save_card = Some(value);
         self
     }
 
@@ -273,6 +289,13 @@ pub struct CheckoutStatus {
     /// Present only while the session is still payable.
     #[serde(default)]
     pub expires_at: Option<String>,
+    /// The card kept on file for this payment. Present once a session created
+    /// with [`CheckoutSessionRequest::save_card`] has succeeded; `None`
+    /// otherwise. Store `payment_method.id` against your customer - it is what
+    /// [`Client::charge_payment_method`](crate::Client::charge_payment_method)
+    /// takes.
+    #[serde(default)]
+    pub payment_method: Option<PaymentMethod>,
 
     /// The unparsed payload, for fields this struct does not model yet.
     #[serde(skip)]
@@ -335,4 +358,194 @@ pub struct Ping {
     /// The unparsed payload, for fields this struct does not model yet.
     #[serde(skip)]
     pub raw: Value,
+}
+
+/// Stored payment method status wire values, on [`PaymentMethod::status`].
+pub mod payment_method_status {
+    /// Chargeable.
+    pub const ACTIVE: &str = "active";
+    /// What [`Client::revoke_payment_method`](crate::Client::revoke_payment_method)
+    /// leaves behind. A charge on it is refused.
+    pub const REVOKED: &str = "revoked";
+    /// The card's expiry date has passed.
+    pub const EXPIRED: &str = "expired";
+
+    /// The whole vocabulary, in the order the canonical contract lists it. Treat
+    /// a value outside it as not chargeable.
+    pub const ALL: [&str; 3] = [ACTIVE, REVOKED, EXPIRED];
+}
+
+/// A card kept on file. Never the card number, never the PSP token - only what
+/// you may show a customer.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaymentMethod {
+    /// Opaque id, `pm_...` - the handle you charge and revoke with.
+    pub id: String,
+    /// Card brand as the gateway reports it, e.g. `"visa"`, `"mastercard"`.
+    #[serde(default)]
+    pub brand: String,
+    /// Last four digits of the card number, for display only.
+    #[serde(default)]
+    pub last4: String,
+    /// 1 to 12.
+    #[serde(default)]
+    pub expiry_month: u8,
+    /// Four digits, e.g. 2029.
+    #[serde(default)]
+    pub expiry_year: u16,
+    /// One of the [`payment_method_status`] constants. Compare with
+    /// [`PaymentMethod::is_chargeable`] rather than by hand.
+    pub status: String,
+}
+
+impl PaymentMethod {
+    /// True only for `active`. An unrecognised status is reported as NOT
+    /// chargeable, so a status the API adds later never charges a card the
+    /// gateway would refuse anyway.
+    pub fn is_chargeable(&self) -> bool {
+        self.status == payment_method_status::ACTIVE
+    }
+}
+
+/// The parameters for [`Client::charge_payment_method`](crate::Client::charge_payment_method).
+///
+/// `amount`, `currency` and `order_reference` are required and come from
+/// [`ChargeRequest::new`]; the rest are builder methods. The body is exactly
+/// these fields, in this order - it is what gets signed.
+///
+/// ```
+/// use dominaite::ChargeRequest;
+///
+/// let request = ChargeRequest::new(2500, "EUR", "sub-8817-2026-10")
+///     .description("Monthly plan, October")
+///     .idempotency_key("sub-8817-2026-10");
+/// ```
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChargeRequest {
+    /// The amount in MINOR units: `2500` is 25.00 EUR. Integers only.
+    pub amount: i64,
+    /// ISO 4217 currency, e.g. `"EUR"`.
+    pub currency: String,
+    /// Your own order id, at most 100 characters. It shows up in your dashboard.
+    pub order_reference: String,
+    /// Free-text description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// Auto-generated when unset. It travels in the header and in the signature,
+    /// never in the body. Retrying with the same key never charges the card
+    /// twice, so on a timeout retry with the same key. Derive it from the
+    /// billing period, never mint one per attempt.
+    #[serde(skip)]
+    pub idempotency_key: Option<String>,
+}
+
+impl ChargeRequest {
+    /// A charge for one payment. The amount is in MINOR units.
+    pub fn new(
+        amount: i64,
+        currency: impl Into<String>,
+        order_reference: impl Into<String>,
+    ) -> Self {
+        ChargeRequest {
+            amount,
+            currency: currency.into(),
+            order_reference: order_reference.into(),
+            description: None,
+            idempotency_key: None,
+        }
+    }
+
+    /// Sets the description.
+    pub fn description(mut self, value: impl Into<String>) -> Self {
+        self.description = Some(value.into());
+        self
+    }
+
+    /// Pins the idempotency key instead of letting the SDK generate one. Reuse
+    /// the same key when you retry a call that failed at the transport level.
+    pub fn idempotency_key(mut self, value: impl Into<String>) -> Self {
+        self.idempotency_key = Some(value.into());
+        self
+    }
+}
+
+/// Charge status wire values, on [`PaymentMethodCharge::status`].
+pub mod charge_status {
+    /// The card was charged.
+    pub const SUCCEEDED: &str = "succeeded";
+    /// The issuer declined; see [`PaymentMethodCharge::decline_class`](crate::PaymentMethodCharge::decline_class).
+    pub const FAILED: &str = "failed";
+    /// Not terminal: poll [`Client::get_status`](crate::Client::get_status)
+    /// with the charge's transaction id.
+    pub const PENDING: &str = "pending";
+
+    /// The whole vocabulary, in the order the canonical contract lists it. Treat
+    /// a value outside it as still open.
+    pub const ALL: [&str; 3] = [SUCCEEDED, FAILED, PENDING];
+}
+
+/// Decline class wire values, on [`PaymentMethodCharge::decline_class`](crate::PaymentMethodCharge::decline_class). Coarse
+/// enough to act on without reading the issuer's code.
+pub mod decline_class {
+    /// Do not retry this card; ask the customer for another one.
+    pub const HARD: &str = "hard";
+    /// Insufficient funds; retry later (after the customer's payday, not in a loop).
+    pub const SOFT_FUNDS: &str = "soft_funds";
+    /// The issuer wants the customer present; send them through a hosted
+    /// checkout session with `save_card` instead of charging off-session again.
+    pub const SOFT_SCA_REQUIRED: &str = "soft_sca_required";
+    /// A transient issuer or network condition; one retry later is reasonable.
+    pub const SOFT_OTHER: &str = "soft_other";
+
+    /// The whole vocabulary, in the order the canonical contract lists it.
+    pub const ALL: [&str; 4] = [HARD, SOFT_FUNDS, SOFT_SCA_REQUIRED, SOFT_OTHER];
+}
+
+/// What [`Client::charge_payment_method`](crate::Client::charge_payment_method)
+/// returns. A decline is a result, not an error: `status` is `failed` and
+/// `decline_class` says what to do next.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaymentMethodCharge {
+    /// The charge id.
+    pub charge_id: String,
+    /// One of the [`charge_status`] constants. Compare with
+    /// [`PaymentMethodCharge::is_paid`] and [`PaymentMethodCharge::is_terminal`]
+    /// rather than by hand.
+    pub status: String,
+    /// One of the [`decline_class`] constants, present when `status` is `failed`.
+    #[serde(default)]
+    pub decline_class: Option<String>,
+    /// The raw decline code, for your logs; branch on `decline_class` instead.
+    #[serde(default)]
+    pub decline_code: Option<String>,
+    /// The transaction the charge created; readable with
+    /// [`Client::get_status`](crate::Client::get_status).
+    #[serde(default)]
+    pub transaction_id: String,
+
+    /// The unparsed payload, for fields this struct does not model yet.
+    #[serde(skip)]
+    pub raw: Value,
+}
+
+impl PaymentMethodCharge {
+    /// True only for `succeeded`.
+    pub fn is_paid(&self) -> bool {
+        self.status == charge_status::SUCCEEDED
+    }
+
+    /// False while the charge can still change, true once it cannot.
+    ///
+    /// An unrecognised status is reported as NOT terminal, so a status the API
+    /// adds later keeps you polling rather than silently closing a live charge.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            charge_status::SUCCEEDED | charge_status::FAILED
+        )
+    }
 }

@@ -224,6 +224,8 @@ fn write_body(
 fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        201 => "Created",
+        204 => "No Content",
         302 => "Found",
         307 => "Temporary Redirect",
         401 => "Unauthorized",

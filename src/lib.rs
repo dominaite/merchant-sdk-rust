@@ -43,9 +43,13 @@ mod types;
 mod webhooks;
 
 pub use client::{
-    Client, ClientBuilder, RetryOptions, DEFAULT_BASE_URL, PING_PATH, SESSIONS_PATH, VERSION,
+    Client, ClientBuilder, RetryOptions, DEFAULT_BASE_URL, PAYMENT_METHODS_PATH, PING_PATH,
+    SESSIONS_PATH, VERSION,
 };
 pub use error::{Error, Result};
 pub use signing::{sha256_hex, sign_request, SignRequest};
-pub use types::{status, CheckoutSession, CheckoutSessionRequest, CheckoutStatus, Customer, Ping};
+pub use types::{
+    charge_status, decline_class, payment_method_status, status, ChargeRequest, CheckoutSession,
+    CheckoutSessionRequest, CheckoutStatus, Customer, PaymentMethod, PaymentMethodCharge, Ping,
+};
 pub use webhooks::{verify_webhook, WebhookError, DEFAULT_TOLERANCE_SECS};

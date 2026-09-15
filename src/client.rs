@@ -8,7 +8,10 @@ use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::signing::{sign_request, SignRequest};
-use crate::types::{CheckoutSession, CheckoutSessionRequest, CheckoutStatus, Ping};
+use crate::types::{
+    ChargeRequest, CheckoutSession, CheckoutSessionRequest, CheckoutStatus, PaymentMethodCharge,
+    Ping,
+};
 
 /// The production merchant API.
 pub const DEFAULT_BASE_URL: &str = "https://api.dominaite.com/payments";
@@ -16,6 +19,11 @@ pub const DEFAULT_BASE_URL: &str = "https://api.dominaite.com/payments";
 /// The canonical path that gets signed. POST creates a session; GET
 /// `SESSIONS_PATH/{transaction_id}` reads its status.
 pub const SESSIONS_PATH: &str = "/merchant-api/checkout/sessions";
+
+/// The canonical path of stored payment methods. POST
+/// `PAYMENT_METHODS_PATH/{payment_method_id}/charges` charges one; DELETE
+/// `PAYMENT_METHODS_PATH/{payment_method_id}` revokes it.
+pub const PAYMENT_METHODS_PATH: &str = "/merchant-api/payment-methods";
 
 /// The credentials-and-clock smoke test. Creates nothing.
 pub const PING_PATH: &str = "/merchant-api/ping";
@@ -366,8 +374,78 @@ impl Client {
         Ok(status)
     }
 
+    /// Charges a card kept on file, off-session: no widget, no payer present.
+    ///
+    /// `payment_method_id` is the `id` from [`CheckoutStatus::payment_method`]
+    /// of a session you created with [`CheckoutSessionRequest::save_card`]. The
+    /// charge is signed like a session and carries an `Idempotency-Key`
+    /// (auto-generated unless you set one), so retrying after a timeout WITH THE
+    /// SAME KEY never charges the card twice.
+    ///
+    /// A decline is not an error: the returned charge has `status` `failed` plus
+    /// a `decline_class` telling you whether to give up on the card (`hard`),
+    /// wait (`soft_funds`, `soft_other`) or bring the customer back for a hosted
+    /// session (`soft_sca_required`). `pending` is not terminal - poll
+    /// [`Client::get_status`] with `charge.transaction_id`.
+    ///
+    /// Errors it returns:
+    /// - [`Error::Validation`]: bad arguments; nothing was sent.
+    /// - [`Error::Auth`]: wrong credentials, bad signature, clock off, IP not
+    ///   allowlisted.
+    /// - [`Error::Refusal`]: the gateway refused to attempt the charge at all
+    ///   (replayed key, payments off, method not chargeable); inspect `code`.
+    /// - [`Error::Api`]: 404 for an id that is not yours, a 4xx validation
+    ///   rejection, or an unexpected response.
+    /// - [`Error::RateLimited`]: HTTP 429. Wait, then send it again with the
+    ///   same idempotency key.
+    /// - [`Error::Transport`]: network failure or 5xx. Safe to retry WITH the
+    ///   same idempotency key.
+    pub fn charge_payment_method(
+        &self,
+        payment_method_id: &str,
+        request: &ChargeRequest,
+    ) -> Result<PaymentMethodCharge> {
+        let id = normalize_payment_method_id(payment_method_id)?;
+        let (idempotency_key, body) = prepare_charge_request(request)?;
+        let path = format!("{PAYMENT_METHODS_PATH}/{id}/charges");
+        let payload = self.request("POST", &path, &body, &idempotency_key)?;
+
+        // Business refusals reuse the create endpoint's success=false shape, so
+        // the branch is on that flag and the presence of a charge id, not on the
+        // status code.
+        let refused = payload.get("success").and_then(Value::as_bool) == Some(false);
+        if refused || string_field(&payload, "chargeId").is_none() {
+            return Err(Error::refusal(
+                string_field(&payload, "errorCode").unwrap_or_else(|| "UNKNOWN".to_string()),
+                string_field(&payload, "errorMessage")
+                    .unwrap_or_else(|| "The charge was refused.".to_string()),
+                string_field(&payload, "transactionId"),
+            ));
+        }
+
+        let mut charge: PaymentMethodCharge = serde_json::from_value(payload.clone())
+            .map_err(|_| Error::api(201, "The API returned an unexpected charge response"))?;
+        charge.raw = payload;
+        Ok(charge)
+    }
+
+    /// Revokes a card kept on file. The token is dropped at the payment
+    /// provider and the method's status becomes `revoked`; a later
+    /// [`Client::charge_payment_method`] on it is refused. Returns `Ok(())` on
+    /// success (HTTP 204). An id that is not yours returns [`Error::Api`] with
+    /// status 404. Not a payment operation: no idempotency key is signed.
+    pub fn revoke_payment_method(&self, payment_method_id: &str) -> Result<()> {
+        let id = normalize_payment_method_id(payment_method_id)?;
+
+        // DELETE signs an EMPTY idempotency key and an EMPTY body, like GET, and
+        // sends no Idempotency-Key header.
+        let path = format!("{PAYMENT_METHODS_PATH}/{id}");
+        self.request("DELETE", &path, "", "")?;
+        Ok(())
+    }
+
     /// Signs and sends one call, and maps the response onto the error taxonomy.
-    /// `body` and `idempotency_key` are both empty for GET.
+    /// `body` and `idempotency_key` are both empty for GET and DELETE.
     fn request(
         &self,
         method: &str,
@@ -398,7 +476,8 @@ impl Client {
             .header("X-Timestamp", &timestamp)
             .header("X-Signature", &signature);
 
-        // No Idempotency-Key header on GET, matching the empty key it signed.
+        // No Idempotency-Key header on GET or DELETE, matching the empty key
+        // they signed.
         if !idempotency_key.is_empty() {
             builder = builder.header("Idempotency-Key", idempotency_key);
         }
@@ -458,6 +537,11 @@ impl Client {
         // 5xx anyway.
         if http_status >= 500 {
             return Err(classify_status(http_status, None, None));
+        }
+
+        // 204 carries nothing to parse; the status is the whole answer.
+        if http_status == 204 {
+            return Ok(Value::Object(serde_json::Map::new()));
         }
 
         // Bounded on purpose: `read_to_string` caps at ureq's default 10MB, so a
@@ -619,15 +703,46 @@ fn classify_status(status: u16, code: Option<String>, message: Option<String>) -
 /// second serialization would let key ordering or escaping drift between the
 /// signature and the wire.
 fn prepare_session_request(request: &CheckoutSessionRequest) -> Result<(String, String)> {
-    if request.amount <= 0 {
+    validate_money_params(request.amount, &request.currency, &request.order_reference)?;
+    let idempotency_key = normalize_idempotency_key(request.idempotency_key.as_deref())?;
+
+    let body = serde_json::to_string(request).map_err(|error| {
+        Error::validation(format!(
+            "Request parameters are not JSON-encodable: {error}"
+        ))
+    })?;
+
+    Ok((idempotency_key, body))
+}
+
+/// `prepare_session_request` for a charge: same money checks, same key
+/// handling, and the body is exactly the contract's fields in declaration
+/// order, which is what gets signed.
+fn prepare_charge_request(request: &ChargeRequest) -> Result<(String, String)> {
+    validate_money_params(request.amount, &request.currency, &request.order_reference)?;
+    let idempotency_key = normalize_idempotency_key(request.idempotency_key.as_deref())?;
+
+    let body = serde_json::to_string(request).map_err(|error| {
+        Error::validation(format!(
+            "Request parameters are not JSON-encodable: {error}"
+        ))
+    })?;
+
+    Ok((idempotency_key, body))
+}
+
+/// The checks shared by every request that moves money: amount, currency,
+/// order reference.
+fn validate_money_params(amount: i64, currency: &str, order_reference: &str) -> Result<()> {
+    if amount <= 0 {
         return Err(Error::validation(
             "amount must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR)",
         ));
     }
-    if request.currency.trim().is_empty() {
+    if currency.trim().is_empty() {
         return Err(Error::validation("Missing required parameter: currency"));
     }
-    if request.order_reference.trim().is_empty() {
+    if order_reference.trim().is_empty() {
         return Err(Error::validation(
             "Missing required parameter: order_reference",
         ));
@@ -639,33 +754,46 @@ fn prepare_session_request(request: &CheckoutSessionRequest) -> Result<(String, 
     // The server counts UTF-16 units and stays the final arbiter, so a reference
     // built from astral characters (emoji, rarer CJK) can still be rejected
     // there: each one is a single code point here and two units there.
-    if request.order_reference.chars().count() > 100 {
+    if order_reference.chars().count() > 100 {
         return Err(Error::validation(
             "order_reference must be at most 100 characters",
         ));
     }
+    Ok(())
+}
 
-    let idempotency_key = match &request.idempotency_key {
+/// Mints a key when none was given and bounds the one that was.
+fn normalize_idempotency_key(idempotency_key: Option<&str>) -> Result<String> {
+    match idempotency_key {
         Some(key) if key.trim().is_empty() => {
-            return Err(Error::validation("idempotency_key must not be empty"))
+            Err(Error::validation("idempotency_key must not be empty"))
         }
         // Characters, not bytes, for the same reason as order_reference above.
-        Some(key) if key.chars().count() > 100 => {
-            return Err(Error::validation(
-                "idempotency_key must be at most 100 characters",
-            ))
-        }
-        Some(key) => key.clone(),
-        None => new_idempotency_key(),
-    };
+        Some(key) if key.chars().count() > 100 => Err(Error::validation(
+            "idempotency_key must be at most 100 characters",
+        )),
+        Some(key) => Ok(key.to_string()),
+        None => Ok(new_idempotency_key()),
+    }
+}
 
-    let body = serde_json::to_string(request).map_err(|error| {
-        Error::validation(format!(
-            "Request parameters are not JSON-encodable: {error}"
-        ))
-    })?;
-
-    Ok((idempotency_key, body))
+/// A payment method id is opaque (`pm_...`), so this only pins what keeps it a
+/// single path segment: no slash, no query, no whitespace, nothing that needs
+/// percent-encoding. The id goes into the signed canonical path verbatim, so
+/// anything else would sign one path and request another.
+fn normalize_payment_method_id(payment_method_id: &str) -> Result<String> {
+    let normalized = payment_method_id.trim();
+    let well_formed = !normalized.is_empty()
+        && normalized.len() <= 100
+        && normalized
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+    if !well_formed {
+        return Err(Error::validation(
+            "payment_method_id must be the payment_method.id from get_status",
+        ));
+    }
+    Ok(normalized.to_string())
 }
 
 fn string_field(value: &Value, field: &str) -> Option<String> {

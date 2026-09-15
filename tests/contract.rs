@@ -9,7 +9,9 @@
 //! response type deserializes the fixture's example, each type's serde field set
 //! is exactly the fixture's field list (no extra, none missing), every session
 //! refusal code comes back out of the client as a refusal that keeps its code,
-//! and every validation code comes back as a 400 that keeps its code.
+//! every validation code comes back as a 400 that keeps its code, and the
+//! stored-payment-method vocabularies, field sets and examples (the saved-card
+//! status, a succeeded and a declined charge, the bodiless revoke) match too.
 
 // Only part of the mock server is needed here; the client tests use the rest.
 #[allow(dead_code)]
@@ -22,7 +24,10 @@ use serde::de::{self, DeserializeOwned, Deserializer, Visitor};
 use serde::forward_to_deserialize_any;
 use serde_json::Value;
 
-use dominaite::{status, CheckoutSession, CheckoutStatus, Client, Error, Ping};
+use dominaite::{
+    charge_status, decline_class, payment_method_status, status, ChargeRequest, CheckoutSession,
+    CheckoutStatus, Client, Error, PaymentMethod, PaymentMethodCharge, Ping,
+};
 use support::{MockServer, Reply};
 
 const FIXTURE: &str = include_str!("merchant-api-contract.json");
@@ -366,4 +371,207 @@ fn every_contract_validation_code_survives_with_its_status() {
             "{code} is a rejected request, not a refused payment: got {error:?}"
         );
     }
+}
+
+const PAYMENT_METHOD_ID: &str = "pm_0123456789abcdef0123456789abcdef";
+
+#[test]
+fn the_payment_method_status_vocabulary_is_exactly_the_contracts() {
+    assert_eq!(
+        payment_method_status::ALL.to_vec(),
+        strings(&contract()["paymentMethodStatusVocabulary"]),
+        "the SDK payment method status vocabulary drifted from the contract"
+    );
+}
+
+#[test]
+fn the_charge_vocabularies_are_exactly_the_contracts() {
+    let contract = contract();
+    assert_eq!(
+        charge_status::ALL.to_vec(),
+        strings(&contract["chargeStatusVocabulary"]),
+        "the SDK charge status vocabulary drifted from the contract"
+    );
+    assert_eq!(
+        decline_class::ALL.to_vec(),
+        strings(&contract["declineClassVocabulary"]),
+        "the SDK decline class vocabulary drifted from the contract"
+    );
+}
+
+#[test]
+fn the_payment_method_object_matches_the_contract() {
+    let get_status = endpoint("getStatus");
+    assert_fields::<PaymentMethod>(
+        "PaymentMethod",
+        &strings(&get_status["paymentMethodFields"]),
+    );
+
+    let example = get_status["savedCardExample"].clone();
+    let parsed: CheckoutStatus = serde_json::from_value(example).expect("deserializes");
+
+    // The saved-card example is the plain example plus a paymentMethod: nothing
+    // else may move when a card was stored.
+    assert_eq!(parsed.status, status::SUCCEEDED);
+    assert_eq!(parsed.order_reference.as_deref(), Some("order-1042"));
+    let method = parsed
+        .payment_method
+        .expect("the example carries a payment method");
+    assert_eq!(method.id, PAYMENT_METHOD_ID);
+    assert_eq!(method.brand, "visa");
+    assert_eq!(method.last4, "4242");
+    assert_eq!(method.expiry_month, 12);
+    assert_eq!(method.expiry_year, 2029);
+    assert_eq!(method.status, payment_method_status::ACTIVE);
+    assert!(method.is_chargeable());
+}
+
+#[test]
+fn every_payment_method_status_round_trips_and_only_active_is_chargeable() {
+    for value in strings(&contract()["paymentMethodStatusVocabulary"]) {
+        let method: PaymentMethod = serde_json::from_value(serde_json::json!({
+            "id": PAYMENT_METHOD_ID,
+            "brand": "visa",
+            "last4": "4242",
+            "expiryMonth": 12,
+            "expiryYear": 2029,
+            "status": value,
+        }))
+        .expect("deserializes");
+        assert_eq!(method.status, value);
+        assert_eq!(
+            method.is_chargeable(),
+            value == payment_method_status::ACTIVE,
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn charge_payment_method_matches_the_contract() {
+    let charge = endpoint("chargePaymentMethod");
+    assert_eq!(charge["method"], "POST");
+    assert_eq!(
+        charge["path"],
+        "/merchant-api/payment-methods/{paymentMethodId}/charges"
+    );
+    assert_eq!(charge["httpStatus"], 201);
+    assert_fields::<PaymentMethodCharge>("PaymentMethodCharge", &strings(&charge["fields"]));
+
+    // Both examples carry exactly the declared fields, nulls included.
+    for name in ["successExample", "declinedExample"] {
+        let mut keys: Vec<String> = charge[name]
+            .as_object()
+            .expect("an object")
+            .keys()
+            .cloned()
+            .collect();
+        let mut fields = strings(&charge["fields"]);
+        keys.sort();
+        fields.sort();
+        assert_eq!(
+            keys, fields,
+            "{name} does not carry exactly the declared fields"
+        );
+    }
+}
+
+#[test]
+fn the_charge_success_example_comes_back_as_a_paid_charge() {
+    let charge = endpoint("chargePaymentMethod");
+    let server = MockServer::start(vec![Reply::Json(201, charge["successExample"].to_string())]);
+
+    let result = client_for(&server)
+        .charge_payment_method(
+            PAYMENT_METHOD_ID,
+            &ChargeRequest::new(2500, "EUR", "order-1043"),
+        )
+        .expect("the success example is a charge");
+
+    assert_eq!(result.charge_id, "chg_7a8b9c0d1e2f3a4b");
+    assert_eq!(result.status, charge_status::SUCCEEDED);
+    assert_eq!(result.decline_class, None);
+    assert_eq!(result.decline_code, None);
+    assert_eq!(
+        result.transaction_id,
+        "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+    );
+    assert!(result.is_paid());
+    assert!(result.is_terminal());
+}
+
+#[test]
+fn the_charge_declined_example_comes_back_as_a_failed_charge_not_an_error() {
+    let charge = endpoint("chargePaymentMethod");
+    let server = MockServer::start(vec![Reply::Json(
+        201,
+        charge["declinedExample"].to_string(),
+    )]);
+
+    let result = client_for(&server)
+        .charge_payment_method(
+            PAYMENT_METHOD_ID,
+            &ChargeRequest::new(2500, "EUR", "order-1043"),
+        )
+        .expect("a decline is a result");
+
+    assert_eq!(result.charge_id, "chg_7a8b9c0d1e2f3a4c");
+    assert_eq!(result.status, charge_status::FAILED);
+    assert_eq!(
+        result.decline_class.as_deref(),
+        Some(decline_class::SOFT_FUNDS)
+    );
+    assert_eq!(result.decline_code.as_deref(), Some("51"));
+    assert_eq!(
+        result.transaction_id,
+        "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5e"
+    );
+    assert!(!result.is_paid());
+    assert!(result.is_terminal());
+    assert!(
+        decline_class::ALL.contains(&result.decline_class.as_deref().unwrap()),
+        "the example's decline class is inside the vocabulary"
+    );
+}
+
+#[test]
+fn every_charge_refusal_code_survives_as_a_refusal() {
+    // The charge endpoint reuses the create endpoint's refusal shape.
+    for code in strings(&contract()["sessionRefusalErrorCodes"]) {
+        let server = MockServer::start(vec![Reply::enveloped(&format!(
+            r#"{{"success":false,"errorCode":"{code}","errorMessage":"refused","transactionId":"1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"}}"#
+        ))]);
+        let error = client_for(&server)
+            .charge_payment_method(
+                PAYMENT_METHOD_ID,
+                &ChargeRequest::new(2500, "EUR", "order-1043"),
+            )
+            .expect_err(&format!("{code} must not come back as a charge"));
+        assert!(matches!(error, Error::Refusal { .. }), "{code}: {error:?}");
+        assert_eq!(error.code(), Some(code.as_str()));
+    }
+}
+
+#[test]
+fn revoke_payment_method_matches_the_contract() {
+    let revoke = endpoint("revokePaymentMethod");
+    assert_eq!(revoke["method"], "DELETE");
+    assert_eq!(
+        revoke["path"],
+        "/merchant-api/payment-methods/{paymentMethodId}"
+    );
+    assert_eq!(revoke["httpStatus"], 204);
+    assert!(
+        strings(&revoke["fields"]).is_empty(),
+        "a revoke has no response body"
+    );
+
+    let server = MockServer::start(vec![Reply::Json(204, String::new())]);
+    client_for(&server)
+        .revoke_payment_method(PAYMENT_METHOD_ID)
+        .expect("a 204 resolves");
+    let recorded = server.only_request();
+    assert_eq!(recorded.method, "DELETE");
+    assert_eq!(recorded.body, "");
+    assert_eq!(recorded.header("Idempotency-Key"), None);
 }
