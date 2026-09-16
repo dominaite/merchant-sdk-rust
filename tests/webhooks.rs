@@ -174,7 +174,9 @@ fn a_leading_zero_timestamp_fails_even_with_a_mac_over_the_stripped_value() {
     //
     // The leading zero is grammatical (digits are digits), so this rejects at
     // the MAC rather than at the parser.
-    let header = format!("t=0{TIMESTAMP},v1=5305bcf1302fdaba8f8c19a20c899e916fb4d2a7d8d547c62529ff87c4697b72");
+    let header = format!(
+        "t=0{TIMESTAMP},v1=5305bcf1302fdaba8f8c19a20c899e916fb4d2a7d8d547c62529ff87c4697b72"
+    );
 
     assert_eq!(
         verify_at(BODY, &header, SECRET, NOW),

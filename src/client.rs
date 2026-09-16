@@ -8,7 +8,10 @@ use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::signing::{sign_request, SignRequest};
-use crate::types::{CheckoutSession, CheckoutSessionRequest, CheckoutStatus, Ping};
+use crate::types::{
+    ChargeRequest, CheckoutSession, CheckoutSessionRequest, CheckoutStatus, PaymentMethodCharge,
+    Ping,
+};
 
 /// The production merchant API.
 pub const DEFAULT_BASE_URL: &str = "https://api.dominaite.com/payments";
@@ -16,6 +19,11 @@ pub const DEFAULT_BASE_URL: &str = "https://api.dominaite.com/payments";
 /// The canonical path that gets signed. POST creates a session; GET
 /// `SESSIONS_PATH/{transaction_id}` reads its status.
 pub const SESSIONS_PATH: &str = "/merchant-api/checkout/sessions";
+
+/// The canonical path of stored payment methods. POST
+/// `PAYMENT_METHODS_PATH/{payment_method_id}/charges` charges one; DELETE
+/// `PAYMENT_METHODS_PATH/{payment_method_id}` revokes it.
+pub const PAYMENT_METHODS_PATH: &str = "/merchant-api/payment-methods";
 
 /// The credentials-and-clock smoke test. Creates nothing.
 pub const PING_PATH: &str = "/merchant-api/ping";
@@ -347,6 +355,10 @@ impl Client {
     /// requests per minute per API key and 120 per minute per IP, and going over
     /// returns [`Error::RateLimited`]. An unknown transaction id returns
     /// [`Error::Api`] with status 404.
+    ///
+    /// [`CheckoutStatus::stored_payment_method`] is the card kept on file when
+    /// the session asked for one with [`CheckoutSessionRequest::save_card`] and
+    /// the payment was approved; `None` otherwise.
     pub fn get_status(&self, transaction_id: &str) -> Result<CheckoutStatus> {
         let normalized = transaction_id.trim().to_lowercase();
         if !is_uuid(&normalized) {
@@ -366,8 +378,123 @@ impl Client {
         Ok(status)
     }
 
-    /// Signs and sends one call, and maps the response onto the error taxonomy.
-    /// `body` and `idempotency_key` are both empty for GET.
+    /// Charges a card kept on file, off-session: no widget, no payer present.
+    ///
+    /// `payment_method_id` is the `id` from [`CheckoutStatus::stored_payment_method`]
+    /// of a session you created with [`CheckoutSessionRequest::save_card`]. The
+    /// charge is signed like a session and carries an `Idempotency-Key`
+    /// (auto-generated unless you set one), so retrying after a timeout WITH THE
+    /// SAME KEY never charges the card twice.
+    ///
+    /// Returns the charge on HTTP 201 (200 on a durable replay of the same key)
+    /// and on HTTP 402 alike. A decline is not an error: the 402 charge has
+    /// `status` `failed` plus a `decline_class` telling you whether to give up on
+    /// the card (`hard`), wait (`soft_funds`, `soft_other`) or bring the customer
+    /// back for a hosted session (`soft_sca_required`). `pending` is not
+    /// terminal - poll [`Client::get_status`] with `charge.transaction_id`.
+    ///
+    /// Errors it returns:
+    /// - [`Error::Validation`]: bad arguments; nothing was sent.
+    /// - [`Error::Auth`]: wrong credentials, bad signature, clock off, IP not
+    ///   allowlisted.
+    /// - [`Error::Charge`]: the gateway answered with a code instead of a charge
+    ///   (409, 422, 502, 503); branch on `code`. `CHARGE_OUTCOME_UNKNOWN` carries
+    ///   the charge row to poll; never retry it under a new key.
+    /// - [`Error::Api`]: 404 (`PAYMENT_METHOD_NOT_FOUND`) for an id that is not
+    ///   yours, a 400 validation rejection, or an unexpected response.
+    /// - [`Error::RateLimited`]: HTTP 429. Wait, then send it again with the
+    ///   same idempotency key.
+    /// - [`Error::Transport`]: network failure, or a 5xx that carries no gateway
+    ///   code. Safe to retry WITH the same idempotency key.
+    pub fn charge_payment_method(
+        &self,
+        payment_method_id: &str,
+        request: &ChargeRequest,
+    ) -> Result<PaymentMethodCharge> {
+        let id = normalize_payment_method_id(payment_method_id)?;
+        let (idempotency_key, body) = prepare_charge_request(request)?;
+        let path = format!("{PAYMENT_METHODS_PATH}/{id}/charges");
+        let reply = self.send("POST", &path, &body, &idempotency_key)?;
+
+        // 201 (200 on a durable replay): the charge was placed, whatever its
+        // status. 402: the provider declined; the envelope says success=false
+        // but the charge is right there, status `failed` with its decline class,
+        // so it is a result, not an error.
+        let charge = reply.charge();
+        if let Some(charge) = charge
+            .as_ref()
+            .filter(|_| reply.success() || reply.status == 402)
+        {
+            return Ok(charge.clone());
+        }
+
+        if reply.status >= 400 {
+            if let Some(code) = reply
+                .error_code()
+                .filter(|_| !is_generic_failure_status(reply.status))
+            {
+                let message = reply
+                    .error_message()
+                    .unwrap_or_else(|| "The charge was refused.".to_string());
+                return Err(Error::charge(
+                    reply.status,
+                    code,
+                    message,
+                    charge,
+                    reply.envelope,
+                ));
+            }
+            return Err(reply.rejection());
+        }
+
+        Err(Error::api(
+            reply.status,
+            "The API answered the charge without a charge body",
+        ))
+    }
+
+    /// Revokes a card kept on file. The saved credential is deleted at the
+    /// payment provider and the method's status becomes `revoked`; a later
+    /// [`Client::charge_payment_method`] on it is refused with
+    /// `PAYMENT_METHOD_NOT_ACTIVE`. Returns `Ok(())` on HTTP 204, and again on
+    /// an already revoked method, so retrying a timed-out revoke is safe. Not a
+    /// payment operation: no idempotency key is signed.
+    ///
+    /// Errors it returns:
+    /// - [`Error::Revoke`]: the gateway refused and nothing changed (502
+    ///   `UPSTREAM_CONTRACT_ERROR`, 503 `MERCHANT_API_UNAVAILABLE`); branch on
+    ///   `code`.
+    /// - [`Error::Api`]: 404 for an id that is not yours (code
+    ///   `VALIDATION_ERROR`), or an unexpected response.
+    /// - [`Error::Transport`]: network failure, or a 5xx that carries no
+    ///   gateway code.
+    pub fn revoke_payment_method(&self, payment_method_id: &str) -> Result<()> {
+        let id = normalize_payment_method_id(payment_method_id)?;
+
+        // DELETE signs an EMPTY idempotency key and an EMPTY body, like GET, and
+        // sends no Idempotency-Key header.
+        let path = format!("{PAYMENT_METHODS_PATH}/{id}");
+        let reply = self.send("DELETE", &path, "", "")?;
+        if reply.status < 400 {
+            return Ok(());
+        }
+
+        if let Some(code) = reply
+            .error_code()
+            .filter(|_| !is_generic_failure_status(reply.status))
+        {
+            let message = reply
+                .error_message()
+                .unwrap_or_else(|| "The revoke was refused.".to_string());
+            return Err(Error::revoke(reply.status, code, message, reply.envelope));
+        }
+        Err(reply.rejection())
+    }
+
+    /// Signs and sends one call, and maps the response onto the error taxonomy:
+    /// [`Client::send`] plus the generic rejection for any 4xx or 5xx. The
+    /// unwrapped `data` comes back on success (an empty object for a 204).
+    /// `body` and `idempotency_key` are both empty for GET and DELETE.
     fn request(
         &self,
         method: &str,
@@ -375,6 +502,22 @@ impl Client {
         body: &str,
         idempotency_key: &str,
     ) -> Result<Value> {
+        let reply = self.send(method, path, body, idempotency_key)?;
+        if reply.status >= 400 {
+            return Err(reply.rejection());
+        }
+        Ok(reply.payload().clone())
+    }
+
+    /// Signs and sends one call, and parses whatever came back into a [`Reply`].
+    ///
+    /// Only what no route can use is an error here: transport failures, a
+    /// redirect, a 429, a 401/403, and a body that is not a JSON object (a 5xx
+    /// of that kind is a retryable transport error; anything else is an API
+    /// error). Every other status comes back as a reply, so the payment method
+    /// routes can read a 402 decline or a coded 502 as the typed answers they
+    /// are, while [`Client::request`] rejects them generically.
+    fn send(&self, method: &str, path: &str, body: &str, idempotency_key: &str) -> Result<Reply> {
         let timestamp = unix_seconds().to_string();
         let signature = sign_request(SignRequest {
             secret: &self.secret,
@@ -398,7 +541,8 @@ impl Client {
             .header("X-Timestamp", &timestamp)
             .header("X-Signature", &signature);
 
-        // No Idempotency-Key header on GET, matching the empty key it signed.
+        // No Idempotency-Key header on GET or DELETE, matching the empty key
+        // they signed.
         if !idempotency_key.is_empty() {
             builder = builder.header("Idempotency-Key", idempotency_key);
         }
@@ -448,16 +592,12 @@ impl Client {
             });
         }
 
-        // Classify a 5xx on the STATUS, before anything tries to parse the body.
-        // A 502/503/504 usually comes from a load balancer or a cold function
-        // host, not from the API, so the body is an HTML error page or empty.
-        // Parsing first would turn that into "the API returned a non-JSON
-        // response" - a non-retryable Api error for what is plainly a retryable
-        // outage, and the with_retry helper would give up on the first attempt.
-        // Nothing is lost: classify_status ignores the code and message for a
-        // 5xx anyway.
-        if http_status >= 500 {
-            return Err(classify_status(http_status, None, None));
+        // 204 carries nothing to parse; the status is the whole answer.
+        if http_status == 204 {
+            return Ok(Reply::new(
+                http_status,
+                Value::Object(serde_json::Map::new()),
+            ));
         }
 
         // Bounded on purpose: `read_to_string` caps at ureq's default 10MB, so a
@@ -474,46 +614,108 @@ impl Client {
             )
         })?;
 
-        unwrap_envelope(http_status, &raw)
+        // A body that is not a JSON object is classified on the STATUS. A
+        // 502/503/504 of that kind comes from a load balancer or a cold function
+        // host, not from the API, so the body is an HTML error page or empty;
+        // reading it as "the API returned a non-JSON response" would make a
+        // non-retryable Api error out of what is plainly a retryable outage,
+        // and the with_retry helper would give up on the first attempt. A JSON
+        // 5xx is different: that is the gateway itself talking, and the payment
+        // method routes need its code.
+        let envelope = match serde_json::from_str::<Value>(&raw) {
+            Ok(envelope) if envelope.is_object() => envelope,
+            _ if http_status >= 500 => return Err(classify_status(http_status, None, None)),
+            _ => {
+                return Err(Error::api(
+                    http_status,
+                    "The API returned a non-JSON response",
+                ))
+            }
+        };
+
+        let reply = Reply::new(http_status, envelope);
+        // Credentials are refused the same way on every route.
+        if matches!(http_status, 401 | 403) {
+            return Err(reply.rejection());
+        }
+        Ok(reply)
     }
 }
 
-/// Unwraps the gateway envelope and turns a non-2xx into the right error.
+/// One parsed gateway answer: the HTTP status and the envelope as sent.
 ///
-/// Three shapes reach this function and only one of them is nested:
-/// create answers `{ success, data: { success, checkout } }`, while the status and
-/// ping reads answer `{ success, data: { ...fields } }` with no inner `success`
-/// and no wrapper object. So this only ever unwraps `data`; branching on the
-/// inner `success` belongs to the caller that knows which shape it asked for.
-/// Treating a missing `success` as false would mark every paid order unpaid.
-fn unwrap_envelope(http_status: u16, raw: &str) -> Result<Value> {
-    let envelope: Value = serde_json::from_str(raw)
-        .map_err(|_| Error::api(http_status, "The API returned a non-JSON response"))?;
-    if !envelope.is_object() {
-        return Err(Error::api(
-            http_status,
-            "The API returned a non-JSON response",
-        ));
+/// Three shapes arrive and only one of them is nested: create answers
+/// `{ success, data: { success, checkout } }`, while the status and ping reads
+/// answer `{ success, data: { ...fields } }` with no inner `success` and no
+/// wrapper object. So [`Reply::payload`] only ever unwraps `data`; branching on
+/// the inner `success` belongs to the caller that knows which shape it asked
+/// for. Treating a missing `success` as false would mark every paid order unpaid.
+struct Reply {
+    status: u16,
+    /// The whole body: `{ success, data?, error?, metadata }`.
+    envelope: Value,
+}
+
+impl Reply {
+    fn new(status: u16, envelope: Value) -> Reply {
+        Reply { status, envelope }
     }
 
-    let payload = match envelope.get("data") {
-        Some(data) if data.is_object() => data.clone(),
-        _ => envelope.clone(),
-    };
-
-    if http_status < 400 {
-        return Ok(payload);
+    /// The envelope's own `success` flag, true only when it is literally true.
+    fn success(&self) -> bool {
+        self.envelope.get("success").and_then(Value::as_bool) == Some(true)
     }
 
-    let code = string_field(&payload, "errorCode")
-        .or_else(|| envelope.get("error").and_then(|e| string_field(e, "code")));
-    let message = string_field(&payload, "errorMessage").or_else(|| {
-        envelope
+    /// `data` when it is an object, else nothing: the gateway omits null fields
+    /// on the wire, so a bodiless error has no `data` at all.
+    fn data(&self) -> Option<&Value> {
+        self.envelope.get("data").filter(|data| data.is_object())
+    }
+
+    /// The unwrapped `data`, or the envelope itself when there is none.
+    fn payload(&self) -> &Value {
+        self.data().unwrap_or(&self.envelope)
+    }
+
+    /// The charge row in `data`, on a 201, a 402 and the coded 502s that
+    /// attach one. `None` when `data` is missing or carries no charge id.
+    fn charge(&self) -> Option<PaymentMethodCharge> {
+        let data = self.data()?;
+        string_field(data, "chargeId")?;
+        let mut charge: PaymentMethodCharge = serde_json::from_value(data.clone()).ok()?;
+        charge.raw = data.clone();
+        Some(charge)
+    }
+
+    /// The gateway's machine-readable code: `error.code` on the standard
+    /// envelope, or `errorCode` inside `data` on the create route's refusals.
+    fn error_code(&self) -> Option<String> {
+        self.envelope
             .get("error")
-            .and_then(|e| string_field(e, "message"))
-    });
+            .and_then(|error| string_field(error, "code"))
+            .or_else(|| string_field(self.payload(), "errorCode"))
+    }
 
-    Err(classify_status(http_status, code, message))
+    fn error_message(&self) -> Option<String> {
+        self.envelope
+            .get("error")
+            .and_then(|error| string_field(error, "message"))
+            .or_else(|| string_field(self.payload(), "errorMessage"))
+    }
+
+    /// The generic error for a 4xx or 5xx: a 5xx is a retryable transport
+    /// failure, a 4xx an [`Error::Api`] that keeps the code.
+    fn rejection(self) -> Error {
+        classify_status(self.status, self.error_code(), self.error_message())
+    }
+}
+
+/// The statuses that stay generic on every route: input validation, credentials,
+/// an id that is not yours, and rate limiting. A coded answer outside this set
+/// is the gateway describing a payment method outcome, which the charge and
+/// revoke routes surface as [`Error::Charge`] and [`Error::Revoke`].
+fn is_generic_failure_status(status: u16) -> bool {
+    matches!(status, 400 | 401 | 403 | 404 | 429)
 }
 
 /// Why this base URL is not usable, or `None` when it is fine.
@@ -619,15 +821,46 @@ fn classify_status(status: u16, code: Option<String>, message: Option<String>) -
 /// second serialization would let key ordering or escaping drift between the
 /// signature and the wire.
 fn prepare_session_request(request: &CheckoutSessionRequest) -> Result<(String, String)> {
-    if request.amount <= 0 {
+    validate_money_params(request.amount, &request.currency, &request.order_reference)?;
+    let idempotency_key = normalize_idempotency_key(request.idempotency_key.as_deref())?;
+
+    let body = serde_json::to_string(request).map_err(|error| {
+        Error::validation(format!(
+            "Request parameters are not JSON-encodable: {error}"
+        ))
+    })?;
+
+    Ok((idempotency_key, body))
+}
+
+/// `prepare_session_request` for a charge: same money checks, same key
+/// handling, and the body is exactly the contract's fields in declaration
+/// order, which is what gets signed.
+fn prepare_charge_request(request: &ChargeRequest) -> Result<(String, String)> {
+    validate_money_params(request.amount, &request.currency, &request.order_reference)?;
+    let idempotency_key = normalize_idempotency_key(request.idempotency_key.as_deref())?;
+
+    let body = serde_json::to_string(request).map_err(|error| {
+        Error::validation(format!(
+            "Request parameters are not JSON-encodable: {error}"
+        ))
+    })?;
+
+    Ok((idempotency_key, body))
+}
+
+/// The checks shared by every request that moves money: amount, currency,
+/// order reference.
+fn validate_money_params(amount: i64, currency: &str, order_reference: &str) -> Result<()> {
+    if amount <= 0 {
         return Err(Error::validation(
             "amount must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR)",
         ));
     }
-    if request.currency.trim().is_empty() {
+    if currency.trim().is_empty() {
         return Err(Error::validation("Missing required parameter: currency"));
     }
-    if request.order_reference.trim().is_empty() {
+    if order_reference.trim().is_empty() {
         return Err(Error::validation(
             "Missing required parameter: order_reference",
         ));
@@ -639,33 +872,46 @@ fn prepare_session_request(request: &CheckoutSessionRequest) -> Result<(String, 
     // The server counts UTF-16 units and stays the final arbiter, so a reference
     // built from astral characters (emoji, rarer CJK) can still be rejected
     // there: each one is a single code point here and two units there.
-    if request.order_reference.chars().count() > 100 {
+    if order_reference.chars().count() > 100 {
         return Err(Error::validation(
             "order_reference must be at most 100 characters",
         ));
     }
+    Ok(())
+}
 
-    let idempotency_key = match &request.idempotency_key {
+/// Mints a key when none was given and bounds the one that was.
+fn normalize_idempotency_key(idempotency_key: Option<&str>) -> Result<String> {
+    match idempotency_key {
         Some(key) if key.trim().is_empty() => {
-            return Err(Error::validation("idempotency_key must not be empty"))
+            Err(Error::validation("idempotency_key must not be empty"))
         }
         // Characters, not bytes, for the same reason as order_reference above.
-        Some(key) if key.chars().count() > 100 => {
-            return Err(Error::validation(
-                "idempotency_key must be at most 100 characters",
-            ))
-        }
-        Some(key) => key.clone(),
-        None => new_idempotency_key(),
-    };
+        Some(key) if key.chars().count() > 100 => Err(Error::validation(
+            "idempotency_key must be at most 100 characters",
+        )),
+        Some(key) => Ok(key.to_string()),
+        None => Ok(new_idempotency_key()),
+    }
+}
 
-    let body = serde_json::to_string(request).map_err(|error| {
-        Error::validation(format!(
-            "Request parameters are not JSON-encodable: {error}"
-        ))
-    })?;
-
-    Ok((idempotency_key, body))
+/// A payment method id is opaque (`pm_...`), so this only pins what keeps it a
+/// single path segment: no slash, no query, no whitespace, nothing that needs
+/// percent-encoding. The id goes into the signed canonical path verbatim, so
+/// anything else would sign one path and request another.
+fn normalize_payment_method_id(payment_method_id: &str) -> Result<String> {
+    let normalized = payment_method_id.trim();
+    let well_formed = !normalized.is_empty()
+        && normalized.len() <= 100
+        && normalized
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+    if !well_formed {
+        return Err(Error::validation(
+            "payment_method_id must be the payment_method.id from get_status",
+        ));
+    }
+    Ok(normalized.to_string())
 }
 
 fn string_field(value: &Value, field: &str) -> Option<String> {

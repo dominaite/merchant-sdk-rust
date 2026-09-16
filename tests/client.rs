@@ -694,7 +694,10 @@ fn debug_output_never_carries_the_secret() {
             "{label} debug output does not mark the secret as redacted: {printed}"
         );
         // The key id is not a secret, and losing it would make debug output useless.
-        assert!(printed.contains(KEY_ID) || label == "SignRequest", "{label}");
+        assert!(
+            printed.contains(KEY_ID) || label == "SignRequest",
+            "{label}"
+        );
     }
 }
 

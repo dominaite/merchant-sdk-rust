@@ -3,8 +3,66 @@
 use std::error::Error as StdError;
 use std::fmt;
 
+use serde_json::Value;
+
+use crate::types::PaymentMethodCharge;
+
 /// The result type every call in this crate returns.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The codes [`Client::charge_payment_method`](crate::Client::charge_payment_method)
+/// returns as [`Error::Charge`], in the gateway's own order. `CHARGE_DECLINED`
+/// (HTTP 402) is deliberately not one of them: a decline is a charge result with
+/// status `failed`, not an error.
+pub mod charge_error_code {
+    /// HTTP 409: the method is revoked or expired; ask the customer for another
+    /// card via a hosted session with `save_card`.
+    pub const PAYMENT_METHOD_NOT_ACTIVE: &str = "PAYMENT_METHOD_NOT_ACTIVE";
+    /// HTTP 409: a request with this key is still in flight; retry with the
+    /// SAME key in a moment.
+    pub const DUPLICATE_REQUEST: &str = "DUPLICATE_REQUEST";
+    /// HTTP 422: same key, different body or method; a bug on your side.
+    pub const IDEMPOTENCY_KEY_REUSED: &str = "IDEMPOTENCY_KEY_REUSED";
+    /// HTTP 502: the provider gave no verdict and the charge MAY have happened.
+    /// The charge row is attached: poll `get_status` with its transaction id or
+    /// wait for the webhook. Never retry under a new key.
+    pub const CHARGE_OUTCOME_UNKNOWN: &str = "CHARGE_OUTCOME_UNKNOWN";
+    /// HTTP 502: nothing was charged. The charge row is attached when one
+    /// exists, absent when the provider refused before one.
+    pub const CHARGE_FAILED: &str = "CHARGE_FAILED";
+    /// HTTP 503: charges of stored methods are switched off; nothing was
+    /// charged. Retry later with the SAME key.
+    pub const PAYMENT_METHOD_CHARGES_DISABLED: &str = "PAYMENT_METHOD_CHARGES_DISABLED";
+    /// HTTP 503: card payments are off right now; nothing was charged. Retry
+    /// later with the SAME key.
+    pub const PAYMENT_PROCESSING_UNAVAILABLE: &str = "PAYMENT_PROCESSING_UNAVAILABLE";
+
+    /// The whole vocabulary, in the order the canonical contract lists it. An
+    /// unlisted code still arrives as [`Error::Charge`](crate::Error::Charge).
+    pub const ALL: [&str; 7] = [
+        PAYMENT_METHOD_NOT_ACTIVE,
+        DUPLICATE_REQUEST,
+        IDEMPOTENCY_KEY_REUSED,
+        CHARGE_OUTCOME_UNKNOWN,
+        CHARGE_FAILED,
+        PAYMENT_METHOD_CHARGES_DISABLED,
+        PAYMENT_PROCESSING_UNAVAILABLE,
+    ];
+}
+
+/// The codes [`Client::revoke_payment_method`](crate::Client::revoke_payment_method)
+/// returns as [`Error::Revoke`], in the gateway's own order.
+pub mod revoke_error_code {
+    /// HTTP 502: the provider refused the deletion for a reason a retry will
+    /// not fix; contact support with the payment method id.
+    pub const UPSTREAM_CONTRACT_ERROR: &str = "UPSTREAM_CONTRACT_ERROR";
+    /// HTTP 503: the provider is unavailable or throttling; retry later.
+    pub const MERCHANT_API_UNAVAILABLE: &str = "MERCHANT_API_UNAVAILABLE";
+
+    /// The whole vocabulary, in the order the canonical contract lists it. An
+    /// unlisted code still arrives as [`Error::Revoke`](crate::Error::Revoke).
+    pub const ALL: [&str; 2] = [UPSTREAM_CONTRACT_ERROR, MERCHANT_API_UNAVAILABLE];
+}
 
 /// Everything that can go wrong, split by what you should do about it.
 ///
@@ -88,6 +146,68 @@ pub enum Error {
         message: String,
     },
 
+    /// The gateway answered a charge with an error code instead of a charge
+    /// result. `code` is one of the [`charge_error_code`] constants (an
+    /// unlisted code arrives here too, as a plain string), `status` is the HTTP
+    /// status, and `charge` is the charge row the gateway attached when it did.
+    ///
+    /// The one that matters most is `CHARGE_OUTCOME_UNKNOWN` (502): the provider
+    /// gave no verdict and the charge MAY have happened. `charge` is present, so
+    /// poll [`Client::get_status`](crate::Client::get_status) with
+    /// `transaction_id` or wait for the webhook. Never retry under a new key.
+    ///
+    /// ```no_run
+    /// # use dominaite::{charge_error_code, ChargeRequest, Client, Error};
+    /// # fn main() -> Result<(), Error> {
+    /// # let client = Client::new("dmk_x", "dms_y")?;
+    /// # let request = ChargeRequest::new(2500, "EUR", "order-1043");
+    /// match client.charge_payment_method("pm_...", &request) {
+    ///     Err(Error::Charge { code, transaction_id: Some(id), .. })
+    ///         if code == charge_error_code::CHARGE_OUTCOME_UNKNOWN =>
+    ///     {
+    ///         let status = client.get_status(&id)?;
+    ///     }
+    ///     _ => {}
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// A decline is NOT this variant: HTTP 402 comes back as `Ok` with a charge
+    /// whose status is `failed`. A 404 for an id that is not yours is
+    /// [`Error::Api`] with code `PAYMENT_METHOD_NOT_FOUND`, and a 5xx that
+    /// carries no gateway code (an HTML page from a proxy) is [`Error::Transport`].
+    Charge {
+        /// The HTTP status code: 409, 422, 502 or 503.
+        status: u16,
+        /// The machine-readable reason. See [`charge_error_code`].
+        code: String,
+        /// The human-readable reason from the API.
+        message: String,
+        /// The charge row the gateway attached to its answer, when it did.
+        /// Boxed to keep the error small; deref it like any other charge.
+        charge: Option<Box<PaymentMethodCharge>>,
+        /// Shortcut for `charge.transaction_id`, for polling `get_status`.
+        transaction_id: Option<String>,
+        /// The whole envelope, for fields not modelled above.
+        raw: Value,
+    },
+
+    /// The gateway refused to revoke a stored payment method. Nothing changed
+    /// either way; `code` is one of the [`revoke_error_code`] constants (an
+    /// unlisted code arrives here too). An id that is not yours is still
+    /// [`Error::Api`] with status 404.
+    Revoke {
+        /// The HTTP status code: 502 or 503.
+        status: u16,
+        /// The machine-readable reason. See [`revoke_error_code`].
+        code: String,
+        /// The human-readable reason from the API.
+        message: String,
+        /// The whole envelope, for fields not modelled above.
+        raw: Value,
+    },
+
     /// The API is rate limiting you (HTTP 429).
     ///
     /// The platform allows 60 requests per minute per API key and 120 per minute
@@ -121,11 +241,14 @@ pub enum Error {
 impl Error {
     /// The machine-readable code, for the variants that carry one.
     ///
-    /// `Refusal` and `Auth` always have one, `Api` has one when the API sent it;
-    /// the rest return `None`.
+    /// `Refusal`, `Auth`, `Charge` and `Revoke` always have one, `Api` has one
+    /// when the API sent it; the rest return `None`.
     pub fn code(&self) -> Option<&str> {
         match self {
-            Error::Refusal { code, .. } | Error::Auth { code, .. } => Some(code),
+            Error::Refusal { code, .. }
+            | Error::Auth { code, .. }
+            | Error::Charge { code, .. }
+            | Error::Revoke { code, .. } => Some(code),
             Error::Api { code, .. } => code.as_deref(),
             _ => None,
         }
@@ -134,7 +257,9 @@ impl Error {
     /// The HTTP status, for the variants that carry one.
     pub fn http_status(&self) -> Option<u16> {
         match self {
-            Error::Api { status, .. } => Some(*status),
+            Error::Api { status, .. }
+            | Error::Charge { status, .. }
+            | Error::Revoke { status, .. } => Some(*status),
             Error::RateLimited { .. } => Some(429),
             _ => None,
         }
@@ -143,7 +268,9 @@ impl Error {
     /// True only for [`Error::Transport`], the one kind that is safe to retry -
     /// and only with the SAME idempotency key.
     /// [`create_checkout_session_with_retry`](crate::Client::create_checkout_session_with_retry)
-    /// does exactly that.
+    /// does exactly that. False for [`Error::Charge`] even on a 503: those
+    /// codes each carry their own advice, and `CHARGE_OUTCOME_UNKNOWN` must be
+    /// polled, never resent.
     pub fn is_retryable(&self) -> bool {
         matches!(self, Error::Transport { .. })
     }
@@ -195,6 +322,40 @@ impl Error {
         }
     }
 
+    pub(crate) fn charge(
+        status: u16,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        charge: Option<PaymentMethodCharge>,
+        raw: Value,
+    ) -> Error {
+        Error::Charge {
+            status,
+            code: code.into(),
+            message: message.into(),
+            transaction_id: charge
+                .as_ref()
+                .map(|charge| charge.transaction_id.clone())
+                .filter(|id| !id.is_empty()),
+            charge: charge.map(Box::new),
+            raw,
+        }
+    }
+
+    pub(crate) fn revoke(
+        status: u16,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        raw: Value,
+    ) -> Error {
+        Error::Revoke {
+            status,
+            code: code.into(),
+            message: message.into(),
+            raw,
+        }
+    }
+
     pub(crate) fn transport(
         message: impl Into<String>,
         source: Option<Box<dyn StdError + Send + Sync>>,
@@ -226,6 +387,18 @@ impl fmt::Display for Error {
             } => {
                 write!(f, "API error (HTTP {status}): {message}")
             }
+            Error::Charge {
+                status,
+                code,
+                message,
+                ..
+            } => write!(f, "charge error (HTTP {status}, {code}): {message}"),
+            Error::Revoke {
+                status,
+                code,
+                message,
+                ..
+            } => write!(f, "revoke error (HTTP {status}, {code}): {message}"),
             Error::RateLimited {
                 retry_after_seconds: Some(seconds),
             } => write!(f, "rate limited (HTTP 429): retry after {seconds}s"),
