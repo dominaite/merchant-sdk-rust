@@ -28,7 +28,7 @@ use serde::forward_to_deserialize_any;
 use serde_json::Value;
 
 use dominaite::{
-    charge_error_code, charge_status, decline_class, revoke_error_code, status,
+    charge_error_code, charge_status, decline_class, revoke_error_code, session_error_code, status,
     stored_payment_method_status, ChargeRequest, CheckoutSession, CheckoutSessionRequest,
     CheckoutStatus, Client, Error, IdempotencyKey, PaymentMethodCharge, Ping, StoredPaymentMethod,
 };
@@ -348,6 +348,15 @@ fn the_refusal_example_comes_back_as_a_refusal_with_its_transaction() {
         }
         other => panic!("expected a refusal, got {other:?}"),
     }
+}
+
+#[test]
+fn the_session_refusal_constants_are_exactly_the_contracts() {
+    assert_eq!(
+        session_error_code::REFUSALS.to_vec(),
+        strings(&contract()["sessionRefusalErrorCodes"]),
+        "the SDK refusal codes drifted from the contract"
+    );
 }
 
 #[test]

@@ -50,7 +50,7 @@ pub use client::{
     Client, ClientBuilder, RetryOptions, DEFAULT_BASE_URL, PAYMENT_METHODS_PATH, PING_PATH,
     SESSIONS_PATH, VERSION,
 };
-pub use error::{charge_error_code, revoke_error_code, Error, Result};
+pub use error::{charge_error_code, revoke_error_code, session_error_code, Error, Result};
 pub use idempotency::IdempotencyKey;
 pub use signing::{sha256_hex, sign_request, SignRequest};
 pub use types::{

@@ -5,8 +5,8 @@ mod support;
 use std::time::Duration;
 
 use dominaite::{
-    sign_request, CheckoutSessionRequest, Client, Error, IdempotencyKey, RetryOptions, SignRequest,
-    SESSIONS_PATH,
+    session_error_code, sign_request, CheckoutSessionRequest, Client, Error, IdempotencyKey,
+    RetryOptions, SignRequest, SESSIONS_PATH,
 };
 use support::{MockServer, Recorded, Reply};
 
@@ -250,6 +250,38 @@ fn an_unknown_transaction_id_is_a_404_api_error() {
         .expect_err("not found");
 
     assert_eq!(error.http_status(), Some(404));
+}
+
+/// The storefront codes are real HTTP errors, not 200 refusals, and the caller
+/// has to be able to tell "this site is not whitelisted yet" apart from any
+/// other rejection without parsing the message.
+#[test]
+fn a_storefront_rejection_is_an_api_error_matchable_on_its_code() {
+    for (status, code) in [
+        (409, session_error_code::STOREFRONT_NOT_WHITELISTED),
+        (409, session_error_code::STOREFRONT_INACTIVE),
+        (400, session_error_code::STOREFRONT_MISMATCH),
+    ] {
+        let server = MockServer::start(vec![Reply::error_envelope(status, code, "refused")]);
+        let error = client_for(&server)
+            .create_checkout_session_with_retry(
+                &request(),
+                RetryOptions {
+                    attempts: 3,
+                    base_delay: Duration::from_millis(1),
+                },
+            )
+            .expect_err("a storefront rejection is not a session");
+
+        assert_eq!(error.code(), Some(code), "{code} lost its code");
+        assert_eq!(error.http_status(), Some(status), "{code} lost its status");
+        assert!(
+            matches!(&error, Error::Api { code: Some(c), .. } if c == code),
+            "{code}: {error:?}"
+        );
+        assert!(!error.is_retryable(), "{code} will not fix itself");
+        assert_eq!(server.requests().len(), 1, "{code} must not be retried");
+    }
 }
 
 #[test]

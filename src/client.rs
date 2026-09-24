@@ -260,7 +260,8 @@ impl Client {
     /// - [`Error::RateLimited`]: HTTP 429. Wait, then send it again with the
     ///   same idempotency key. Not retried for you.
     /// - [`Error::Api`]: an unexpected or rejecting response; inspect `status`
-    ///   and `code`.
+    ///   and `code`. The storefront codes arrive here, e.g. a 409 with
+    ///   [`session_error_code::STOREFRONT_NOT_WHITELISTED`](crate::session_error_code::STOREFRONT_NOT_WHITELISTED).
     /// - [`Error::Transport`]: network failure or 5xx. Safe to retry WITH the same
     ///   idempotency key, which is what [`Client::create_checkout_session_with_retry`]
     ///   does.

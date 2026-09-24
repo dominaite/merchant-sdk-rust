@@ -532,7 +532,7 @@ string where there is one.
 | `Error::RateLimited { retry_after_seconds }` | 429. The platform allows 60 requests per minute per API key and 120 per minute per IP. | Wait `retry_after_seconds` (or back off yourself when it is `None`), then send the request again with the **same** idempotency key. Never auto-retried: `is_retryable()` is false. |
 | `Error::Charge { status, code, charge, transaction_id, .. }` | `charge_payment_method` got an error code instead of a charge: 409, 422, 502 or 503. | Branch on `code` (see [Stored payment methods](#stored-payment-methods-recurring)). `CHARGE_OUTCOME_UNKNOWN` carries the `transaction_id` to poll; never retry it under a new key. |
 | `Error::Revoke { status, code, .. }` | `revoke_payment_method` was refused: 502 `UPSTREAM_CONTRACT_ERROR` or 503 `MERCHANT_API_UNAVAILABLE`. Nothing changed. | Retry later on 503; contact support on 502. |
-| `Error::Api { status, code, .. }` | Any other rejecting or unexpected response. `code` carries the API's machine-readable reason when it sent one, e.g. `IDEMPOTENCY_KEY_REQUIRED` on a 400, `PAYMENT_METHOD_NOT_FOUND` on a charge 404. | Inspect `status` and `code`. A 404 from `get_status` is an unknown transaction id. |
+| `Error::Api { status, code, .. }` | Any other rejecting or unexpected response. `code` carries the API's machine-readable reason when it sent one, e.g. `IDEMPOTENCY_KEY_REQUIRED` on a 400, `STOREFRONT_NOT_WHITELISTED` on a 409, `PAYMENT_METHOD_NOT_FOUND` on a charge 404. | Inspect `status` and `code`. A 404 from `get_status` is an unknown transaction id. |
 | `Error::Validation { .. }` | Bad arguments (non-positive amount, missing field, malformed key id). | Fix the call; nothing was sent. |
 
 Refusal codes on `Error::Refusal`:
@@ -547,6 +547,35 @@ Refusal codes on `Error::Refusal`:
 - `IDEMPOTENCY_KEY_REUSED` - same key sent with a different body; use a fresh key.
 
 All five arrive as HTTP 200 with `success: false`, not as an HTTP error status.
+
+Every refusal code is a constant in `dominaite::session_error_code` (`REFUSALS` lists them).
+
+### Storefront errors
+
+A merchant with more than one website has a storefront (an online location) per site. When the
+storefront cannot take payments, session creation fails with a real HTTP status rather than a
+200 refusal, so these arrive as `Error::Api` with the code set:
+
+| Code | Status | Meaning |
+|---|---|---|
+| `STOREFRONT_NOT_WHITELISTED` | 409 | The site's domain is not whitelisted with the payment provider yet. |
+| `STOREFRONT_INACTIVE` | 409 | The storefront was deactivated or deleted. |
+| `STOREFRONT_MISMATCH` | 400 | The API key is bound to one storefront and the request named another. |
+
+None of them fixes itself on a retry, and none is a code bug on your side: the fix is in the
+Dominaite backoffice or onboarding. Show the customer "payments are unavailable" and alert your
+team.
+
+```rust
+use dominaite::session_error_code;
+
+match client.create_checkout_session(&request) {
+    Err(error) if error.code() == Some(session_error_code::STOREFRONT_NOT_WHITELISTED) => {
+        alert_ops("storefront not whitelisted yet");
+    }
+    other => { /* ... */ }
+}
+```
 
 ### Recovering from a replay refusal
 

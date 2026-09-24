@@ -10,6 +10,82 @@ use crate::types::PaymentMethodCharge;
 /// The result type every call in this crate returns.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The codes [`Client::create_checkout_session`](crate::Client::create_checkout_session)
+/// can answer with, so you can branch on [`Error::code`] without typing the
+/// strings.
+///
+/// Two shapes. The replay and availability codes are business refusals: HTTP
+/// 200 with `success: false`, arriving as [`Error::Refusal`]. The storefront
+/// codes are real HTTP errors (409 or 400) and arrive as [`Error::Api`] with the
+/// code set; they will not change on a retry and need a fix on the Dominaite
+/// side (backoffice or onboarding), not in your code.
+///
+/// ```no_run
+/// # use dominaite::{session_error_code, CheckoutSessionRequest, Client, Error, IdempotencyKey};
+/// # fn main() -> Result<(), Error> {
+/// # let client = Client::new("dmk_x", "dms_y")?;
+/// # let key = IdempotencyKey::new("order-1042")?;
+/// # let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042", key);
+/// match client.create_checkout_session(&request) {
+///     Err(error) if error.code() == Some(session_error_code::STOREFRONT_NOT_WHITELISTED) => {
+///         // HTTP 409: this site's domain is not whitelisted with the payment
+///         // provider yet. Show "payments unavailable" and alert your team.
+///     }
+///     _ => {}
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub mod session_error_code {
+    /// HTTP 409, [`Error::Api`](crate::Error::Api): the storefront's domain is
+    /// not yet whitelisted with the payment provider. Nothing was created. Not
+    /// retryable; the whitelisting is finished on the Dominaite side.
+    pub const STOREFRONT_NOT_WHITELISTED: &str = "STOREFRONT_NOT_WHITELISTED";
+    /// HTTP 409, [`Error::Api`](crate::Error::Api): the storefront (online
+    /// location) this key or request points at was deactivated or deleted.
+    pub const STOREFRONT_INACTIVE: &str = "STOREFRONT_INACTIVE";
+    /// HTTP 400, [`Error::Api`](crate::Error::Api): the API key is bound to one
+    /// storefront and the request named a different one.
+    pub const STOREFRONT_MISMATCH: &str = "STOREFRONT_MISMATCH";
+
+    /// HTTP 200 refusal: card payments are off right now; retry later with the
+    /// SAME key.
+    pub const PAYMENT_PROCESSING_UNAVAILABLE: &str = "PAYMENT_PROCESSING_UNAVAILABLE";
+    /// HTTP 200 refusal: a session for this key is already open or in flight;
+    /// re-send the SAME key shortly, never a fresh one.
+    pub const DUPLICATE_REQUEST: &str = "DUPLICATE_REQUEST";
+    /// HTTP 200 refusal: this key's payment already completed. Carries the
+    /// transaction id; read it back with
+    /// [`Client::get_status`](crate::Client::get_status).
+    pub const ALREADY_PROCESSED: &str = "ALREADY_PROCESSED";
+    /// HTTP 200 refusal: this key was replayed with a different amount,
+    /// currency or body. With an order-derived key that means the order total
+    /// changed without the key changing.
+    pub const IDEMPOTENCY_KEY_REUSED: &str = "IDEMPOTENCY_KEY_REUSED";
+    /// HTTP 200 refusal: the earlier attempt with this key failed, was
+    /// cancelled or was abandoned. The key is spent; use a fresh one.
+    pub const PRIOR_ATTEMPT_FAILED: &str = "PRIOR_ATTEMPT_FAILED";
+
+    /// The business refusal codes, in the order the canonical contract lists
+    /// them. An unlisted code still arrives as
+    /// [`Error::Refusal`](crate::Error::Refusal).
+    pub const REFUSALS: [&str; 5] = [
+        PAYMENT_PROCESSING_UNAVAILABLE,
+        DUPLICATE_REQUEST,
+        ALREADY_PROCESSED,
+        IDEMPOTENCY_KEY_REUSED,
+        PRIOR_ATTEMPT_FAILED,
+    ];
+
+    /// The storefront codes, which arrive as [`Error::Api`](crate::Error::Api)
+    /// with a 409 or 400.
+    pub const STOREFRONT: [&str; 3] = [
+        STOREFRONT_NOT_WHITELISTED,
+        STOREFRONT_INACTIVE,
+        STOREFRONT_MISMATCH,
+    ];
+}
+
 /// The codes [`Client::charge_payment_method`](crate::Client::charge_payment_method)
 /// returns as [`Error::Charge`], in the gateway's own order. `CHARGE_DECLINED`
 /// (HTTP 402) is deliberately not one of them: a decline is a charge result with
@@ -131,7 +207,9 @@ pub enum Error {
     /// The API answered, but with an unexpected or rejecting response. A 422
     /// means an idempotency key was replayed with a different body; use a fresh
     /// key. A 404 from [`Client::get_status`](crate::Client::get_status) means an
-    /// unknown transaction id.
+    /// unknown transaction id. A 409 or 400 carrying one of the
+    /// [`session_error_code::STOREFRONT`] codes means the storefront cannot take
+    /// payments yet (`STOREFRONT_NOT_WHITELISTED`) or at all.
     Api {
         /// The HTTP status code.
         status: u16,
