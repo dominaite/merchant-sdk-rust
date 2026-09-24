@@ -16,7 +16,7 @@ through. A git dependency works today:
 
 ```toml
 [dependencies]
-dominaite = { git = "https://github.com/dominaite/merchant-sdk-rust", tag = "v0.4.0" }
+dominaite = { git = "https://github.com/dominaite/merchant-sdk-rust", tag = "v1.0.0" }
 ```
 
 To work on the SDK itself:
@@ -48,7 +48,7 @@ Everything below is copy-paste. It assumes an empty directory and nothing instal
 
 ```sh
 cargo new my-checkout && cd my-checkout
-cargo add --git https://github.com/dominaite/merchant-sdk-rust --tag v0.4.0 dominaite
+cargo add --git https://github.com/dominaite/merchant-sdk-rust --tag v1.0.0 dominaite
 ```
 
 Set your credentials and the environment you are pointing at:
