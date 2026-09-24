@@ -307,13 +307,15 @@ impl Client {
     /// never a fresh one: a new key per attempt would be exactly the
     /// double-charge bug this method exists to prevent.
     ///
-    /// What a replayed key gets back is a refusal, not the original session: the
-    /// API answers HTTP 200 with `success: false` and one of the replay codes
-    /// ([`Error::Refusal`] with `DUPLICATE_REQUEST`, `ALREADY_PROCESSED`,
-    /// `PRIOR_ATTEMPT_FAILED` or `IDEMPOTENCY_KEY_REUSED`). The first attempt's
-    /// cashier key and token are not returned again. When the refusal names a
-    /// transaction id, read it back with [`Client::get_status`] to find out what
-    /// the earlier attempt did.
+    /// When the first attempt did land, the retry is a replay. A clean replay of
+    /// a session that is still open returns the ORIGINAL session, with the same
+    /// transaction id and cashier handles, so a response lost to a timeout is
+    /// recovered. A replay of a paid or failed attempt, or one with a different
+    /// amount, currency or `save_card`, is an [`Error::Refusal`]
+    /// (`ALREADY_PROCESSED`, `PRIOR_ATTEMPT_FAILED`, `IDEMPOTENCY_KEY_REUSED`),
+    /// and `DUPLICATE_REQUEST` means the open session cannot be handed back just
+    /// yet. When the refusal names a transaction id, read it back with
+    /// [`Client::get_status`] to find out what the earlier attempt did.
     ///
     /// `PAYMENT_PROCESSING_UNAVAILABLE` is retried in both of its forms: a 503
     /// (already a transport error) and the HTTP 200 refusal. Card payments being

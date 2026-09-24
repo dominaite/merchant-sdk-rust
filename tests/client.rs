@@ -603,6 +603,30 @@ fn retry_gives_up_and_returns_the_transport_error() {
 /// Without the transaction id on the refusal, the documented recovery - read it
 /// back with `get_status` - is unreachable from the error, leaving a second
 /// payment as the caller's only option.
+/// A clean replay of an open session is the gateway handing back the ORIGINAL
+/// session. It must come out as an ordinary session, same transaction and
+/// cashier handles, so a reload renders the same widget.
+#[test]
+fn a_clean_replay_of_an_open_session_is_the_original_session() {
+    let server = MockServer::start(vec![create_ok(), create_ok()]);
+    let client = client_for(&server);
+
+    let first = client.create_checkout_session(&request()).expect("created");
+    let replayed = client
+        .create_checkout_session(&request())
+        .expect("a clean replay is a session, not a refusal");
+
+    assert_eq!(replayed.transaction_id, first.transaction_id);
+    assert_eq!(replayed.cashier_key, first.cashier_key);
+    assert_eq!(replayed.cashier_token, first.cashier_token);
+    let keys: Vec<_> = server
+        .requests()
+        .iter()
+        .map(|recorded| recorded.header("Idempotency-Key").map(str::to_string))
+        .collect();
+    assert_eq!(keys, vec![Some(SESSION_KEY.to_string()); 2]);
+}
+
 #[test]
 fn a_replay_refusal_carries_the_transaction_id_for_recovery() {
     let transaction_id = "11111111-2222-4333-8444-555555555555";

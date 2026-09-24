@@ -275,13 +275,21 @@ to 100 characters of visible ASCII (`!` through `~`: no spaces, no control chara
 non-Latin letters), and both constructors return `Error::Validation` for anything else, before
 anything is sent. That includes an order id with a space in it passed to `for_order`.
 
-A replayed key does not hand back the original session. While the first attempt is live (or
-completed, or judged failed), the API answers HTTP 200 with `success: false` and a replay code,
-which arrives as `Error::Refusal`
-(`DUPLICATE_REQUEST`, `ALREADY_PROCESSED`, `PRIOR_ATTEMPT_FAILED`, `IDEMPOTENCY_KEY_REUSED`) - the
-first session's `cashierKey` and `cashierToken` are not returned again. When the refusal names a
-transaction id, read it back with `get_status` to find out what the earlier attempt did; see
-[Recovering from a replay refusal](#recovering-from-a-replay-refusal).
+What a replayed key gets back depends on where the first attempt is:
+
+- Still open and unexpired, same amount and currency: the ORIGINAL session, as an ordinary
+  `Ok` with the same `transaction_id`, `cashier_key` and `cashier_token`. This is what makes a
+  reload, the back button, or a retry after a lost response safe: you render the same widget
+  again.
+- Paid, failed, or sent with a different amount, currency or `save_card`: HTTP 200 with
+  `success: false` and a replay code, which arrives as `Error::Refusal` (`ALREADY_PROCESSED`,
+  `PRIOR_ATTEMPT_FAILED`, `IDEMPOTENCY_KEY_REUSED`).
+- Open, but its session cannot be handed back right now (a concurrent create still writing it,
+  or an expired one the gateway could not replace yet): `DUPLICATE_REQUEST`. Send the same key
+  again shortly.
+
+When a refusal names a transaction id, read it back with `get_status` to find out what the
+earlier attempt did; see [Recovering from a replay refusal](#recovering-from-a-replay-refusal).
 
 `create_checkout_session_with_retry` does that for you: it sends the request's key on every
 attempt, retrying `Error::Transport` (network failures and 5xx, including
@@ -563,8 +571,10 @@ string where there is one.
 Refusal codes on `Error::Refusal`:
 
 - `PAYMENT_PROCESSING_UNAVAILABLE` - card payments are off right now; retry later.
-- `DUPLICATE_REQUEST` - a session for this idempotency key is already open, or expired within
-  the last few minutes; re-POST the same key shortly, never a fresh one.
+- `DUPLICATE_REQUEST` - a session for this idempotency key is open but cannot be handed back
+  right now (a concurrent create, or an expired session not yet replaced); re-POST the same key
+  shortly, never a fresh one. A clean replay of an open session is not a refusal: it returns
+  the original session.
 - `ALREADY_PROCESSED` - this idempotency key's payment already completed.
 - `PRIOR_ATTEMPT_FAILED` - the earlier attempt with this key failed; use a fresh key. The
   order-derived key is spent, so derive the next one from a new attempt id (for example

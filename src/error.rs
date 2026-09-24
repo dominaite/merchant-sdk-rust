@@ -51,8 +51,10 @@ pub mod session_error_code {
     /// HTTP 200 refusal: card payments are off right now; retry later with the
     /// SAME key.
     pub const PAYMENT_PROCESSING_UNAVAILABLE: &str = "PAYMENT_PROCESSING_UNAVAILABLE";
-    /// HTTP 200 refusal: a session for this key is already open or in flight;
-    /// re-send the SAME key shortly, never a fresh one.
+    /// HTTP 200 refusal: a session for this key is open but cannot be handed
+    /// back right now (a concurrent create, or an expired one not yet
+    /// replaced); re-send the SAME key shortly, never a fresh one. A clean
+    /// replay of an open session is not this: it returns the original session.
     pub const DUPLICATE_REQUEST: &str = "DUPLICATE_REQUEST";
     /// HTTP 200 refusal: this key's payment already completed. Carries the
     /// transaction id; read it back with
