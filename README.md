@@ -231,23 +231,27 @@ network. The amount is locked server-side - what you pass here is what gets char
 in the browser can change it. Compute it from your own catalog, never from the request body your
 page sent you.
 
-The minor unit depends on the currency (ISO 4217): EUR, USD, GBP, BGN and most others have two
-decimals, JPY, KRW and ISK none, BHD, KWD, OMR, JOD and TND three. `to_minor_units` converts a
-decimal string for you:
+The minor unit depends on the currency, and it is the gateway's minor unit that counts. EUR,
+USD, GBP, CAD, AUD, CHF, BGN, RON, PLN, CZK, SEK, DKK, NOK and the other two-decimal currencies
+have two decimals, JPY and HUF none, BHD and KWD three. HUF is the trap: ISO 4217 lists two
+decimals, but the gateway charges whole forints, so 1500 HUF is `1500`, not `150000`.
+`to_minor_units` converts a decimal string for you:
 
 ```rust
 use dominaite::to_minor_units;
 
 let amount = to_minor_units("0.30", "EUR")?;  // 30
-let amount = to_minor_units("500", "JPY")?;   // 500
+let amount = to_minor_units("1500", "HUF")?;  // 1500
 let amount = to_minor_units("1.250", "KWD")?; // 1250
 ```
 
 It parses the string and never goes through a float, so `"0.30"` is always 30 and never 29.
 Feed it the decimal your catalog or database already holds, not the result of float
-arithmetic. More decimal places than the currency allows (`"0.305"` EUR), signs, thousands
-separators and unknown currencies are `Error::Validation`; do your own rounding first.
-`currency_exponent` answers the exponent alone.
+arithmetic. It is strict: more decimal places than the currency has is `Error::Validation`
+even when they are zeros (`"25.000"` EUR), and so are signs, exponents, thousands separators
+and unknown currencies; do your own rounding first. ISK, KRW, OMR, JOD and TND are refused as
+not supported, because ISO 4217 and the gateway disagree on their decimals and a guess would
+be off by 10x or 100x. `currency_exponent` answers the exponent alone.
 
 ## Retries and double-charges
 
