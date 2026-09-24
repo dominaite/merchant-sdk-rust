@@ -100,10 +100,11 @@ pub enum Error {
         /// which row.
         ///
         /// ```no_run
-        /// # use dominaite::{Client, CheckoutSessionRequest, Error};
+        /// # use dominaite::{Client, CheckoutSessionRequest, Error, IdempotencyKey};
         /// # fn main() -> Result<(), Error> {
         /// # let client = Client::new("dmk_x", "dms_y")?;
-        /// # let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042");
+        /// # let key = IdempotencyKey::new("order-1042")?;
+        /// # let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042", key);
         /// match client.create_checkout_session(&request) {
         ///     Err(Error::Refusal { transaction_id: Some(id), .. }) => {
         ///         let status = client.get_status(&id)?;
@@ -157,10 +158,11 @@ pub enum Error {
     /// `transaction_id` or wait for the webhook. Never retry under a new key.
     ///
     /// ```no_run
-    /// # use dominaite::{charge_error_code, ChargeRequest, Client, Error};
+    /// # use dominaite::{charge_error_code, ChargeRequest, Client, Error, IdempotencyKey};
     /// # fn main() -> Result<(), Error> {
     /// # let client = Client::new("dmk_x", "dms_y")?;
-    /// # let request = ChargeRequest::new(2500, "EUR", "order-1043");
+    /// # let key = IdempotencyKey::new("order-1043")?;
+    /// # let request = ChargeRequest::new(2500, "EUR", "order-1043", key);
     /// match client.charge_payment_method("pm_...", &request) {
     ///     Err(Error::Charge { code, transaction_id: Some(id), .. })
     ///         if code == charge_error_code::CHARGE_OUTCOME_UNKNOWN =>

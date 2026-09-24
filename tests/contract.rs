@@ -29,8 +29,8 @@ use serde_json::Value;
 
 use dominaite::{
     charge_error_code, charge_status, decline_class, revoke_error_code, status,
-    stored_payment_method_status, ChargeRequest, CheckoutSession, CheckoutStatus, Client, Error,
-    PaymentMethodCharge, Ping, StoredPaymentMethod,
+    stored_payment_method_status, ChargeRequest, CheckoutSession, CheckoutSessionRequest,
+    CheckoutStatus, Client, Error, IdempotencyKey, PaymentMethodCharge, Ping, StoredPaymentMethod,
 };
 use support::{MockServer, Reply};
 
@@ -141,6 +141,14 @@ fn assert_fields<T: DeserializeOwned>(type_name: &str, expected: &[String]) {
         actual, expected,
         "{type_name} does not model exactly the fields the contract lists"
     );
+}
+
+fn idempotency_key(value: &str) -> IdempotencyKey {
+    IdempotencyKey::new(value).expect("a valid idempotency key")
+}
+
+fn session_request() -> CheckoutSessionRequest {
+    CheckoutSessionRequest::new(8440, "EUR", "order-1042", idempotency_key("order-1042"))
 }
 
 fn client_for(server: &MockServer) -> Client {
@@ -299,11 +307,7 @@ fn the_success_example_comes_back_as_a_session() {
     )]);
 
     let session = client_for(&server)
-        .create_checkout_session(&dominaite::CheckoutSessionRequest::new(
-            8440,
-            "EUR",
-            "order-1042",
-        ))
+        .create_checkout_session(&session_request())
         .expect("the contract's success example is a session");
 
     assert_eq!(
@@ -321,11 +325,7 @@ fn the_refusal_example_comes_back_as_a_refusal_with_its_transaction() {
     )]);
 
     let error = client_for(&server)
-        .create_checkout_session(&dominaite::CheckoutSessionRequest::new(
-            8440,
-            "EUR",
-            "order-1042",
-        ))
+        .create_checkout_session(&session_request())
         .expect_err("a refusal is not a session");
 
     // HTTP 200 all the way, and never retryable: it will not change on its own.
@@ -365,11 +365,7 @@ fn every_contract_refusal_code_survives_as_a_refusal() {
         let server = MockServer::start(vec![Reply::enveloped(&payload)]);
 
         let error = client_for(&server)
-            .create_checkout_session(&dominaite::CheckoutSessionRequest::new(
-                8440,
-                "EUR",
-                "order-1042",
-            ))
+            .create_checkout_session(&session_request())
             .expect_err("a refusal is not a session");
 
         assert_eq!(error.code(), Some(code), "{code} did not survive");
@@ -396,11 +392,7 @@ fn every_contract_validation_code_survives_with_its_status() {
         let server = MockServer::start(vec![Reply::error_envelope(400, code, "rejected")]);
 
         let error = client_for(&server)
-            .create_checkout_session(&dominaite::CheckoutSessionRequest::new(
-                8440,
-                "EUR",
-                "order-1042",
-            ))
+            .create_checkout_session(&session_request())
             .expect_err("a validation rejection is not a session");
 
         assert_eq!(error.code(), Some(code), "{code} did not survive");
@@ -416,7 +408,7 @@ fn every_contract_validation_code_survives_with_its_status() {
 const PAYMENT_METHOD_ID: &str = "pm_0123456789abcdef0123456789abcdef";
 
 fn charge_request() -> ChargeRequest {
-    ChargeRequest::new(2500, "EUR", "order-1043")
+    ChargeRequest::new(2500, "EUR", "order-1043", idempotency_key("order-1043"))
 }
 
 #[test]

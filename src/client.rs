@@ -1,7 +1,6 @@
 //! The client: signing, sending, and mapping responses onto the error taxonomy.
 
 use std::fmt;
-use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -302,9 +301,9 @@ impl Client {
     ///
     /// Reusing the key is what makes the retry safe. A transport failure leaves
     /// you not knowing whether the request landed; a key the API has already seen
-    /// never opens a second session. Generating a fresh key per attempt would be
-    /// exactly the double-charge bug this method exists to prevent, so the key is
-    /// pinned once before the first attempt.
+    /// never opens a second session. Every attempt sends the request's own key,
+    /// never a fresh one: a new key per attempt would be exactly the
+    /// double-charge bug this method exists to prevent.
     ///
     /// What a replayed key gets back is a refusal, not the original session: the
     /// API answers HTTP 200 with `success: false` and one of the replay codes
@@ -325,14 +324,9 @@ impl Client {
             return Err(Error::validation("attempts must be at least 1"));
         }
 
-        let mut pinned = request.clone();
-        if pinned.idempotency_key.is_none() {
-            pinned.idempotency_key = Some(new_idempotency_key());
-        }
-
         let mut last_error = None;
         for attempt in 0..options.attempts {
-            match self.create_checkout_session(&pinned) {
+            match self.create_checkout_session(request) {
                 Ok(session) => return Ok(session),
                 Err(error) if error.is_retryable() => {
                     last_error = Some(error);
@@ -382,9 +376,9 @@ impl Client {
     ///
     /// `payment_method_id` is the `id` from [`CheckoutStatus::stored_payment_method`]
     /// of a session you created with [`CheckoutSessionRequest::save_card`]. The
-    /// charge is signed like a session and carries an `Idempotency-Key`
-    /// (auto-generated unless you set one), so retrying after a timeout WITH THE
-    /// SAME KEY never charges the card twice.
+    /// charge is signed like a session and carries the request's required
+    /// `Idempotency-Key`, so retrying after a timeout WITH THE SAME KEY never
+    /// charges the card twice.
     ///
     /// Returns the charge on HTTP 201 (200 on a durable replay of the same key)
     /// and on HTTP 402 alike. A decline is not an error: the 402 charge has
@@ -817,12 +811,13 @@ fn classify_status(status: u16, code: Option<String>, message: Option<String>) -
 }
 
 /// Validates the request and returns the idempotency key plus the exact body
-/// bytes that get both signed and sent. Serializing once is the point: hashing a
+/// bytes that get both signed and sent. The key was validated when it was
+/// built, so it goes out as is. Serializing once is the point: hashing a
 /// second serialization would let key ordering or escaping drift between the
 /// signature and the wire.
 fn prepare_session_request(request: &CheckoutSessionRequest) -> Result<(String, String)> {
     validate_money_params(request.amount, &request.currency, &request.order_reference)?;
-    let idempotency_key = normalize_idempotency_key(request.idempotency_key.as_deref())?;
+    let idempotency_key = request.idempotency_key.as_str().to_string();
 
     let body = serde_json::to_string(request).map_err(|error| {
         Error::validation(format!(
@@ -838,7 +833,7 @@ fn prepare_session_request(request: &CheckoutSessionRequest) -> Result<(String, 
 /// order, which is what gets signed.
 fn prepare_charge_request(request: &ChargeRequest) -> Result<(String, String)> {
     validate_money_params(request.amount, &request.currency, &request.order_reference)?;
-    let idempotency_key = normalize_idempotency_key(request.idempotency_key.as_deref())?;
+    let idempotency_key = request.idempotency_key.as_str().to_string();
 
     let body = serde_json::to_string(request).map_err(|error| {
         Error::validation(format!(
@@ -878,21 +873,6 @@ fn validate_money_params(amount: i64, currency: &str, order_reference: &str) -> 
         ));
     }
     Ok(())
-}
-
-/// Mints a key when none was given and bounds the one that was.
-fn normalize_idempotency_key(idempotency_key: Option<&str>) -> Result<String> {
-    match idempotency_key {
-        Some(key) if key.trim().is_empty() => {
-            Err(Error::validation("idempotency_key must not be empty"))
-        }
-        // Characters, not bytes, for the same reason as order_reference above.
-        Some(key) if key.chars().count() > 100 => Err(Error::validation(
-            "idempotency_key must be at most 100 characters",
-        )),
-        Some(key) => Ok(key.to_string()),
-        None => Ok(new_idempotency_key()),
-    }
 }
 
 /// A payment method id is opaque (`pm_...`), so this only pins what keeps it a
@@ -944,74 +924,10 @@ pub(crate) fn unix_seconds() -> u64 {
         .unwrap_or(0)
 }
 
-/// Mints a random v4 UUID for use as an idempotency key. Keys are per-payment, so
-/// a fresh one is generated for every call that does not supply its own.
-///
-/// The bytes come from the OS. If the OS random source cannot be read, the
-/// fallback mixes the process's hash seed (itself OS-seeded), the current time in
-/// nanoseconds, and the address of a stack local - unique in practice, and only
-/// ever reached on a machine where /dev/urandom is unavailable.
-fn new_idempotency_key() -> String {
-    let mut bytes = [0u8; 16];
-    if !fill_from_os(&mut bytes) {
-        fill_from_fallback(&mut bytes);
-    }
-
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-
-    let hexed = hex::encode(bytes);
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hexed[0..8],
-        &hexed[8..12],
-        &hexed[12..16],
-        &hexed[16..20],
-        &hexed[20..32]
-    )
-}
-
-fn fill_from_os(bytes: &mut [u8; 16]) -> bool {
-    match std::fs::File::open("/dev/urandom") {
-        Ok(mut file) => file.read_exact(bytes).is_ok(),
-        Err(_) => false,
-    }
-}
-
-fn fill_from_fallback(bytes: &mut [u8; 16]) {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-
-    let mut hasher = RandomState::new().build_hasher();
-    hasher.write_u128(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or(0),
-    );
-    let marker = 0u8;
-    hasher.write_usize(std::ptr::addr_of!(marker) as usize);
-    let high = hasher.finish();
-
-    hasher.write_u64(high);
-    let low = hasher.finish();
-
-    bytes[..8].copy_from_slice(&high.to_le_bytes());
-    bytes[8..].copy_from_slice(&low.to_le_bytes());
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn idempotency_keys_are_unique_v4_uuids() {
-        let first = new_idempotency_key();
-        let second = new_idempotency_key();
-        assert_ne!(first, second);
-        assert!(is_uuid(&first), "{first} is not a lowercase UUID");
-        assert_eq!(&first[14..15], "4");
-    }
+    use crate::idempotency::IdempotencyKey;
 
     #[test]
     fn uuid_check_rejects_near_misses() {
@@ -1023,7 +939,8 @@ mod tests {
 
     #[test]
     fn body_serializes_once_with_extra_fields_merged() {
-        let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042")
+        let key = IdempotencyKey::new("order-1042").expect("valid key");
+        let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042", key)
             .extra("splitPayment", serde_json::json!(true));
         let (_, body) = prepare_session_request(&request).expect("valid request");
         assert_eq!(

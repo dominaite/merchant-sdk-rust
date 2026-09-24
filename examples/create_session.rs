@@ -11,7 +11,7 @@
 
 use std::env;
 
-use dominaite::{CheckoutSessionRequest, Client, Customer, Error};
+use dominaite::{CheckoutSessionRequest, Client, Customer, Error, IdempotencyKey};
 
 fn main() {
     let key_id = env::var("DOMINAITE_KEY_ID").unwrap_or_default();
@@ -35,7 +35,12 @@ fn main() {
         ping.merchant_id, ping.clock_skew_seconds
     );
 
-    let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042") // 2500 = 25.00 EUR
+    // The key belongs to the order: running this again replays the same session
+    // instead of opening a second one. Use a scope that is unique to your
+    // deployment, e.g. a short hash of your shop's public URL.
+    let key = IdempotencyKey::for_order("example", "order-1042", 2500, "EUR")
+        .unwrap_or_else(|error| fail(error));
+    let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042", key) // 2500 = 25.00 EUR
         .customer(
             Customer::new()
                 .first_name("Ana")

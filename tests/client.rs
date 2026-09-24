@@ -5,7 +5,8 @@ mod support;
 use std::time::Duration;
 
 use dominaite::{
-    sign_request, CheckoutSessionRequest, Client, Error, RetryOptions, SignRequest, SESSIONS_PATH,
+    sign_request, CheckoutSessionRequest, Client, Error, IdempotencyKey, RetryOptions, SignRequest,
+    SESSIONS_PATH,
 };
 use support::{MockServer, Recorded, Reply};
 
@@ -42,8 +43,18 @@ fn client_for(server: &MockServer) -> Client {
         .expect("valid credentials")
 }
 
+const SESSION_KEY: &str = "00000000-0000-4000-8000-000000000001";
+
+fn key(value: &str) -> IdempotencyKey {
+    IdempotencyKey::new(value).expect("a valid idempotency key")
+}
+
 fn request() -> CheckoutSessionRequest {
-    CheckoutSessionRequest::new(2500, "EUR", "order-1042")
+    CheckoutSessionRequest::new(2500, "EUR", "order-1042", key(SESSION_KEY))
+}
+
+fn request_for(amount: i64, currency: &str, order_reference: &str) -> CheckoutSessionRequest {
+    CheckoutSessionRequest::new(amount, currency, order_reference, key(SESSION_KEY))
 }
 
 /// Recomputes the signature from what the server actually received, and asserts
@@ -86,11 +97,12 @@ fn create_session_signs_exactly_what_it_sends() {
         r#"{"amount":2500,"currency":"EUR","orderReference":"order-1042"}"#
     );
 
-    let key = recorded
-        .header("Idempotency-Key")
-        .expect("POST carries an Idempotency-Key")
-        .to_string();
-    assert_signature_matches(&recorded, SESSIONS_PATH, &key);
+    assert_eq!(
+        recorded.header("Idempotency-Key"),
+        Some(SESSION_KEY),
+        "POST carries the caller's Idempotency-Key"
+    );
+    assert_signature_matches(&recorded, SESSIONS_PATH, SESSION_KEY);
 }
 
 #[test]
@@ -545,17 +557,54 @@ fn retry_never_repeats_a_refusal_or_an_auth_failure() {
 }
 
 #[test]
-fn a_pinned_idempotency_key_is_the_one_that_gets_sent() {
+fn the_order_derived_key_is_the_one_that_gets_sent_and_signed() {
     let server = MockServer::start(vec![create_ok()]);
-    let key = "00000000-0000-4000-8000-000000000001";
+    let derived = IdempotencyKey::for_order("shop-a1b2c3d4", "order-1042", 2500, "EUR")
+        .expect("a valid order key");
 
     client_for(&server)
-        .create_checkout_session(&request().idempotency_key(key))
+        .create_checkout_session(&CheckoutSessionRequest::new(
+            2500,
+            "EUR",
+            "order-1042",
+            derived,
+        ))
         .expect("created");
 
     let recorded = server.only_request();
-    assert_eq!(recorded.header("Idempotency-Key"), Some(key));
-    assert_signature_matches(&recorded, SESSIONS_PATH, key);
+    let expected = "shop-a1b2c3d4-order-1042-2500-EUR";
+    assert_eq!(recorded.header("Idempotency-Key"), Some(expected));
+    assert_signature_matches(&recorded, SESSIONS_PATH, expected);
+}
+
+/// Reload and back button safety: the same order at the same amount asks again
+/// with the same key, so the gateway replays instead of opening a second
+/// payment. The SDK must never swap in a key of its own on the way.
+#[test]
+fn the_same_order_sends_the_same_key_every_time() {
+    let server = MockServer::start(vec![create_ok()]);
+    let client = client_for(&server);
+
+    for _ in 0..2 {
+        let key = IdempotencyKey::for_order("shop-a1b2c3d4", "order-1042", 2500, "EUR")
+            .expect("a valid order key");
+        client
+            .create_checkout_session(&CheckoutSessionRequest::new(2500, "EUR", "order-1042", key))
+            .expect("created");
+    }
+
+    let keys: Vec<String> = server
+        .requests()
+        .iter()
+        .map(|recorded| {
+            recorded
+                .header("Idempotency-Key")
+                .expect("key sent")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0], keys[1], "a reload must replay, not mint");
 }
 
 #[test]
@@ -564,25 +613,13 @@ fn bad_arguments_are_rejected_before_anything_is_sent() {
     let client = client_for(&server);
 
     for (label, bad) in [
-        (
-            "zero amount",
-            CheckoutSessionRequest::new(0, "EUR", "order-1"),
-        ),
-        (
-            "negative amount",
-            CheckoutSessionRequest::new(-500, "EUR", "order-1"),
-        ),
-        (
-            "missing currency",
-            CheckoutSessionRequest::new(2500, "", "order-1"),
-        ),
-        (
-            "missing order reference",
-            CheckoutSessionRequest::new(2500, "EUR", ""),
-        ),
+        ("zero amount", request_for(0, "EUR", "order-1")),
+        ("negative amount", request_for(-500, "EUR", "order-1")),
+        ("missing currency", request_for(2500, "", "order-1")),
+        ("missing order reference", request_for(2500, "EUR", "")),
         (
             "over-long order reference",
-            CheckoutSessionRequest::new(2500, "EUR", "x".repeat(101)),
+            request_for(2500, "EUR", &"x".repeat(101)),
         ),
     ] {
         let error = client
@@ -612,32 +649,26 @@ fn length_limits_count_characters_not_bytes() {
     let client = client_for(&server);
 
     client
-        .create_checkout_session(&CheckoutSessionRequest::new(2500, "EUR", &cyrillic))
+        .create_checkout_session(&request_for(2500, "EUR", &cyrillic))
         .expect("a 100-character order reference is within the limit");
 
     client
-        .create_checkout_session(&request().idempotency_key(&cyrillic))
+        .create_checkout_session(&CheckoutSessionRequest::new(
+            2500,
+            "EUR",
+            "order-1042",
+            key(&cyrillic),
+        ))
         .expect("a 100-character idempotency key is within the limit");
 
     // 101 characters is over the limit whichever alphabet it is written in.
-    for (label, over) in [
-        (
-            "order reference",
-            CheckoutSessionRequest::new(2500, "EUR", "ж".repeat(101)),
-        ),
-        (
-            "idempotency key",
-            request().idempotency_key("ж".repeat(101)),
-        ),
-    ] {
-        let error = client
-            .create_checkout_session(&over)
-            .expect_err(&format!("an over-long {label} must be rejected"));
-        assert!(
-            matches!(error, Error::Validation { .. }),
-            "{label}: {error}"
-        );
-    }
+    let error = client
+        .create_checkout_session(&request_for(2500, "EUR", &"ж".repeat(101)))
+        .expect_err("an over-long order reference must be rejected");
+    assert!(matches!(error, Error::Validation { .. }), "{error}");
+
+    let error = IdempotencyKey::new("ж".repeat(101)).expect_err("an over-long key");
+    assert!(matches!(error, Error::Validation { .. }), "{error}");
 
     assert_eq!(server.requests().len(), 2, "only the valid calls were sent");
 }

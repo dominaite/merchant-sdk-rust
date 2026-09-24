@@ -69,7 +69,7 @@ environment.
 `src/main.rs`:
 
 ```rust
-use dominaite::{CheckoutSessionRequest, Client, Customer, Error};
+use dominaite::{CheckoutSessionRequest, Client, Customer, Error, IdempotencyKey};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder(
@@ -84,7 +84,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ping = client.ping()?;
     println!("merchant {}, clock skew {}s", ping.merchant_id, ping.clock_skew_seconds);
 
-    let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042") // 2500 = 25.00 EUR
+    // The key belongs to the order, not to the request: a reload or the back button
+    // replays this session instead of opening a second one, and a changed amount
+    // gets a new key. The scope keeps your deployments apart (a short hash of your
+    // shop's public URL works well).
+    let key = IdempotencyKey::for_order("shop-a1b2c3d4", "order-1042", 2500, "EUR")?;
+
+    let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042", key) // 2500 = 25.00 EUR
         .customer(
             // Pass everything you already know - prefilled fields are hidden from the
             // payer, so the checkout form stays short.
@@ -227,9 +233,24 @@ page sent you.
 
 ## Retries and double-charges
 
-Every `create_checkout_session` call carries an idempotency key (auto-generated, or set your own
-with `.idempotency_key(...)`). Retrying with the same key never opens a second payment - on a
-timeout, retry with the same key rather than generating a new one.
+Every `create_checkout_session` and `charge_payment_method` call takes an idempotency key, and
+the SDK never makes one up: `CheckoutSessionRequest::new` and `ChargeRequest::new` will not
+compile without an `IdempotencyKey`. Retrying with the same key never opens a second payment -
+on a timeout, retry with the same key rather than generating a new one.
+
+Derive the key from the order with `IdempotencyKey::for_order(scope, order_id, amount_minor,
+currency)`, which builds `{scope}-{orderId}-{amountMinor}-{CURRENCY}`:
+
+- Same order, same amount: same key. A page reload or the back button replays the session
+  already open for the order instead of opening a second one.
+- Changed amount or currency: new key. A re-priced order never reuses the session opened for
+  the old total (that replay would be refused with `IDEMPOTENCY_KEY_REUSED`).
+- `scope` keeps deployments that share one merchant apart. A staging and a production shop
+  that both number orders from 1001 would otherwise collide.
+
+If you already derive keys your own way, wrap them with `IdempotencyKey::new(key)`. Both
+constructors return `Error::Validation` for an empty key or one over 100 characters, before
+anything is sent.
 
 A replayed key does not hand back the original session. While the first attempt is live (or
 completed, or judged failed), the API answers HTTP 200 with `success: false` and a replay code,
@@ -239,8 +260,8 @@ first session's `cashierKey` and `cashierToken` are not returned again. When the
 transaction id, read it back with `get_status` to find out what the earlier attempt did; see
 [Recovering from a replay refusal](#recovering-from-a-replay-refusal).
 
-`create_checkout_session_with_retry` does that for you: it pins one key up front and reuses it
-across attempts, retrying only `Error::Transport` (network failures and 5xx, including
+`create_checkout_session_with_retry` does that for you: it sends the request's key on every
+attempt, retrying only `Error::Transport` (network failures and 5xx, including
 `MERCHANT_API_UNAVAILABLE`). Refusals and authentication failures are not retried - they will not
 change.
 
@@ -266,7 +287,7 @@ nothing else about the session changes, and a request without it sends the exact
 before (the flag is omitted, not sent as `false`).
 
 ```rust
-let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042").save_card(true);
+let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042", key).save_card(true);
 let session = client.create_checkout_session(&request)?;
 ```
 
@@ -288,15 +309,16 @@ if let Some(method) = &status.stored_payment_method {
 
 Charge the stored card later, off-session, with `charge_payment_method`. The call takes the
 same amount, currency and order reference as a session, and an idempotency key that is required
-and signed exactly like `create_checkout_session` (one is generated when you do not pass one;
-pin your own when you retry).
+and signed exactly like `create_checkout_session`. Derive it from what you are billing (the
+subscription and its period), so a retried charge carries the same one.
 
 ```rust
-use dominaite::{charge_error_code, charge_status, decline_class, ChargeRequest, Error};
+use dominaite::{charge_error_code, charge_status, decline_class, ChargeRequest, Error, IdempotencyKey};
 
+let key = IdempotencyKey::new("sub-8817-2026-10")?;
 match client.charge_payment_method(
     &method_id,
-    &ChargeRequest::new(2500, "EUR", "order-1043").description("Monthly plan"),
+    &ChargeRequest::new(2500, "EUR", "order-1043", key).description("Monthly plan"),
 ) {
     Ok(charge) => match charge.status.as_str() {
         charge_status::SUCCEEDED => mark_paid(&charge.transaction_id),
@@ -519,7 +541,9 @@ Refusal codes on `Error::Refusal`:
 - `DUPLICATE_REQUEST` - a session for this idempotency key is already open, or expired within
   the last few minutes; re-POST the same key shortly, never a fresh one.
 - `ALREADY_PROCESSED` - this idempotency key's payment already completed.
-- `PRIOR_ATTEMPT_FAILED` - the earlier attempt with this key failed; use a fresh key.
+- `PRIOR_ATTEMPT_FAILED` - the earlier attempt with this key failed; use a fresh key. The
+  order-derived key is spent, so derive the next one from a new attempt id (for example
+  `order-1042-2` as the `order_id`).
 - `IDEMPOTENCY_KEY_REUSED` - same key sent with a different body; use a fresh key.
 
 All five arrive as HTTP 200 with `success: false`, not as an HTTP error status.
