@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-use crate::error::{Error, Result};
+use crate::error::{session_error_code, Error, Result};
 use crate::signing::{sign_request, SignRequest};
 use crate::types::{
     ChargeRequest, CheckoutSession, CheckoutSessionRequest, CheckoutStatus, PaymentMethodCharge,
@@ -297,8 +297,9 @@ impl Client {
         }
     }
 
-    /// Creates a session, retrying [`Error::Transport`] only, with THE SAME
-    /// idempotency key across every attempt.
+    /// Creates a session, retrying [`Error::Transport`] and the
+    /// `PAYMENT_PROCESSING_UNAVAILABLE` refusal, with THE SAME idempotency key
+    /// across every attempt.
     ///
     /// Reusing the key is what makes the retry safe. A transport failure leaves
     /// you not knowing whether the request landed; a key the API has already seen
@@ -314,8 +315,11 @@ impl Client {
     /// transaction id, read it back with [`Client::get_status`] to find out what
     /// the earlier attempt did.
     ///
-    /// Refusals and authentication failures are returned immediately. They will
-    /// not change on a retry.
+    /// `PAYMENT_PROCESSING_UNAVAILABLE` is retried in both of its forms: a 503
+    /// (already a transport error) and the HTTP 200 refusal. Card payments being
+    /// off is temporary, and nothing was created, so the same key is safe.
+    /// Every other refusal, and every authentication failure, is returned
+    /// immediately. They will not change on a retry.
     pub fn create_checkout_session_with_retry(
         &self,
         request: &CheckoutSessionRequest,
@@ -329,7 +333,7 @@ impl Client {
         for attempt in 0..options.attempts {
             match self.create_checkout_session(request) {
                 Ok(session) => return Ok(session),
-                Err(error) if error.is_retryable() => {
+                Err(error) if error.is_retryable() || is_processing_unavailable(&error) => {
                     last_error = Some(error);
                     if attempt + 1 < options.attempts {
                         std::thread::sleep(options.base_delay * 2u32.pow(attempt.min(16)));
@@ -703,6 +707,15 @@ impl Reply {
     fn rejection(self) -> Error {
         classify_status(self.status, self.error_code(), self.error_message())
     }
+}
+
+/// The one refusal the session retry helper sends again: card payments are off
+/// for now and nothing was created, so the same key comes back safely later.
+fn is_processing_unavailable(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Refusal { code, .. } if code == session_error_code::PAYMENT_PROCESSING_UNAVAILABLE
+    )
 }
 
 /// The statuses that stay generic on every route: input validation, credentials,

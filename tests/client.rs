@@ -531,6 +531,58 @@ fn a_503_carrying_payment_processing_unavailable_is_retried_with_the_same_key() 
     }
 }
 
+/// The same outage in its other form: an HTTP 200 refusal. Card payments are
+/// off for now and nothing was created, so the helper tries again with the
+/// same key rather than handing the caller a dead end.
+#[test]
+fn a_payment_processing_unavailable_refusal_is_retried_with_the_same_key() {
+    let server = MockServer::start(vec![
+        refusal(session_error_code::PAYMENT_PROCESSING_UNAVAILABLE),
+        create_ok(),
+    ]);
+
+    let session = client_for(&server)
+        .create_checkout_session_with_retry(
+            &request(),
+            RetryOptions {
+                attempts: 3,
+                base_delay: Duration::from_millis(0),
+            },
+        )
+        .expect("the retry succeeds");
+    assert_eq!(session.transaction_id, TRANSACTION_ID);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "the refusal must be retried");
+    for recorded in &requests {
+        assert_eq!(recorded.header("Idempotency-Key"), Some(SESSION_KEY));
+    }
+}
+
+#[test]
+fn a_persistent_payment_processing_unavailable_refusal_comes_back_after_the_last_attempt() {
+    let server = MockServer::start(vec![refusal(
+        session_error_code::PAYMENT_PROCESSING_UNAVAILABLE,
+    )]);
+
+    let error = client_for(&server)
+        .create_checkout_session_with_retry(
+            &request(),
+            RetryOptions {
+                attempts: 3,
+                base_delay: Duration::from_millis(0),
+            },
+        )
+        .expect_err("still unavailable");
+
+    assert_eq!(
+        error.code(),
+        Some(session_error_code::PAYMENT_PROCESSING_UNAVAILABLE)
+    );
+    assert!(matches!(error, Error::Refusal { .. }), "{error:?}");
+    assert_eq!(server.requests().len(), 3, "every attempt was used");
+}
+
 #[test]
 fn retry_gives_up_and_returns_the_transport_error() {
     let server = MockServer::start(vec![Reply::error_envelope(503, "X", "down")]);

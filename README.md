@@ -283,9 +283,10 @@ transaction id, read it back with `get_status` to find out what the earlier atte
 [Recovering from a replay refusal](#recovering-from-a-replay-refusal).
 
 `create_checkout_session_with_retry` does that for you: it sends the request's key on every
-attempt, retrying only `Error::Transport` (network failures and 5xx, including
-`MERCHANT_API_UNAVAILABLE`). Refusals and authentication failures are not retried - they will not
-change.
+attempt, retrying `Error::Transport` (network failures and 5xx, including
+`MERCHANT_API_UNAVAILABLE`) and `PAYMENT_PROCESSING_UNAVAILABLE` in both its forms, the 503 and
+the HTTP 200 refusal. Other refusals and authentication failures are not retried - they will
+not change.
 
 ```rust
 use dominaite::RetryOptions;
