@@ -7,7 +7,9 @@ use crate::error::{Error, Result};
 const UNSUPPORTED: [&str; 5] = ["ISK", "KRW", "OMR", "JOD", "TND"];
 
 /// How many decimal places the gateway uses for `currency`, or `None` for a
-/// code this crate does not know or does not support. Case-insensitive.
+/// code this crate does not know or does not support. Case-insensitive. The
+/// list is closed on purpose: a currency missing from it is `None`, never a
+/// guessed default of 2.
 ///
 /// This follows the GATEWAY, not ISO 4217. They differ on HUF: the gateway
 /// charges whole forints (0 decimals) where ISO lists 2, so `"1500"` HUF is
@@ -27,7 +29,7 @@ pub fn currency_exponent(currency: &str) -> Option<u32> {
     let upper = currency.trim().to_ascii_uppercase();
     match upper.as_str() {
         "EUR" | "USD" | "GBP" | "CAD" | "AUD" | "CHF" | "BGN" | "RON" | "PLN" | "CZK" | "SEK"
-        | "DKK" | "NOK" | "NZD" | "TRY" | "RSD" | "MKD" | "UAH" => Some(2),
+        | "DKK" | "NOK" => Some(2),
         "JPY" | "HUF" => Some(0),
         "BHD" | "KWD" => Some(3),
         _ => None,
@@ -73,7 +75,7 @@ pub fn to_minor_units(amount: &str, currency: &str) -> Result<i64> {
     }
     let exponent = currency_exponent(currency).ok_or_else(|| {
         Error::validation(format!(
-            "unknown currency {currency:?}: no exponent known for it"
+            "unknown currency {currency:?}: no minor-unit exponent on record"
         ))
     })?;
 

@@ -129,6 +129,25 @@ fn an_unknown_currency_is_rejected() {
     assert_rejected("25.00", "");
 }
 
+/// The list is the gateway's and nothing more. These look like ordinary
+/// two-decimal currencies, but the other SDKs refuse them, so this one does
+/// too rather than quietly defaulting to 2.
+#[test]
+fn currencies_outside_the_gateway_table_are_unknown() {
+    for currency in ["NZD", "TRY", "RSD", "MKD", "UAH", "nzd"] {
+        assert_eq!(currency_exponent(currency), None, "{currency}");
+        match to_minor_units("25.00", currency) {
+            Err(Error::Validation { message }) => {
+                assert!(
+                    message.contains("unknown currency"),
+                    "{currency}: {message}"
+                )
+            }
+            other => panic!("{currency}: expected a validation error, got {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn an_amount_too_large_for_i64_is_rejected() {
     assert_eq!(
