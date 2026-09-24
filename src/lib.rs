@@ -34,7 +34,9 @@
 //! # }
 //! ```
 //!
-//! Amounts are always integers in MINOR units. Errors are typed: see [`Error`].
+//! Amounts are always integers in MINOR units; [`to_minor_units`] converts a
+//! decimal string by the currency's ISO 4217 exponent. Errors are typed: see
+//! [`Error`].
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -42,6 +44,7 @@
 mod client;
 mod error;
 mod idempotency;
+mod money;
 mod signing;
 mod types;
 mod webhooks;
@@ -52,6 +55,7 @@ pub use client::{
 };
 pub use error::{charge_error_code, revoke_error_code, session_error_code, Error, Result};
 pub use idempotency::IdempotencyKey;
+pub use money::{currency_exponent, to_minor_units};
 pub use signing::{sha256_hex, sign_request, SignRequest};
 pub use types::{
     charge_status, decline_class, status, stored_payment_method_status, ChargeRequest,

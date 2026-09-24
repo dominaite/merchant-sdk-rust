@@ -231,6 +231,24 @@ network. The amount is locked server-side - what you pass here is what gets char
 in the browser can change it. Compute it from your own catalog, never from the request body your
 page sent you.
 
+The minor unit depends on the currency (ISO 4217): EUR, USD, GBP, BGN and most others have two
+decimals, JPY, KRW and ISK none, BHD, KWD, OMR, JOD and TND three. `to_minor_units` converts a
+decimal string for you:
+
+```rust
+use dominaite::to_minor_units;
+
+let amount = to_minor_units("0.30", "EUR")?;  // 30
+let amount = to_minor_units("500", "JPY")?;   // 500
+let amount = to_minor_units("1.250", "KWD")?; // 1250
+```
+
+It parses the string and never goes through a float, so `"0.30"` is always 30 and never 29.
+Feed it the decimal your catalog or database already holds, not the result of float
+arithmetic. More decimal places than the currency allows (`"0.305"` EUR), signs, thousands
+separators and unknown currencies are `Error::Validation`; do your own rounding first.
+`currency_exponent` answers the exponent alone.
+
 ## Retries and double-charges
 
 Every `create_checkout_session` and `charge_payment_method` call takes an idempotency key, and
