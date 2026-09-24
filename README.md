@@ -16,7 +16,7 @@ through. A git dependency works today:
 
 ```toml
 [dependencies]
-dominaite = { git = "https://github.com/dominaite/merchant-sdk-rust", tag = "v0.1.0" }
+dominaite = { git = "https://github.com/dominaite/merchant-sdk-rust", tag = "v0.3.0" }
 ```
 
 To work on the SDK itself:
@@ -48,7 +48,7 @@ Everything below is copy-paste. It assumes an empty directory and nothing instal
 
 ```sh
 cargo new my-checkout && cd my-checkout
-cargo add --git https://github.com/dominaite/merchant-sdk-rust --tag v0.1.0 dominaite
+cargo add --git https://github.com/dominaite/merchant-sdk-rust --tag v0.3.0 dominaite
 ```
 
 Set your credentials and the environment you are pointing at:
@@ -69,7 +69,7 @@ environment.
 `src/main.rs`:
 
 ```rust
-use dominaite::{CheckoutSessionRequest, Client, Customer, Error};
+use dominaite::{CheckoutSessionRequest, Client, Customer, Error, IdempotencyKey};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder(
@@ -84,7 +84,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ping = client.ping()?;
     println!("merchant {}, clock skew {}s", ping.merchant_id, ping.clock_skew_seconds);
 
-    let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042") // 2500 = 25.00 EUR
+    // The key belongs to the order, not to the request: a reload or the back button
+    // replays this session instead of opening a second one, and a changed amount
+    // gets a new key. The scope keeps your deployments apart (a short hash of your
+    // shop's public URL works well).
+    let key = IdempotencyKey::for_order("shop-a1b2c3d4", "order-1042", 2500, "EUR")?;
+
+    let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042", key) // 2500 = 25.00 EUR
         .customer(
             // Pass everything you already know - prefilled fields are hidden from the
             // payer, so the checkout form stays short.
@@ -225,24 +231,71 @@ network. The amount is locked server-side - what you pass here is what gets char
 in the browser can change it. Compute it from your own catalog, never from the request body your
 page sent you.
 
+The minor unit depends on the currency, and it is the gateway's minor unit that counts. EUR,
+USD, GBP, CAD, AUD, CHF, BGN, RON, PLN, CZK, SEK, DKK, NOK and the other two-decimal currencies
+have two decimals, JPY and HUF none, BHD and KWD three. HUF is the trap: ISO 4217 lists two
+decimals, but the gateway charges whole forints, so 1500 HUF is `1500`, not `150000`.
+`to_minor_units` converts a decimal string for you:
+
+```rust
+use dominaite::to_minor_units;
+
+let amount = to_minor_units("0.30", "EUR")?;  // 30
+let amount = to_minor_units("1500", "HUF")?;  // 1500
+let amount = to_minor_units("1.250", "KWD")?; // 1250
+```
+
+It parses the string and never goes through a float, so `"0.30"` is always 30 and never 29.
+Feed it the decimal your catalog or database already holds, not the result of float
+arithmetic. It is strict: more decimal places than the currency has is `Error::Validation`
+even when they are zeros (`"25.000"` EUR), and so are signs, exponents, thousands separators
+and unknown currencies; do your own rounding first. ISK, KRW, OMR, JOD and TND are refused as
+not supported, because ISO 4217 and the gateway disagree on their decimals and a guess would
+be off by 10x or 100x. `currency_exponent` answers the exponent alone.
+
 ## Retries and double-charges
 
-Every `create_checkout_session` call carries an idempotency key (auto-generated, or set your own
-with `.idempotency_key(...)`). Retrying with the same key never opens a second payment - on a
-timeout, retry with the same key rather than generating a new one.
+Every `create_checkout_session` and `charge_payment_method` call takes an idempotency key, and
+the SDK never makes one up: `CheckoutSessionRequest::new` and `ChargeRequest::new` will not
+compile without an `IdempotencyKey`. Retrying with the same key never opens a second payment -
+on a timeout, retry with the same key rather than generating a new one.
 
-A replayed key does not hand back the original session. While the first attempt is live (or
-completed, or judged failed), the API answers HTTP 200 with `success: false` and a replay code,
-which arrives as `Error::Refusal`
-(`DUPLICATE_REQUEST`, `ALREADY_PROCESSED`, `PRIOR_ATTEMPT_FAILED`, `IDEMPOTENCY_KEY_REUSED`) - the
-first session's `cashierKey` and `cashierToken` are not returned again. When the refusal names a
-transaction id, read it back with `get_status` to find out what the earlier attempt did; see
-[Recovering from a replay refusal](#recovering-from-a-replay-refusal).
+Derive the key from the order with `IdempotencyKey::for_order(scope, order_id, amount_minor,
+currency)`, which builds `{scope}-{orderId}-{amountMinor}-{CURRENCY}`:
 
-`create_checkout_session_with_retry` does that for you: it pins one key up front and reuses it
-across attempts, retrying only `Error::Transport` (network failures and 5xx, including
-`MERCHANT_API_UNAVAILABLE`). Refusals and authentication failures are not retried - they will not
-change.
+- Same order, same amount: same key. A page reload or the back button replays the session
+  already open for the order instead of opening a second one.
+- Changed amount or currency: new key. A re-priced order never reuses the session opened for
+  the old total (that replay would be refused with `IDEMPOTENCY_KEY_REUSED`).
+- `scope` keeps deployments that share one merchant apart. A staging and a production shop
+  that both number orders from 1001 would otherwise collide.
+
+If you already derive keys your own way, wrap them with `IdempotencyKey::new(key)`. A key is 1
+to 100 characters of visible ASCII (`!` through `~`: no spaces, no control characters, no
+non-Latin letters), and both constructors return `Error::Validation` for anything else, before
+anything is sent. That includes an order id with a space in it passed to `for_order`.
+
+What a replayed key gets back depends on where the first attempt is:
+
+- Still open and unexpired, same amount and currency: the ORIGINAL session, as an ordinary
+  `Ok` with the same `transaction_id`, `cashier_key` and `cashier_token`. This is what makes a
+  reload, the back button, or a retry after a lost response safe: you render the same widget
+  again.
+- Paid, failed, or sent with a different amount, currency or `save_card`: HTTP 200 with
+  `success: false` and a replay code, which arrives as `Error::Refusal` (`ALREADY_PROCESSED`,
+  `PRIOR_ATTEMPT_FAILED`, `IDEMPOTENCY_KEY_REUSED`).
+- Open, but its session cannot be handed back right now (a concurrent create still writing it,
+  or an expired one the gateway could not replace yet): `DUPLICATE_REQUEST`. Send the same key
+  again shortly.
+
+When a refusal names a transaction id, read it back with `get_status` to find out what the
+earlier attempt did; see [Recovering from a replay refusal](#recovering-from-a-replay-refusal).
+
+`create_checkout_session_with_retry` does that for you: it sends the request's key on every
+attempt, retrying `Error::Transport` (network failures and 5xx, including
+`MERCHANT_API_UNAVAILABLE`) and `PAYMENT_PROCESSING_UNAVAILABLE` in both its forms, the 503 and
+the HTTP 200 refusal. Other refusals and authentication failures are not retried - they will
+not change.
 
 ```rust
 use dominaite::RetryOptions;
@@ -266,7 +319,7 @@ nothing else about the session changes, and a request without it sends the exact
 before (the flag is omitted, not sent as `false`).
 
 ```rust
-let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042").save_card(true);
+let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042", key).save_card(true);
 let session = client.create_checkout_session(&request)?;
 ```
 
@@ -288,15 +341,16 @@ if let Some(method) = &status.stored_payment_method {
 
 Charge the stored card later, off-session, with `charge_payment_method`. The call takes the
 same amount, currency and order reference as a session, and an idempotency key that is required
-and signed exactly like `create_checkout_session` (one is generated when you do not pass one;
-pin your own when you retry).
+and signed exactly like `create_checkout_session`. Derive it from what you are billing (the
+subscription and its period), so a retried charge carries the same one.
 
 ```rust
-use dominaite::{charge_error_code, charge_status, decline_class, ChargeRequest, Error};
+use dominaite::{charge_error_code, charge_status, decline_class, ChargeRequest, Error, IdempotencyKey};
 
+let key = IdempotencyKey::new("sub-8817-2026-10")?;
 match client.charge_payment_method(
     &method_id,
-    &ChargeRequest::new(2500, "EUR", "order-1043").description("Monthly plan"),
+    &ChargeRequest::new(2500, "EUR", "order-1043", key).description("Monthly plan"),
 ) {
     Ok(charge) => match charge.status.as_str() {
         charge_status::SUCCEEDED => mark_paid(&charge.transaction_id),
@@ -482,8 +536,9 @@ if status.is_paid() { /* fulfil the order */ }
 `dominaite::status` constants). **`succeeded` is the only value that means the customer paid** -
 that is what `is_paid()` answers. `is_terminal()` tells you whether to stop polling, and reports
 a status it does not recognise as NOT terminal, so a value the API adds later makes you keep
-polling instead of closing an open order. Keep polling on `pending`, `processing` and
-`requires_capture` - none of them is terminal.
+polling instead of closing an open order. Keep polling on `pending`, `processing`,
+`requires_capture` and `disputed` - none of them is terminal (a dispute can still go either
+way).
 
 `requires_capture` is **not** "unpaid": the payer has already paid and the funds are held
 awaiting capture, which is why `is_paid()` (settled) and `is_terminal()` (finished) both answer
@@ -510,19 +565,52 @@ string where there is one.
 | `Error::RateLimited { retry_after_seconds }` | 429. The platform allows 60 requests per minute per API key and 120 per minute per IP. | Wait `retry_after_seconds` (or back off yourself when it is `None`), then send the request again with the **same** idempotency key. Never auto-retried: `is_retryable()` is false. |
 | `Error::Charge { status, code, charge, transaction_id, .. }` | `charge_payment_method` got an error code instead of a charge: 409, 422, 502 or 503. | Branch on `code` (see [Stored payment methods](#stored-payment-methods-recurring)). `CHARGE_OUTCOME_UNKNOWN` carries the `transaction_id` to poll; never retry it under a new key. |
 | `Error::Revoke { status, code, .. }` | `revoke_payment_method` was refused: 502 `UPSTREAM_CONTRACT_ERROR` or 503 `MERCHANT_API_UNAVAILABLE`. Nothing changed. | Retry later on 503; contact support on 502. |
-| `Error::Api { status, code, .. }` | Any other rejecting or unexpected response. `code` carries the API's machine-readable reason when it sent one, e.g. `IDEMPOTENCY_KEY_REQUIRED` on a 400, `PAYMENT_METHOD_NOT_FOUND` on a charge 404. | Inspect `status` and `code`. A 404 from `get_status` is an unknown transaction id. |
+| `Error::Api { status, code, .. }` | Any other rejecting or unexpected response. `code` carries the API's machine-readable reason when it sent one, e.g. `IDEMPOTENCY_KEY_REQUIRED` on a 400, `STOREFRONT_NOT_WHITELISTED` on a 409, `PAYMENT_METHOD_NOT_FOUND` on a charge 404. | Inspect `status` and `code`. A 404 from `get_status` is an unknown transaction id. |
 | `Error::Validation { .. }` | Bad arguments (non-positive amount, missing field, malformed key id). | Fix the call; nothing was sent. |
 
 Refusal codes on `Error::Refusal`:
 
 - `PAYMENT_PROCESSING_UNAVAILABLE` - card payments are off right now; retry later.
-- `DUPLICATE_REQUEST` - a session for this idempotency key is already open, or expired within
-  the last few minutes; re-POST the same key shortly, never a fresh one.
+- `DUPLICATE_REQUEST` - a session for this idempotency key is open but cannot be handed back
+  right now (a concurrent create, or an expired session not yet replaced); re-POST the same key
+  shortly, never a fresh one. A clean replay of an open session is not a refusal: it returns
+  the original session.
 - `ALREADY_PROCESSED` - this idempotency key's payment already completed.
-- `PRIOR_ATTEMPT_FAILED` - the earlier attempt with this key failed; use a fresh key.
+- `PRIOR_ATTEMPT_FAILED` - the earlier attempt with this key failed; use a fresh key. The
+  order-derived key is spent, so derive the next one from a new attempt id (for example
+  `order-1042-2` as the `order_id`).
 - `IDEMPOTENCY_KEY_REUSED` - same key sent with a different body; use a fresh key.
 
 All five arrive as HTTP 200 with `success: false`, not as an HTTP error status.
+
+Every refusal code is a constant in `dominaite::session_error_code` (`REFUSALS` lists them).
+
+### Storefront errors
+
+A merchant with more than one website has a storefront (an online location) per site. When the
+storefront cannot take payments, session creation fails with a real HTTP status rather than a
+200 refusal, so these arrive as `Error::Api` with the code set:
+
+| Code | Status | Meaning |
+|---|---|---|
+| `STOREFRONT_NOT_WHITELISTED` | 409 | The site's domain is not whitelisted with the payment provider yet. |
+| `STOREFRONT_INACTIVE` | 409 | The storefront was deactivated or deleted. |
+| `STOREFRONT_MISMATCH` | 400 | The API key is bound to one storefront and the request named another. |
+
+None of them fixes itself on a retry, and none is a code bug on your side: the fix is in the
+Dominaite backoffice or onboarding. Show the customer "payments are unavailable" and alert your
+team.
+
+```rust
+use dominaite::session_error_code;
+
+match client.create_checkout_session(&request) {
+    Err(error) if error.code() == Some(session_error_code::STOREFRONT_NOT_WHITELISTED) => {
+        alert_ops("storefront not whitelisted yet");
+    }
+    other => { /* ... */ }
+}
+```
 
 ### Recovering from a replay refusal
 

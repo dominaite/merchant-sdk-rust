@@ -12,7 +12,7 @@ use std::time::Duration;
 use dominaite::{
     charge_error_code, charge_status, decline_class, revoke_error_code, sign_request,
     stored_payment_method_status, ChargeRequest, CheckoutSessionRequest, Client, Error,
-    SignRequest, PAYMENT_METHODS_PATH, SESSIONS_PATH,
+    IdempotencyKey, SignRequest, PAYMENT_METHODS_PATH, SESSIONS_PATH,
 };
 use support::{MockServer, Recorded, Reply};
 
@@ -69,8 +69,16 @@ fn client_for(server: &MockServer) -> Client {
         .expect("valid credentials")
 }
 
+fn key(value: &str) -> IdempotencyKey {
+    IdempotencyKey::new(value).expect("a valid idempotency key")
+}
+
 fn charge_request() -> ChargeRequest {
-    ChargeRequest::new(2500, "EUR", "order-1043").idempotency_key(CHARGE_KEY)
+    ChargeRequest::new(2500, "EUR", "order-1043", key(CHARGE_KEY))
+}
+
+fn charge_for(amount: i64, currency: &str, order_reference: &str) -> ChargeRequest {
+    ChargeRequest::new(amount, currency, order_reference, key(CHARGE_KEY))
 }
 
 fn charge_path() -> String {
@@ -102,9 +110,13 @@ fn save_card_is_sent_in_the_session_body_and_nowhere_else() {
     let server = MockServer::start(vec![create_ok()]);
     client_for(&server)
         .create_checkout_session(
-            &CheckoutSessionRequest::new(2500, "EUR", "order-1042")
-                .save_card(true)
-                .idempotency_key("00000000-0000-4000-8000-000000000001"),
+            &CheckoutSessionRequest::new(
+                2500,
+                "EUR",
+                "order-1042",
+                key("00000000-0000-4000-8000-000000000001"),
+            )
+            .save_card(true),
         )
         .expect("session created");
 
@@ -129,7 +141,12 @@ fn save_card_is_sent_in_the_session_body_and_nowhere_else() {
 fn a_session_without_save_card_keeps_the_vector_body() {
     let server = MockServer::start(vec![create_ok()]);
     client_for(&server)
-        .create_checkout_session(&CheckoutSessionRequest::new(2500, "EUR", "order-1042"))
+        .create_checkout_session(&CheckoutSessionRequest::new(
+            2500,
+            "EUR",
+            "order-1042",
+            key("00000000-0000-4000-8000-000000000001"),
+        ))
         .expect("session created");
 
     assert_eq!(
@@ -260,23 +277,23 @@ fn charge_payment_method_signs_the_charge_vector_byte_for_byte() {
 }
 
 #[test]
-fn charge_payment_method_generates_a_key_and_sends_the_description_last() {
+fn charge_payment_method_sends_the_callers_key_and_the_description_last() {
     let server = MockServer::start(vec![charge_ok()]);
     client_for(&server)
         .charge_payment_method(
             PAYMENT_METHOD_ID,
-            &ChargeRequest::new(2500, "EUR", "order-1043").description("Monthly plan"),
+            &ChargeRequest::new(2500, "EUR", "order-1043", key("sub-8817-2026-10"))
+                .description("Monthly plan"),
         )
         .expect("charged");
 
     let recorded = server.only_request();
-    let key = recorded.header("Idempotency-Key").expect("a generated key");
-    assert_eq!(key.len(), 36, "a v4 UUID: {key}");
+    assert_eq!(recorded.header("Idempotency-Key"), Some("sub-8817-2026-10"));
     assert_eq!(
         recorded.body,
         r#"{"amount":2500,"currency":"EUR","orderReference":"order-1043","description":"Monthly plan"}"#
     );
-    assert_signature_matches(&recorded, &charge_path(), key);
+    assert_signature_matches(&recorded, &charge_path(), "sub-8817-2026-10");
 }
 
 #[test]
@@ -525,27 +542,13 @@ fn charge_payment_method_validates_money_params_like_a_session() {
     let client = client_for(&server);
 
     for (label, bad) in [
-        ("zero amount", ChargeRequest::new(0, "EUR", "order-1")),
-        (
-            "negative amount",
-            ChargeRequest::new(-500, "EUR", "order-1"),
-        ),
-        ("missing currency", ChargeRequest::new(2500, "", "order-1")),
-        (
-            "missing order reference",
-            ChargeRequest::new(2500, "EUR", ""),
-        ),
+        ("zero amount", charge_for(0, "EUR", "order-1")),
+        ("negative amount", charge_for(-500, "EUR", "order-1")),
+        ("missing currency", charge_for(2500, "", "order-1")),
+        ("missing order reference", charge_for(2500, "EUR", "")),
         (
             "over-long order reference",
-            ChargeRequest::new(2500, "EUR", "x".repeat(101)),
-        ),
-        (
-            "empty idempotency key",
-            ChargeRequest::new(2500, "EUR", "order-1").idempotency_key(""),
-        ),
-        (
-            "over-long idempotency key",
-            ChargeRequest::new(2500, "EUR", "order-1").idempotency_key("k".repeat(101)),
+            charge_for(2500, "EUR", &"x".repeat(101)),
         ),
     ] {
         let error = client

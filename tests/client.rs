@@ -5,7 +5,8 @@ mod support;
 use std::time::Duration;
 
 use dominaite::{
-    sign_request, CheckoutSessionRequest, Client, Error, RetryOptions, SignRequest, SESSIONS_PATH,
+    session_error_code, sign_request, CheckoutSessionRequest, Client, Error, IdempotencyKey,
+    RetryOptions, SignRequest, SESSIONS_PATH,
 };
 use support::{MockServer, Recorded, Reply};
 
@@ -42,8 +43,18 @@ fn client_for(server: &MockServer) -> Client {
         .expect("valid credentials")
 }
 
+const SESSION_KEY: &str = "00000000-0000-4000-8000-000000000001";
+
+fn key(value: &str) -> IdempotencyKey {
+    IdempotencyKey::new(value).expect("a valid idempotency key")
+}
+
 fn request() -> CheckoutSessionRequest {
-    CheckoutSessionRequest::new(2500, "EUR", "order-1042")
+    CheckoutSessionRequest::new(2500, "EUR", "order-1042", key(SESSION_KEY))
+}
+
+fn request_for(amount: i64, currency: &str, order_reference: &str) -> CheckoutSessionRequest {
+    CheckoutSessionRequest::new(amount, currency, order_reference, key(SESSION_KEY))
 }
 
 /// Recomputes the signature from what the server actually received, and asserts
@@ -86,11 +97,12 @@ fn create_session_signs_exactly_what_it_sends() {
         r#"{"amount":2500,"currency":"EUR","orderReference":"order-1042"}"#
     );
 
-    let key = recorded
-        .header("Idempotency-Key")
-        .expect("POST carries an Idempotency-Key")
-        .to_string();
-    assert_signature_matches(&recorded, SESSIONS_PATH, &key);
+    assert_eq!(
+        recorded.header("Idempotency-Key"),
+        Some(SESSION_KEY),
+        "POST carries the caller's Idempotency-Key"
+    );
+    assert_signature_matches(&recorded, SESSIONS_PATH, SESSION_KEY);
 }
 
 #[test]
@@ -238,6 +250,38 @@ fn an_unknown_transaction_id_is_a_404_api_error() {
         .expect_err("not found");
 
     assert_eq!(error.http_status(), Some(404));
+}
+
+/// The storefront codes are real HTTP errors, not 200 refusals, and the caller
+/// has to be able to tell "this site is not whitelisted yet" apart from any
+/// other rejection without parsing the message.
+#[test]
+fn a_storefront_rejection_is_an_api_error_matchable_on_its_code() {
+    for (status, code) in [
+        (409, session_error_code::STOREFRONT_NOT_WHITELISTED),
+        (409, session_error_code::STOREFRONT_INACTIVE),
+        (400, session_error_code::STOREFRONT_MISMATCH),
+    ] {
+        let server = MockServer::start(vec![Reply::error_envelope(status, code, "refused")]);
+        let error = client_for(&server)
+            .create_checkout_session_with_retry(
+                &request(),
+                RetryOptions {
+                    attempts: 3,
+                    base_delay: Duration::from_millis(1),
+                },
+            )
+            .expect_err("a storefront rejection is not a session");
+
+        assert_eq!(error.code(), Some(code), "{code} lost its code");
+        assert_eq!(error.http_status(), Some(status), "{code} lost its status");
+        assert!(
+            matches!(&error, Error::Api { code: Some(c), .. } if c == code),
+            "{code}: {error:?}"
+        );
+        assert!(!error.is_retryable(), "{code} will not fix itself");
+        assert_eq!(server.requests().len(), 1, "{code} must not be retried");
+    }
 }
 
 #[test]
@@ -459,6 +503,86 @@ fn retry_reuses_one_idempotency_key_across_attempts() {
     }
 }
 
+/// A 503 that carries a gateway code is still an outage, whichever code it is.
+/// The dotnet SDK let a coded 503 bypass its retry helper; this pins that the
+/// Rust one retries it with the same key.
+#[test]
+fn a_503_carrying_payment_processing_unavailable_is_retried_with_the_same_key() {
+    let server = MockServer::start(vec![
+        Reply::error_envelope(503, "PAYMENT_PROCESSING_UNAVAILABLE", "try later"),
+        create_ok(),
+    ]);
+
+    let session = client_for(&server)
+        .create_checkout_session_with_retry(
+            &request(),
+            RetryOptions {
+                attempts: 3,
+                base_delay: Duration::from_millis(0),
+            },
+        )
+        .expect("the retry succeeds");
+    assert_eq!(session.transaction_id, TRANSACTION_ID);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "the coded 503 must be retried");
+    for recorded in &requests {
+        assert_eq!(recorded.header("Idempotency-Key"), Some(SESSION_KEY));
+    }
+}
+
+/// The same outage in its other form: an HTTP 200 refusal. Card payments are
+/// off for now and nothing was created, so the helper tries again with the
+/// same key rather than handing the caller a dead end.
+#[test]
+fn a_payment_processing_unavailable_refusal_is_retried_with_the_same_key() {
+    let server = MockServer::start(vec![
+        refusal(session_error_code::PAYMENT_PROCESSING_UNAVAILABLE),
+        create_ok(),
+    ]);
+
+    let session = client_for(&server)
+        .create_checkout_session_with_retry(
+            &request(),
+            RetryOptions {
+                attempts: 3,
+                base_delay: Duration::from_millis(0),
+            },
+        )
+        .expect("the retry succeeds");
+    assert_eq!(session.transaction_id, TRANSACTION_ID);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "the refusal must be retried");
+    for recorded in &requests {
+        assert_eq!(recorded.header("Idempotency-Key"), Some(SESSION_KEY));
+    }
+}
+
+#[test]
+fn a_persistent_payment_processing_unavailable_refusal_comes_back_after_the_last_attempt() {
+    let server = MockServer::start(vec![refusal(
+        session_error_code::PAYMENT_PROCESSING_UNAVAILABLE,
+    )]);
+
+    let error = client_for(&server)
+        .create_checkout_session_with_retry(
+            &request(),
+            RetryOptions {
+                attempts: 3,
+                base_delay: Duration::from_millis(0),
+            },
+        )
+        .expect_err("still unavailable");
+
+    assert_eq!(
+        error.code(),
+        Some(session_error_code::PAYMENT_PROCESSING_UNAVAILABLE)
+    );
+    assert!(matches!(error, Error::Refusal { .. }), "{error:?}");
+    assert_eq!(server.requests().len(), 3, "every attempt was used");
+}
+
 #[test]
 fn retry_gives_up_and_returns_the_transport_error() {
     let server = MockServer::start(vec![Reply::error_envelope(503, "X", "down")]);
@@ -479,6 +603,30 @@ fn retry_gives_up_and_returns_the_transport_error() {
 /// Without the transaction id on the refusal, the documented recovery - read it
 /// back with `get_status` - is unreachable from the error, leaving a second
 /// payment as the caller's only option.
+/// A clean replay of an open session is the gateway handing back the ORIGINAL
+/// session. It must come out as an ordinary session, same transaction and
+/// cashier handles, so a reload renders the same widget.
+#[test]
+fn a_clean_replay_of_an_open_session_is_the_original_session() {
+    let server = MockServer::start(vec![create_ok(), create_ok()]);
+    let client = client_for(&server);
+
+    let first = client.create_checkout_session(&request()).expect("created");
+    let replayed = client
+        .create_checkout_session(&request())
+        .expect("a clean replay is a session, not a refusal");
+
+    assert_eq!(replayed.transaction_id, first.transaction_id);
+    assert_eq!(replayed.cashier_key, first.cashier_key);
+    assert_eq!(replayed.cashier_token, first.cashier_token);
+    let keys: Vec<_> = server
+        .requests()
+        .iter()
+        .map(|recorded| recorded.header("Idempotency-Key").map(str::to_string))
+        .collect();
+    assert_eq!(keys, vec![Some(SESSION_KEY.to_string()); 2]);
+}
+
 #[test]
 fn a_replay_refusal_carries_the_transaction_id_for_recovery() {
     let transaction_id = "11111111-2222-4333-8444-555555555555";
@@ -545,17 +693,54 @@ fn retry_never_repeats_a_refusal_or_an_auth_failure() {
 }
 
 #[test]
-fn a_pinned_idempotency_key_is_the_one_that_gets_sent() {
+fn the_order_derived_key_is_the_one_that_gets_sent_and_signed() {
     let server = MockServer::start(vec![create_ok()]);
-    let key = "00000000-0000-4000-8000-000000000001";
+    let derived = IdempotencyKey::for_order("shop-a1b2c3d4", "order-1042", 2500, "EUR")
+        .expect("a valid order key");
 
     client_for(&server)
-        .create_checkout_session(&request().idempotency_key(key))
+        .create_checkout_session(&CheckoutSessionRequest::new(
+            2500,
+            "EUR",
+            "order-1042",
+            derived,
+        ))
         .expect("created");
 
     let recorded = server.only_request();
-    assert_eq!(recorded.header("Idempotency-Key"), Some(key));
-    assert_signature_matches(&recorded, SESSIONS_PATH, key);
+    let expected = "shop-a1b2c3d4-order-1042-2500-EUR";
+    assert_eq!(recorded.header("Idempotency-Key"), Some(expected));
+    assert_signature_matches(&recorded, SESSIONS_PATH, expected);
+}
+
+/// Reload and back button safety: the same order at the same amount asks again
+/// with the same key, so the gateway replays instead of opening a second
+/// payment. The SDK must never swap in a key of its own on the way.
+#[test]
+fn the_same_order_sends_the_same_key_every_time() {
+    let server = MockServer::start(vec![create_ok()]);
+    let client = client_for(&server);
+
+    for _ in 0..2 {
+        let key = IdempotencyKey::for_order("shop-a1b2c3d4", "order-1042", 2500, "EUR")
+            .expect("a valid order key");
+        client
+            .create_checkout_session(&CheckoutSessionRequest::new(2500, "EUR", "order-1042", key))
+            .expect("created");
+    }
+
+    let keys: Vec<String> = server
+        .requests()
+        .iter()
+        .map(|recorded| {
+            recorded
+                .header("Idempotency-Key")
+                .expect("key sent")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0], keys[1], "a reload must replay, not mint");
 }
 
 #[test]
@@ -564,25 +749,13 @@ fn bad_arguments_are_rejected_before_anything_is_sent() {
     let client = client_for(&server);
 
     for (label, bad) in [
-        (
-            "zero amount",
-            CheckoutSessionRequest::new(0, "EUR", "order-1"),
-        ),
-        (
-            "negative amount",
-            CheckoutSessionRequest::new(-500, "EUR", "order-1"),
-        ),
-        (
-            "missing currency",
-            CheckoutSessionRequest::new(2500, "", "order-1"),
-        ),
-        (
-            "missing order reference",
-            CheckoutSessionRequest::new(2500, "EUR", ""),
-        ),
+        ("zero amount", request_for(0, "EUR", "order-1")),
+        ("negative amount", request_for(-500, "EUR", "order-1")),
+        ("missing currency", request_for(2500, "", "order-1")),
+        ("missing order reference", request_for(2500, "EUR", "")),
         (
             "over-long order reference",
-            CheckoutSessionRequest::new(2500, "EUR", "x".repeat(101)),
+            request_for(2500, "EUR", &"x".repeat(101)),
         ),
     ] {
         let error = client
@@ -600,9 +773,10 @@ fn bad_arguments_are_rejected_before_anything_is_sent() {
     );
 }
 
-/// The limit is 100 characters, not 100 bytes. Counting bytes cut a Cyrillic
-/// order reference off at 50 and a CJK one at 33, rejecting locally what the API
-/// accepts.
+/// The order reference limit is 100 characters, not 100 bytes. Counting bytes
+/// cut a Cyrillic order reference off at 50 and a CJK one at 33, rejecting
+/// locally what the API accepts. The key is visible ASCII only, so for it the
+/// two counts are the same.
 #[test]
 fn length_limits_count_characters_not_bytes() {
     let cyrillic = "ж".repeat(100);
@@ -612,32 +786,26 @@ fn length_limits_count_characters_not_bytes() {
     let client = client_for(&server);
 
     client
-        .create_checkout_session(&CheckoutSessionRequest::new(2500, "EUR", &cyrillic))
+        .create_checkout_session(&request_for(2500, "EUR", &cyrillic))
         .expect("a 100-character order reference is within the limit");
 
     client
-        .create_checkout_session(&request().idempotency_key(&cyrillic))
+        .create_checkout_session(&CheckoutSessionRequest::new(
+            2500,
+            "EUR",
+            "order-1042",
+            key(&"k".repeat(100)),
+        ))
         .expect("a 100-character idempotency key is within the limit");
 
     // 101 characters is over the limit whichever alphabet it is written in.
-    for (label, over) in [
-        (
-            "order reference",
-            CheckoutSessionRequest::new(2500, "EUR", "ж".repeat(101)),
-        ),
-        (
-            "idempotency key",
-            request().idempotency_key("ж".repeat(101)),
-        ),
-    ] {
-        let error = client
-            .create_checkout_session(&over)
-            .expect_err(&format!("an over-long {label} must be rejected"));
-        assert!(
-            matches!(error, Error::Validation { .. }),
-            "{label}: {error}"
-        );
-    }
+    let error = client
+        .create_checkout_session(&request_for(2500, "EUR", &"ж".repeat(101)))
+        .expect_err("an over-long order reference must be rejected");
+    assert!(matches!(error, Error::Validation { .. }), "{error}");
+
+    let error = IdempotencyKey::new("k".repeat(101)).expect_err("an over-long key");
+    assert!(matches!(error, Error::Validation { .. }), "{error}");
 
     assert_eq!(server.requests().len(), 2, "only the valid calls were sent");
 }

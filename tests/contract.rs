@@ -28,9 +28,9 @@ use serde::forward_to_deserialize_any;
 use serde_json::Value;
 
 use dominaite::{
-    charge_error_code, charge_status, decline_class, revoke_error_code, status,
-    stored_payment_method_status, ChargeRequest, CheckoutSession, CheckoutStatus, Client, Error,
-    PaymentMethodCharge, Ping, StoredPaymentMethod,
+    charge_error_code, charge_status, decline_class, revoke_error_code, session_error_code, status,
+    stored_payment_method_status, ChargeRequest, CheckoutSession, CheckoutSessionRequest,
+    CheckoutStatus, Client, Error, IdempotencyKey, PaymentMethodCharge, Ping, StoredPaymentMethod,
 };
 use support::{MockServer, Reply};
 
@@ -143,6 +143,14 @@ fn assert_fields<T: DeserializeOwned>(type_name: &str, expected: &[String]) {
     );
 }
 
+fn idempotency_key(value: &str) -> IdempotencyKey {
+    IdempotencyKey::new(value).expect("a valid idempotency key")
+}
+
+fn session_request() -> CheckoutSessionRequest {
+    CheckoutSessionRequest::new(8440, "EUR", "order-1042", idempotency_key("order-1042"))
+}
+
 fn client_for(server: &MockServer) -> Client {
     Client::builder(KEY_ID, SECRET)
         .base_url(server.base_url())
@@ -178,6 +186,34 @@ fn every_contract_status_round_trips_through_the_status_response() {
             status.is_paid(),
             value == status::SUCCEEDED,
             "{value}: only succeeded means the customer paid"
+        );
+    }
+}
+
+/// The polling contract, status by status: stop on an outcome, keep polling on
+/// anything that can still move. `disputed` keeps polling, because a dispute
+/// can resolve either way.
+#[test]
+fn every_contract_status_has_the_documented_terminal_verdict() {
+    let example = endpoint("getStatus")["example"].clone();
+    let terminal = [
+        status::SUCCEEDED,
+        status::FAILED,
+        status::REFUNDED,
+        status::PARTIALLY_REFUNDED,
+        status::CANCELLED,
+        status::ABANDONED,
+    ];
+
+    for value in strings(&contract()["statusVocabulary"]) {
+        let mut payload = example.clone();
+        payload["status"] = Value::String(value.clone());
+        let parsed: CheckoutStatus = serde_json::from_value(payload).expect("deserializes");
+
+        assert_eq!(
+            parsed.is_terminal(),
+            terminal.contains(&value.as_str()),
+            "{value}: wrong terminal verdict"
         );
     }
 }
@@ -299,11 +335,7 @@ fn the_success_example_comes_back_as_a_session() {
     )]);
 
     let session = client_for(&server)
-        .create_checkout_session(&dominaite::CheckoutSessionRequest::new(
-            8440,
-            "EUR",
-            "order-1042",
-        ))
+        .create_checkout_session(&session_request())
         .expect("the contract's success example is a session");
 
     assert_eq!(
@@ -321,11 +353,7 @@ fn the_refusal_example_comes_back_as_a_refusal_with_its_transaction() {
     )]);
 
     let error = client_for(&server)
-        .create_checkout_session(&dominaite::CheckoutSessionRequest::new(
-            8440,
-            "EUR",
-            "order-1042",
-        ))
+        .create_checkout_session(&session_request())
         .expect_err("a refusal is not a session");
 
     // HTTP 200 all the way, and never retryable: it will not change on its own.
@@ -351,6 +379,15 @@ fn the_refusal_example_comes_back_as_a_refusal_with_its_transaction() {
 }
 
 #[test]
+fn the_session_refusal_constants_are_exactly_the_contracts() {
+    assert_eq!(
+        session_error_code::REFUSALS.to_vec(),
+        strings(&contract()["sessionRefusalErrorCodes"]),
+        "the SDK refusal codes drifted from the contract"
+    );
+}
+
+#[test]
 fn every_contract_refusal_code_survives_as_a_refusal() {
     let codes = strings(&contract()["sessionRefusalErrorCodes"]);
     assert_eq!(codes.len(), 5, "the contract lists five refusal codes");
@@ -365,11 +402,7 @@ fn every_contract_refusal_code_survives_as_a_refusal() {
         let server = MockServer::start(vec![Reply::enveloped(&payload)]);
 
         let error = client_for(&server)
-            .create_checkout_session(&dominaite::CheckoutSessionRequest::new(
-                8440,
-                "EUR",
-                "order-1042",
-            ))
+            .create_checkout_session(&session_request())
             .expect_err("a refusal is not a session");
 
         assert_eq!(error.code(), Some(code), "{code} did not survive");
@@ -396,11 +429,7 @@ fn every_contract_validation_code_survives_with_its_status() {
         let server = MockServer::start(vec![Reply::error_envelope(400, code, "rejected")]);
 
         let error = client_for(&server)
-            .create_checkout_session(&dominaite::CheckoutSessionRequest::new(
-                8440,
-                "EUR",
-                "order-1042",
-            ))
+            .create_checkout_session(&session_request())
             .expect_err("a validation rejection is not a session");
 
         assert_eq!(error.code(), Some(code), "{code} did not survive");
@@ -416,7 +445,7 @@ fn every_contract_validation_code_survives_with_its_status() {
 const PAYMENT_METHOD_ID: &str = "pm_0123456789abcdef0123456789abcdef";
 
 fn charge_request() -> ChargeRequest {
-    ChargeRequest::new(2500, "EUR", "order-1043")
+    ChargeRequest::new(2500, "EUR", "order-1043", idempotency_key("order-1043"))
 }
 
 #[test]

@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::idempotency::IdempotencyKey;
+
 /// Optional payer details. Prefilled fields are hidden from the payer in the
 /// widget, so the checkout form stays short.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -55,15 +57,20 @@ impl Customer {
 
 /// The parameters for [`Client::create_checkout_session`](crate::Client::create_checkout_session).
 ///
-/// `amount`, `currency` and `order_reference` are required and come from
-/// [`CheckoutSessionRequest::new`]; everything else is a builder method.
+/// `amount`, `currency`, `order_reference` and the idempotency key are required
+/// and come from [`CheckoutSessionRequest::new`]; everything else is a builder
+/// method.
 ///
 /// ```
-/// use dominaite::{CheckoutSessionRequest, Customer};
+/// use dominaite::{CheckoutSessionRequest, Customer, IdempotencyKey};
 ///
-/// let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042")
+/// # fn main() -> Result<(), dominaite::Error> {
+/// let key = IdempotencyKey::for_order("shop-a1b2c3d4", "order-1042", 2500, "EUR")?;
+/// let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042", key)
 ///     .customer(Customer::new().first_name("Ana").email("ana@example.com"))
 ///     .language("bg");
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,11 +107,12 @@ pub struct CheckoutSessionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub save_card: Option<bool>,
 
-    /// Auto-generated when unset. It travels in the header and in the signature,
-    /// never in the body. Retrying with the same key never creates a second
-    /// payment, so on a timeout retry with the same key.
+    /// Required. It travels in the header and in the signature, never in the
+    /// body. Retrying with the same key never creates a second payment, so on a
+    /// timeout retry with the same key. See [`IdempotencyKey::for_order`] for
+    /// the recommended order-derived key.
     #[serde(skip)]
-    pub idempotency_key: Option<String>,
+    pub idempotency_key: IdempotencyKey,
 
     /// Any additional field the API accepts that this struct does not model yet.
     /// These are merged into the JSON body.
@@ -113,11 +121,14 @@ pub struct CheckoutSessionRequest {
 }
 
 impl CheckoutSessionRequest {
-    /// A request for one payment. The amount is in MINOR units.
+    /// A request for one payment. The amount is in MINOR units. The key is
+    /// required: build it with [`IdempotencyKey::for_order`] so a reload of the
+    /// same order replays its session instead of opening a second one.
     pub fn new(
         amount: i64,
         currency: impl Into<String>,
         order_reference: impl Into<String>,
+        idempotency_key: IdempotencyKey,
     ) -> Self {
         CheckoutSessionRequest {
             amount,
@@ -129,7 +140,7 @@ impl CheckoutSessionRequest {
             theme: None,
             description: None,
             save_card: None,
-            idempotency_key: None,
+            idempotency_key,
             extra: Map::new(),
         }
     }
@@ -168,13 +179,6 @@ impl CheckoutSessionRequest {
     /// [`CheckoutSessionRequest::save_card`].
     pub fn save_card(mut self, value: bool) -> Self {
         self.save_card = Some(value);
-        self
-    }
-
-    /// Pins the idempotency key instead of letting the SDK generate one. Reuse
-    /// the same key when you retry a call that failed at the transport level.
-    pub fn idempotency_key(mut self, value: impl Into<String>) -> Self {
-        self.idempotency_key = Some(value.into());
         self
     }
 
@@ -232,7 +236,8 @@ pub mod status {
     pub const PARTIALLY_REFUNDED: &str = "partially_refunded";
     /// The payment was cancelled.
     pub const CANCELLED: &str = "cancelled";
-    /// The payment is disputed.
+    /// The payment is disputed. Not terminal: the dispute can still resolve
+    /// either way, so keep polling.
     pub const DISPUTED: &str = "disputed";
     /// Authorized, awaiting capture.
     pub const REQUIRES_CAPTURE: &str = "requires_capture";
@@ -323,6 +328,11 @@ impl CheckoutStatus {
 
     /// False while the payment can still change, true once it cannot.
     ///
+    /// Terminal: `succeeded`, `failed`, `cancelled`, `abandoned`, `refunded`
+    /// and `partially_refunded`. Keep polling on `pending`, `processing`,
+    /// `requires_capture` and `disputed`: a dispute is still open and can go
+    /// either way.
+    ///
     /// An unrecognised status is reported as NOT terminal, so a status the API
     /// adds later makes you keep polling rather than silently close an order
     /// that is still open.
@@ -334,7 +344,6 @@ impl CheckoutStatus {
                 | status::REFUNDED
                 | status::PARTIALLY_REFUNDED
                 | status::CANCELLED
-                | status::DISPUTED
                 | status::ABANDONED
         )
     }
@@ -420,16 +429,19 @@ impl StoredPaymentMethod {
 
 /// The parameters for [`Client::charge_payment_method`](crate::Client::charge_payment_method).
 ///
-/// `amount`, `currency` and `order_reference` are required and come from
-/// [`ChargeRequest::new`]; the rest are builder methods. The body is exactly
-/// these fields, in this order - it is what gets signed.
+/// `amount`, `currency`, `order_reference` and the idempotency key are required
+/// and come from [`ChargeRequest::new`]; the rest are builder methods. The body
+/// is exactly these fields, in this order - it is what gets signed.
 ///
 /// ```
-/// use dominaite::ChargeRequest;
+/// use dominaite::{ChargeRequest, IdempotencyKey};
 ///
-/// let request = ChargeRequest::new(2500, "EUR", "sub-8817-2026-10")
-///     .description("Monthly plan, October")
-///     .idempotency_key("sub-8817-2026-10");
+/// # fn main() -> Result<(), dominaite::Error> {
+/// let key = IdempotencyKey::new("sub-8817-2026-10")?;
+/// let request = ChargeRequest::new(2500, "EUR", "sub-8817-2026-10", key)
+///     .description("Monthly plan, October");
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -444,40 +456,36 @@ pub struct ChargeRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
-    /// Auto-generated when unset. It travels in the header and in the signature,
-    /// never in the body. Retrying with the same key never charges the card
-    /// twice, so on a timeout retry with the same key. Derive it from the
-    /// billing period, never mint one per attempt.
+    /// Required. It travels in the header and in the signature, never in the
+    /// body. Retrying with the same key never charges the card twice, so on a
+    /// timeout retry with the same key. Derive it from the billing period,
+    /// never mint one per attempt.
     #[serde(skip)]
-    pub idempotency_key: Option<String>,
+    pub idempotency_key: IdempotencyKey,
 }
 
 impl ChargeRequest {
-    /// A charge for one payment. The amount is in MINOR units.
+    /// A charge for one payment. The amount is in MINOR units. The key is
+    /// required: derive it from what is being billed (the subscription and its
+    /// period, say), so a retried charge carries the same one.
     pub fn new(
         amount: i64,
         currency: impl Into<String>,
         order_reference: impl Into<String>,
+        idempotency_key: IdempotencyKey,
     ) -> Self {
         ChargeRequest {
             amount,
             currency: currency.into(),
             order_reference: order_reference.into(),
             description: None,
-            idempotency_key: None,
+            idempotency_key,
         }
     }
 
     /// Sets the description.
     pub fn description(mut self, value: impl Into<String>) -> Self {
         self.description = Some(value.into());
-        self
-    }
-
-    /// Pins the idempotency key instead of letting the SDK generate one. Reuse
-    /// the same key when you retry a call that failed at the transport level.
-    pub fn idempotency_key(mut self, value: impl Into<String>) -> Self {
-        self.idempotency_key = Some(value.into());
         self
     }
 }
