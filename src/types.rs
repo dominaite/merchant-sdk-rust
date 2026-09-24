@@ -236,7 +236,8 @@ pub mod status {
     pub const PARTIALLY_REFUNDED: &str = "partially_refunded";
     /// The payment was cancelled.
     pub const CANCELLED: &str = "cancelled";
-    /// The payment is disputed.
+    /// The payment is disputed. Not terminal: the dispute can still resolve
+    /// either way, so keep polling.
     pub const DISPUTED: &str = "disputed";
     /// Authorized, awaiting capture.
     pub const REQUIRES_CAPTURE: &str = "requires_capture";
@@ -327,6 +328,11 @@ impl CheckoutStatus {
 
     /// False while the payment can still change, true once it cannot.
     ///
+    /// Terminal: `succeeded`, `failed`, `cancelled`, `abandoned`, `refunded`
+    /// and `partially_refunded`. Keep polling on `pending`, `processing`,
+    /// `requires_capture` and `disputed`: a dispute is still open and can go
+    /// either way.
+    ///
     /// An unrecognised status is reported as NOT terminal, so a status the API
     /// adds later makes you keep polling rather than silently close an order
     /// that is still open.
@@ -338,7 +344,6 @@ impl CheckoutStatus {
                 | status::REFUNDED
                 | status::PARTIALLY_REFUNDED
                 | status::CANCELLED
-                | status::DISPUTED
                 | status::ABANDONED
         )
     }

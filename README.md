@@ -522,8 +522,9 @@ if status.is_paid() { /* fulfil the order */ }
 `dominaite::status` constants). **`succeeded` is the only value that means the customer paid** -
 that is what `is_paid()` answers. `is_terminal()` tells you whether to stop polling, and reports
 a status it does not recognise as NOT terminal, so a value the API adds later makes you keep
-polling instead of closing an open order. Keep polling on `pending`, `processing` and
-`requires_capture` - none of them is terminal.
+polling instead of closing an open order. Keep polling on `pending`, `processing`,
+`requires_capture` and `disputed` - none of them is terminal (a dispute can still go either
+way).
 
 `requires_capture` is **not** "unpaid": the payer has already paid and the funds are held
 awaiting capture, which is why `is_paid()` (settled) and `is_terminal()` (finished) both answer

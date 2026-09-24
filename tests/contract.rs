@@ -190,6 +190,34 @@ fn every_contract_status_round_trips_through_the_status_response() {
     }
 }
 
+/// The polling contract, status by status: stop on an outcome, keep polling on
+/// anything that can still move. `disputed` keeps polling, because a dispute
+/// can resolve either way.
+#[test]
+fn every_contract_status_has_the_documented_terminal_verdict() {
+    let example = endpoint("getStatus")["example"].clone();
+    let terminal = [
+        status::SUCCEEDED,
+        status::FAILED,
+        status::REFUNDED,
+        status::PARTIALLY_REFUNDED,
+        status::CANCELLED,
+        status::ABANDONED,
+    ];
+
+    for value in strings(&contract()["statusVocabulary"]) {
+        let mut payload = example.clone();
+        payload["status"] = Value::String(value.clone());
+        let parsed: CheckoutStatus = serde_json::from_value(payload).expect("deserializes");
+
+        assert_eq!(
+            parsed.is_terminal(),
+            terminal.contains(&value.as_str()),
+            "{value}: wrong terminal verdict"
+        );
+    }
+}
+
 #[test]
 fn an_unknown_status_stays_non_terminal() {
     // Not in the fixture on purpose: the contract can grow, and a status this
