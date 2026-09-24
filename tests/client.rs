@@ -503,6 +503,34 @@ fn retry_reuses_one_idempotency_key_across_attempts() {
     }
 }
 
+/// A 503 that carries a gateway code is still an outage, whichever code it is.
+/// The dotnet SDK let a coded 503 bypass its retry helper; this pins that the
+/// Rust one retries it with the same key.
+#[test]
+fn a_503_carrying_payment_processing_unavailable_is_retried_with_the_same_key() {
+    let server = MockServer::start(vec![
+        Reply::error_envelope(503, "PAYMENT_PROCESSING_UNAVAILABLE", "try later"),
+        create_ok(),
+    ]);
+
+    let session = client_for(&server)
+        .create_checkout_session_with_retry(
+            &request(),
+            RetryOptions {
+                attempts: 3,
+                base_delay: Duration::from_millis(0),
+            },
+        )
+        .expect("the retry succeeds");
+    assert_eq!(session.transaction_id, TRANSACTION_ID);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "the coded 503 must be retried");
+    for recorded in &requests {
+        assert_eq!(recorded.header("Idempotency-Key"), Some(SESSION_KEY));
+    }
+}
+
 #[test]
 fn retry_gives_up_and_returns_the_transport_error() {
     let server = MockServer::start(vec![Reply::error_envelope(503, "X", "down")]);
