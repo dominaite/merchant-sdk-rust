@@ -749,9 +749,10 @@ fn bad_arguments_are_rejected_before_anything_is_sent() {
     );
 }
 
-/// The limit is 100 characters, not 100 bytes. Counting bytes cut a Cyrillic
-/// order reference off at 50 and a CJK one at 33, rejecting locally what the API
-/// accepts.
+/// The order reference limit is 100 characters, not 100 bytes. Counting bytes
+/// cut a Cyrillic order reference off at 50 and a CJK one at 33, rejecting
+/// locally what the API accepts. The key is visible ASCII only, so for it the
+/// two counts are the same.
 #[test]
 fn length_limits_count_characters_not_bytes() {
     let cyrillic = "ж".repeat(100);
@@ -769,7 +770,7 @@ fn length_limits_count_characters_not_bytes() {
             2500,
             "EUR",
             "order-1042",
-            key(&cyrillic),
+            key(&"k".repeat(100)),
         ))
         .expect("a 100-character idempotency key is within the limit");
 
@@ -779,7 +780,7 @@ fn length_limits_count_characters_not_bytes() {
         .expect_err("an over-long order reference must be rejected");
     assert!(matches!(error, Error::Validation { .. }), "{error}");
 
-    let error = IdempotencyKey::new("ж".repeat(101)).expect_err("an over-long key");
+    let error = IdempotencyKey::new("k".repeat(101)).expect_err("an over-long key");
     assert!(matches!(error, Error::Validation { .. }), "{error}");
 
     assert_eq!(server.requests().len(), 2, "only the valid calls were sent");

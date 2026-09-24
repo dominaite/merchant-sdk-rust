@@ -270,9 +270,10 @@ currency)`, which builds `{scope}-{orderId}-{amountMinor}-{CURRENCY}`:
 - `scope` keeps deployments that share one merchant apart. A staging and a production shop
   that both number orders from 1001 would otherwise collide.
 
-If you already derive keys your own way, wrap them with `IdempotencyKey::new(key)`. Both
-constructors return `Error::Validation` for an empty key or one over 100 characters, before
-anything is sent.
+If you already derive keys your own way, wrap them with `IdempotencyKey::new(key)`. A key is 1
+to 100 characters of visible ASCII (`!` through `~`: no spaces, no control characters, no
+non-Latin letters), and both constructors return `Error::Validation` for anything else, before
+anything is sent. That includes an order id with a space in it passed to `for_order`.
 
 A replayed key does not hand back the original session. While the first attempt is live (or
 completed, or judged failed), the API answers HTTP 200 with `success: false` and a replay code,

@@ -87,15 +87,47 @@ fn the_order_key_rejects_what_the_gateway_would() {
 #[test]
 fn a_caller_key_must_be_non_empty_and_at_most_100_characters() {
     assert_validation(IdempotencyKey::new(""), "empty");
-    assert_validation(IdempotencyKey::new("   "), "whitespace only");
     assert_validation(IdempotencyKey::new("k".repeat(101)), "101 characters");
 
-    // Characters, not bytes: 100 Cyrillic letters are 200 bytes and still fit.
-    let cyrillic = "ж".repeat(100);
+    let longest = "k".repeat(100);
     assert_eq!(
-        IdempotencyKey::new(cyrillic.clone())
+        IdempotencyKey::new(longest.clone())
             .expect("100 characters fit")
             .as_str(),
-        cyrillic
+        longest
+    );
+}
+
+/// The shared cross-SDK rule: visible ASCII, 0x21 through 0x7E, nothing else.
+#[test]
+fn a_caller_key_must_be_visible_ascii() {
+    for (label, bad) in [
+        ("whitespace only", "   "),
+        ("inner space", "order 1042"),
+        ("tab", "order\t1042"),
+        ("newline", "order-1042\n"),
+        ("DEL", "order\u{7f}1042"),
+        ("Cyrillic", "заказ-1042"),
+        ("accented", "commande-1042-é"),
+    ] {
+        assert_validation(IdempotencyKey::new(bad), label);
+    }
+
+    // Both ends of the range are fine.
+    let edges = "!order-1042_~";
+    assert_eq!(IdempotencyKey::new(edges).expect("valid").as_str(), edges);
+}
+
+/// The helper's output is held to the same rule, so an order id with a space
+/// or a non-Latin letter is refused rather than sent.
+#[test]
+fn the_order_key_is_checked_against_the_same_rule() {
+    assert_validation(
+        IdempotencyKey::for_order("a1b2c3d4", "order 1042", 3000, "EUR"),
+        "space in the order id",
+    );
+    assert_validation(
+        IdempotencyKey::for_order("магазин", "order-1042", 3000, "EUR"),
+        "non-ASCII scope",
     );
 }

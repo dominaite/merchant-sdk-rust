@@ -36,17 +36,25 @@ const MAX_KEY_CHARS: usize = 100;
 pub struct IdempotencyKey(String);
 
 impl IdempotencyKey {
-    /// Wraps a key you derive yourself. It must not be empty or whitespace, and
-    /// it is at most 100 characters (characters, not bytes, so a Cyrillic key
-    /// gets the full 100). Anything else is [`Error::Validation`].
+    /// Wraps a key you derive yourself: 1 to 100 characters, visible ASCII
+    /// only (`!` through `~`, so no spaces, control characters or non-Latin
+    /// letters). Anything else is [`Error::Validation`].
+    ///
+    /// Visible ASCII is what every Dominaite SDK accepts. The key travels in an
+    /// HTTP header and inside the signature, where anything else is at the
+    /// mercy of each HTTP stack's encoding.
     pub fn new(key: impl Into<String>) -> Result<IdempotencyKey> {
         let key = key.into();
-        if key.trim().is_empty() {
+        if key.is_empty() {
             return Err(Error::validation("idempotency_key must not be empty"));
         }
-        // Characters, not bytes. `len()` counts UTF-8 bytes, so a non-Latin key
-        // would hit the limit at half its real length.
-        if key.chars().count() > MAX_KEY_CHARS {
+        if !key.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+            return Err(Error::validation(
+                "idempotency_key must be visible ASCII only (no spaces, control or non-ASCII characters)",
+            ));
+        }
+        // All ASCII by now, so bytes and characters are the same count.
+        if key.len() > MAX_KEY_CHARS {
             return Err(Error::validation(
                 "idempotency_key must be at most 100 characters",
             ));
@@ -68,8 +76,10 @@ impl IdempotencyKey {
     ///
     /// `amount_minor` is the same MINOR-unit integer you put on the request and
     /// must be positive. `currency` is a three-letter ISO 4217 code in any case;
-    /// the key carries it uppercased. Empty parts, and a result over 100
-    /// characters, are [`Error::Validation`].
+    /// the key carries it uppercased. The result is checked like
+    /// [`IdempotencyKey::new`], so `scope` and `order_id` have to be visible
+    /// ASCII too. Empty parts, and a result over 100 characters, are
+    /// [`Error::Validation`].
     pub fn for_order(
         scope: &str,
         order_id: &str,
