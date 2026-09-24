@@ -1,8 +1,8 @@
 # Changelog
 
-## 1.0.0
+## 0.3.0
 
-Breaking. All six Dominaite SDKs move to 1.0.0 together with the same changes.
+Breaking. All six Dominaite SDKs move to 0.3.0 together with the same changes.
 
 - The idempotency key is required. `CheckoutSessionRequest::new` and `ChargeRequest::new` take
   an `IdempotencyKey` as a fourth argument, and the SDK no longer generates a random key when
@@ -25,7 +25,7 @@ Breaking. All six Dominaite SDKs move to 1.0.0 together with the same changes.
   way.
 - Docs: a clean replay of an open session returns the original session, not a refusal.
 
-### Migrating from 0.x
+### Migrating from 0.2
 
 Pass a key to every request constructor. For a checkout, derive it from the order:
 
