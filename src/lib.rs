@@ -58,8 +58,8 @@ pub use idempotency::IdempotencyKey;
 pub use money::{currency_exponent, to_minor_units};
 pub use signing::{sha256_hex, sign_request, SignRequest};
 pub use types::{
-    charge_status, decline_class, status, stored_payment_method_status, ChargeRequest,
-    CheckoutSession, CheckoutSessionRequest, CheckoutStatus, Customer, PaymentMethodCharge, Ping,
-    StoredPaymentMethod,
+    charge_status, decline_class, retired_reason, status, stored_payment_method_status,
+    ChargeRequest, CheckoutSession, CheckoutSessionRequest, CheckoutStatus, Customer,
+    PaymentMethodCharge, Ping, StoredPaymentMethod,
 };
 pub use webhooks::{verify_webhook, WebhookError, DEFAULT_TOLERANCE_SECS};

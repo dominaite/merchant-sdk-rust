@@ -79,12 +79,13 @@ pub mod session_error_code {
         PRIOR_ATTEMPT_FAILED,
     ];
 
-    /// The storefront codes, which arrive as [`Error::Api`](crate::Error::Api)
-    /// with a 409 or 400.
+    /// The storefront codes, in the order the canonical contract lists them.
+    /// They arrive as [`Error::Api`](crate::Error::Api) with a 400 or 409, are
+    /// never retryable, and are not in [`REFUSALS`].
     pub const STOREFRONT: [&str; 3] = [
-        STOREFRONT_NOT_WHITELISTED,
-        STOREFRONT_INACTIVE,
         STOREFRONT_MISMATCH,
+        STOREFRONT_INACTIVE,
+        STOREFRONT_NOT_WHITELISTED,
     ];
 }
 

@@ -324,7 +324,9 @@ let session = client.create_checkout_session(&request)?;
 ```
 
 Once that session is paid, `get_status` carries a `stored_payment_method`: an id, the brand,
-the last four digits, the expiry and a status (`active`, `revoked` or `expired`). Persist the id
+the last four digits, the expiry and a status (`active`, `revoked`, `expired` or `retired`). A
+`retired` card was stopped by the platform, `retired_reason` says why (`hard_decline`,
+`chargeback` or `source_sale_reversed`), and it never becomes chargeable again. Persist the id
 against your customer. The full card number never reaches the SDK, and the provider token
 behind the id never leaves the gateway. `brand`, `last4` and the expiry are `Option`s: the
 gateway omits them when the provider did not report them. This is not the gateway's
