@@ -7,8 +7,13 @@
 //!
 //! Deliveries are AT-LEAST-ONCE. Dedupe on the envelope's `id`, respond 2xx fast,
 //! and queue the real work instead of doing it inline.
+//!
+//! Deliveries can also arrive OUT OF ORDER. [`WebhookEvent::sequence`] says how to
+//! order `agreement.*` and `charge.*` events.
 
 use hmac::{Hmac, Mac};
+use serde::Deserialize;
+use serde_json::Value;
 use sha2::Sha256;
 use std::error::Error as StdError;
 use std::fmt;
@@ -148,6 +153,79 @@ pub fn verify_webhook(
     }
 
     Ok(())
+}
+
+/// A parsed webhook envelope: `{ id, type, apiVersion, createdAt, data }`.
+///
+/// Parse it only after [`verify_webhook`] returned `Ok(())`, and parse the same
+/// raw body you verified:
+///
+/// ```
+/// use dominaite::WebhookEvent;
+///
+/// # fn main() -> Result<(), serde_json::Error> {
+/// let body = r#"{"id":"7f9c24e5-1d1f-4c0a-9b6c-2f3a4d5e6f70","type":"agreement.past_due","apiVersion":"2026-09-25","createdAt":"2026-09-25T10:00:00Z","data":{"id":"agr_1","status":"past_due","sequence":3}}"#;
+/// let event = WebhookEvent::parse(body)?;
+/// assert_eq!(event.event_type, "agreement.past_due");
+/// assert_eq!(event.api_version.as_deref(), Some("2026-09-25"));
+/// assert_eq!(event.sequence(), Some(3));
+/// # Ok(())
+/// # }
+/// ```
+///
+/// `data` stays a [`serde_json::Value`]: its shape depends on `type`, and fields
+/// are only ever added under an `apiVersion`, never renamed or removed, so ignore
+/// fields you do not recognise.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookEvent {
+    /// The delivery id. Your dedupe key: the same event can arrive twice.
+    pub id: String,
+    /// The event type, e.g. `payment.succeeded`, `agreement.past_due`,
+    /// `charge.failed`. `type` on the wire.
+    #[serde(rename = "type")]
+    pub event_type: String,
+    /// The dated version of the payload shape the event was rendered in, e.g.
+    /// `2026-09-25`. A redelivery keeps the `apiVersion` of its first attempt.
+    /// `None` on deliveries from servers that predate the field.
+    #[serde(default)]
+    pub api_version: Option<String>,
+    /// ISO 8601 UTC instant of the charge or transition the event reports. It can
+    /// repeat across events, so never order by it; see [`WebhookEvent::sequence`].
+    #[serde(default)]
+    pub created_at: String,
+    /// The event payload, shaped by `type`.
+    #[serde(default)]
+    pub data: Value,
+}
+
+impl WebhookEvent {
+    /// Parses a verified raw body. The same as `serde_json::from_str`.
+    pub fn parse(payload: &str) -> Result<WebhookEvent, serde_json::Error> {
+        serde_json::from_str(payload)
+    }
+
+    /// `data.sequence`: the per-object counter that orders `agreement.*` and
+    /// `charge.*` events. `None` on `payment.*` events and on deliveries from
+    /// servers that predate the field.
+    ///
+    /// Deliveries can arrive out of order. Keep the highest sequence you have
+    /// processed per object and discard any event whose sequence is not higher;
+    /// when you need current state, read the object by id. createdAt can repeat
+    /// across events, so order by sequence, not createdAt. A sequence of 0 only
+    /// comes from events recorded before the counter existed; treat it as older
+    /// than any positive number.
+    ///
+    /// The object the counter belongs to:
+    ///
+    /// - `agreement.*`: the agreement, `data.id`.
+    /// - `charge.*` the platform placed for an agreement: the agreement period,
+    ///   `data.agreementId` plus `data.periodNumber`, so the `charge.retrying` and
+    ///   `charge.failed` events of one period compare across attempts.
+    /// - `charge.*` for a one-off charge you initiated: `data.chargeId`.
+    pub fn sequence(&self) -> Option<i64> {
+        self.data.get("sequence").and_then(Value::as_i64)
+    }
 }
 
 struct SignatureHeader<'a> {
