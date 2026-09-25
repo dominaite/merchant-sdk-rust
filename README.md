@@ -522,7 +522,9 @@ The object is:
   across attempts.
 - `charge.*` for a one-off charge you initiated: `data.chargeId`.
 
-A redelivery of an event carries the same sequence.
+A redelivery of an event carries the same sequence. `PaymentMethodCharge::sequence` is the
+charge's current sequence as the charge route returns it (`Option<i64>`, `None` until the server
+sends it).
 
 ### Events
 

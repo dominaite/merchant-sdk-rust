@@ -6,6 +6,7 @@
   absent), `created_at` and `data`. `WebhookEvent::sequence()` reads `data.sequence` on
   `agreement.*` and `charge.*` events so you can drop out-of-order deliveries; the README has the
   ordering rule. Payloads without `apiVersion` or `sequence` still parse.
+- `PaymentMethodCharge::sequence`: optional, `None` until the server sends it.
 
 ## 0.3.0
 
