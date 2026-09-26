@@ -19,6 +19,7 @@ use std::error::Error as StdError;
 use std::fmt;
 
 use crate::client::unix_seconds;
+use crate::types::StoredPaymentMethod;
 
 /// The default clock skew allowed between the signature's timestamp and your
 /// server's clock, in seconds. Matches the server's own tolerance.
@@ -226,6 +227,105 @@ impl WebhookEvent {
     pub fn sequence(&self) -> Option<i64> {
         self.data.get("sequence").and_then(Value::as_i64)
     }
+
+    /// `data` of a `payment.*` event, typed. `None` on every other event type,
+    /// and when `data` does not have the documented shape.
+    pub fn payment_data(&self) -> Option<PaymentEventData> {
+        if !self.event_type.starts_with("payment.") {
+            return None;
+        }
+        serde_json::from_value(self.data.clone()).ok()
+    }
+
+    /// Shortcut for [`PaymentEventData::stored_payment_method`]: the card a
+    /// `payment.succeeded` or `payment.requires_capture` event says this payment
+    /// kept on file. `None` on every other event; read the caveat on the field.
+    pub fn stored_payment_method(&self) -> Option<StoredPaymentMethod> {
+        self.payment_data()?.stored_payment_method
+    }
+}
+
+/// `data` on a `payment.*` event, from [`WebhookEvent::payment_data`].
+///
+/// Webhooks spell a missing value as an explicit `null`; the SDK reads null
+/// and absent alike as `None`. Fields are only ever added, so older deliveries
+/// that lack one still parse.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaymentEventData {
+    /// The transaction the event is about. On `payment.refunded` that is the
+    /// refund's own transaction; `original_transaction_id` is the payment.
+    pub transaction_id: String,
+    /// The status the transaction moved to, one of the
+    /// [`status`](crate::status) constants.
+    pub status: String,
+    /// The status it moved from.
+    #[serde(default)]
+    pub previous_status: Option<String>,
+    /// The kind of transaction, e.g. `sale`.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// What you are PAID, in MINOR units (the base, without surcharge). On
+    /// `payment.refunded`, the amount of that refund.
+    #[serde(default)]
+    pub amount: Option<i64>,
+    /// The card movement in MINOR units, surcharge included.
+    #[serde(default)]
+    pub gross_amount: Option<i64>,
+    /// The surcharge portion in MINOR units; `None` when there was none.
+    #[serde(default)]
+    pub surcharge_amount: Option<i64>,
+    /// ISO 4217 currency.
+    #[serde(default)]
+    pub currency: Option<String>,
+    /// How the payer paid, as a category: `card`, `wallet`, ...
+    #[serde(default)]
+    pub payment_method: Option<String>,
+    /// The wallet, e.g. `apple_pay`; set only for wallet payments.
+    #[serde(default)]
+    pub wallet_type: Option<String>,
+    /// The transaction this one hangs off: the refunded payment on
+    /// `payment.refunded`, the authorization on the `payment.succeeded` of a
+    /// capture.
+    #[serde(default)]
+    pub original_transaction_id: Option<String>,
+    /// The Idempotency-Key you sent on create session. `None` on refund and
+    /// dispute events.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Your own order reference, the one to match events to orders on. Refund
+    /// and cancel events carry the original payment's.
+    #[serde(default)]
+    pub order_reference: Option<String>,
+    /// The hosted checkout order id; `None` off the hosted path.
+    #[serde(default)]
+    pub order_id: Option<String>,
+    /// The description you sent on create session.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Lower-cased card brand once a card payment was attempted.
+    #[serde(default)]
+    pub payment_method_brand: Option<String>,
+    /// Last four card digits once a card payment was attempted.
+    #[serde(default)]
+    pub payment_method_last4: Option<String>,
+    /// The card this payment kept on file, the same object and type as
+    /// [`CheckoutStatus::stored_payment_method`](crate::CheckoutStatus::stored_payment_method).
+    ///
+    /// Only `payment.succeeded`, and `payment.requires_capture` for an
+    /// authorization, carry it, when the card was stored together with the
+    /// approval. It is `None` when no card was saved and on every other
+    /// `payment.*` event. `charge.*` events name their card by
+    /// `data.storedPaymentMethodId` instead.
+    ///
+    /// It can ALSO be `None` when a card was saved: the card can be stored after
+    /// the approval was announced, as on a server-to-server sale that succeeded
+    /// synchronously and on a sale settled by a later sweep. The status read is
+    /// the source of truth: on a `save_card` session whose event has no stored
+    /// payment method, call [`Client::get_status`](crate::Client::get_status) to
+    /// pick it up.
+    #[serde(default)]
+    pub stored_payment_method: Option<StoredPaymentMethod>,
 }
 
 struct SignatureHeader<'a> {

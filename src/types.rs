@@ -603,3 +603,190 @@ impl PaymentMethodCharge {
         )
     }
 }
+
+/// The parameters for [`Client::create_refund`](crate::Client::create_refund).
+///
+/// The idempotency key is required and comes from [`RefundRequest::new`]; the
+/// amount and reason are builder methods. Leave the amount out to refund
+/// everything still refundable: the body then carries no `amount` at all, not a
+/// null. The body is exactly these fields, in this order - it is what gets
+/// signed.
+///
+/// ```
+/// use dominaite::{to_minor_units, IdempotencyKey, RefundRequest};
+///
+/// # fn main() -> Result<(), dominaite::Error> {
+/// // A partial refund of 1,500 HUF (HUF has no minor unit at the gateway).
+/// let key = IdempotencyKey::new("return-7731")?;
+/// let partial = RefundRequest::new(key)
+///     .amount(to_minor_units("1500", "HUF")?)
+///     .reason("Returned one item");
+///
+/// // Everything still refundable on the payment.
+/// let full = RefundRequest::new(IdempotencyKey::new("credit-note-2291")?);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefundRequest {
+    /// The amount to refund in MINOR units of the payment's currency, at least
+    /// 1. `None` refunds everything still refundable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<i64>,
+    /// Free text stored with the refund, at most 500 characters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+
+    /// Required. It travels in the header and in the signature, never in the
+    /// body. Derive it from YOUR refund (the return or credit-note id) and resend
+    /// it as is: the same key answers the same refund and never refunds twice.
+    #[serde(skip)]
+    pub idempotency_key: IdempotencyKey,
+}
+
+impl RefundRequest {
+    /// A refund of everything still refundable on the payment. Set
+    /// [`RefundRequest::amount`] for a partial one.
+    pub fn new(idempotency_key: IdempotencyKey) -> Self {
+        RefundRequest {
+            amount: None,
+            reason: None,
+            idempotency_key,
+        }
+    }
+
+    /// Refunds this amount, in MINOR units, instead of everything still
+    /// refundable.
+    pub fn amount(mut self, amount: i64) -> Self {
+        self.amount = Some(amount);
+        self
+    }
+
+    /// Sets the reason stored with the refund.
+    pub fn reason(mut self, value: impl Into<String>) -> Self {
+        self.reason = Some(value.into());
+        self
+    }
+}
+
+/// Refund status wire values, on [`Refund::status`].
+pub mod refund_status {
+    /// Accepted and queued, behind another refund of the same payment or not yet
+    /// picked up.
+    pub const PENDING: &str = "pending";
+    /// With the payment provider now.
+    pub const PROCESSING: &str = "processing";
+    /// The money was returned to the payer. Final.
+    pub const SUCCEEDED: &str = "succeeded";
+    /// The refund did not happen; read
+    /// [`Refund::failure_code`](crate::Refund::failure_code). Final for this
+    /// idempotency key: a new attempt needs a new key.
+    pub const FAILED: &str = "failed";
+
+    /// The whole vocabulary, in the order the canonical contract lists it. Treat
+    /// a value outside it as still open.
+    pub const ALL: [&str; 4] = [PENDING, PROCESSING, SUCCEEDED, FAILED];
+}
+
+/// The codes a failed [`Refund`] carries in [`Refund::failure_code`]. They are
+/// not HTTP errors: the refund was accepted and then did not happen.
+pub mod refund_failure_code {
+    /// The amount was more than what was left to refund.
+    pub const REFUND_AMOUNT_EXCEEDED: &str = "REFUND_AMOUNT_EXCEEDED";
+    /// The payment could no longer be refunded.
+    pub const PAYMENT_NOT_REFUNDABLE: &str = "PAYMENT_NOT_REFUNDABLE";
+    /// The refund could not be completed. Also what an unknown code means; see
+    /// [`Refund::failure`](crate::Refund::failure).
+    pub const REFUND_FAILED: &str = "REFUND_FAILED";
+
+    /// The whole vocabulary, in the order the canonical contract lists it.
+    pub const ALL: [&str; 3] = [
+        REFUND_AMOUNT_EXCEEDED,
+        PAYMENT_NOT_REFUNDABLE,
+        REFUND_FAILED,
+    ];
+}
+
+/// What [`Client::create_refund`](crate::Client::create_refund) (HTTP 202) and
+/// [`Client::get_refund`](crate::Client::get_refund) (HTTP 200) return. The
+/// gateway omits null fields on the wire; the SDK reads absent as `None`.
+///
+/// A 202 means the refund is queued, not done. Read it back with `get_refund`,
+/// or wait for the `payment.refunded` webhook, which fires once the money has
+/// moved. A failed refund sends no webhook, so poll if you need to know about
+/// failures.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Refund {
+    /// `re_` followed by 32 hex characters. The same key on the same payment
+    /// always names the same refund.
+    pub refund_id: String,
+    /// The payment being refunded.
+    pub transaction_id: String,
+    /// One of the [`refund_status`] constants. Compare with
+    /// [`Refund::is_succeeded`] and [`Refund::is_terminal`] rather than by hand.
+    pub status: String,
+    /// MINOR units. On `pending`, the amount requested (`None` for a refund of
+    /// everything still refundable); on `processing`, the amount being refunded
+    /// (`None` until such a refund has been sized); on `succeeded`, the amount
+    /// actually refunded; always `None` on `failed`.
+    #[serde(default)]
+    pub amount: Option<i64>,
+    /// ISO 4217 code of the payment. A refund is always in the payment's
+    /// currency.
+    #[serde(default)]
+    pub currency: String,
+    /// On `failed` only: one of the [`refund_failure_code`] constants. Branch on
+    /// [`Refund::failure`], which folds an unknown code into `REFUND_FAILED`.
+    #[serde(default)]
+    pub failure_code: Option<String>,
+    /// On `failed` only: a fixed English explanation of `failure_code`.
+    #[serde(default)]
+    pub failure_message: Option<String>,
+    /// ISO 8601 UTC, when the refund reached `succeeded` or `failed`; `None`
+    /// before that.
+    #[serde(default)]
+    pub completed_at: Option<String>,
+
+    /// The unwrapped refund object as the gateway sent it, for fields this
+    /// struct does not model yet.
+    #[serde(skip)]
+    pub raw: Value,
+}
+
+impl Refund {
+    /// True only for `succeeded`: the money went back to the payer.
+    pub fn is_succeeded(&self) -> bool {
+        self.status == refund_status::SUCCEEDED
+    }
+
+    /// False while the refund can still change, true once it cannot
+    /// (`succeeded` or `failed`).
+    ///
+    /// An unrecognised status is reported as NOT terminal, so a status the API
+    /// adds later keeps you polling rather than closing a refund that is still
+    /// open.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            refund_status::SUCCEEDED | refund_status::FAILED
+        )
+    }
+
+    /// Why a failed refund did not happen, as one of the
+    /// [`refund_failure_code`] constants. An unknown or missing code on a failed
+    /// refund reads as `REFUND_FAILED`. `None` unless the status is `failed`.
+    pub fn failure(&self) -> Option<&'static str> {
+        if self.status != refund_status::FAILED {
+            return None;
+        }
+        let code = self.failure_code.as_deref().unwrap_or("");
+        Some(
+            refund_failure_code::ALL
+                .into_iter()
+                .find(|known| *known == code)
+                .unwrap_or(refund_failure_code::REFUND_FAILED),
+        )
+    }
+}

@@ -7,6 +7,21 @@
   `agreement.*` and `charge.*` events so you can drop out-of-order deliveries; the README has the
   ordering rule. Payloads without `apiVersion` or `sequence` still parse.
 - `PaymentMethodCharge::sequence`: optional, `None` until the server sends it.
+- Refunds: `create_refund(transaction_id, &RefundRequest)` (POST
+  `/merchant-api/payments/{transactionId}/refunds`, HTTP 202, required and signed idempotency
+  key) and `get_refund(transaction_id, refund_id)`. `RefundRequest::new(key)` refunds everything
+  still refundable and sends no `amount`; `.amount(minor)` makes it partial, `.reason(...)` is
+  optional. `Refund` has the contract's eight fields plus `is_succeeded()`, `is_terminal()` and
+  `failure()`, which reads an unknown failure code as `REFUND_FAILED`. New constants:
+  `refund_status`, `refund_failure_code`, and `refund_error_code` with
+  `retry_window_seconds`. Refund HTTP errors arrive as `Error::Api` with their code.
+- `WebhookEvent::payment_data()` types `data` on `payment.*` events as `PaymentEventData`, with
+  every field the gateway sends, including `stored_payment_method` (the existing
+  `StoredPaymentMethod`, set on `payment.succeeded` and `payment.requires_capture` only).
+  `WebhookEvent::stored_payment_method()` is the shortcut. It can be `None` even when a card was
+  saved; the status read is the source of truth. Explicit nulls read as `None`.
+- The canonical `merchant-api-contract.json` now carries the refund endpoints and vocabularies,
+  and the contract test pins them.
 
 ## 0.3.0
 

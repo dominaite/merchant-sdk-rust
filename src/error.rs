@@ -143,6 +143,71 @@ pub mod revoke_error_code {
     pub const ALL: [&str; 2] = [UPSTREAM_CONTRACT_ERROR, MERCHANT_API_UNAVAILABLE];
 }
 
+/// The codes [`Client::create_refund`](crate::Client::create_refund) and
+/// [`Client::get_refund`](crate::Client::get_refund) answer with, in the order the
+/// canonical contract lists them. They arrive as [`Error::Api`](crate::Error::Api)
+/// with the code and the HTTP status set. A 500 on these routes means nothing
+/// was queued and arrives as [`Error::Transport`](crate::Error::Transport): retry
+/// with the SAME key.
+///
+/// `REFUND_FAILED` is not one of them: it is a
+/// [`refund_failure_code`](crate::refund_failure_code) on a refund that was
+/// accepted and then failed.
+pub mod refund_error_code {
+    /// HTTP 404: no card-not-present payment with this id under your account.
+    pub const PAYMENT_NOT_FOUND: &str = "PAYMENT_NOT_FOUND";
+    /// HTTP 404, status read only: no refund with this id on this payment.
+    /// Right after a 202 the refund may not be picked up yet; read it again for
+    /// up to 60 seconds, after that the id is unknown.
+    pub const REFUND_NOT_FOUND: &str = "REFUND_NOT_FOUND";
+    /// HTTP 422: the payment is not paid, already fully refunded, or everything
+    /// left on it is already being refunded. Nothing was queued and the key is
+    /// not burnt.
+    pub const PAYMENT_NOT_REFUNDABLE: &str = "PAYMENT_NOT_REFUNDABLE";
+    /// HTTP 422: the amount is more than what is left to refund, counting
+    /// refunds still in progress; the message names the amount left. Nothing
+    /// was queued and the key is not burnt.
+    pub const REFUND_AMOUNT_EXCEEDED: &str = "REFUND_AMOUNT_EXCEEDED";
+    /// HTTP 422: this key was first used for a different amount, reason or
+    /// payment. Use a fresh key for a genuinely new refund.
+    pub const IDEMPOTENCY_KEY_REUSED: &str = "IDEMPOTENCY_KEY_REUSED";
+    /// HTTP 409: a request with this key is being processed right now. Retry
+    /// with the SAME key after a second, for up to 120 seconds.
+    pub const DUPLICATE_REQUEST: &str = "DUPLICATE_REQUEST";
+    /// HTTP 400: the Idempotency-Key header is missing or longer than 100
+    /// characters.
+    pub const IDEMPOTENCY_KEY_REQUIRED: &str = "IDEMPOTENCY_KEY_REQUIRED";
+
+    /// The whole vocabulary, in the order the canonical contract lists it. An
+    /// unlisted code still arrives as [`Error::Api`](crate::Error::Api) with
+    /// its code.
+    pub const ALL: [&str; 7] = [
+        PAYMENT_NOT_FOUND,
+        REFUND_NOT_FOUND,
+        PAYMENT_NOT_REFUNDABLE,
+        REFUND_AMOUNT_EXCEEDED,
+        IDEMPOTENCY_KEY_REUSED,
+        DUPLICATE_REQUEST,
+        IDEMPOTENCY_KEY_REQUIRED,
+    ];
+
+    /// How long the same request is worth sending again after this code, in
+    /// seconds: 120 for `DUPLICATE_REQUEST` (same key), 60 for
+    /// `REFUND_NOT_FOUND` (the status read, right after a 202). `None` for every
+    /// other code, which a retry will not change.
+    ///
+    /// Not what [`Error::is_retryable`](crate::Error::is_retryable) answers:
+    /// that stays true only for a transport failure, which is safe to resend
+    /// at once. These two want a pause between attempts.
+    pub fn retry_window_seconds(code: &str) -> Option<u64> {
+        match code {
+            DUPLICATE_REQUEST => Some(120),
+            REFUND_NOT_FOUND => Some(60),
+            _ => None,
+        }
+    }
+}
+
 /// Everything that can go wrong, split by what you should do about it.
 ///
 /// Match on the variant rather than on the message. Every variant that carries a
@@ -215,7 +280,8 @@ pub enum Error {
     /// key. A 404 from [`Client::get_status`](crate::Client::get_status) means an
     /// unknown transaction id. A 409 or 400 carrying one of the
     /// [`session_error_code::STOREFRONT`] codes means the storefront cannot take
-    /// payments yet (`STOREFRONT_NOT_WHITELISTED`) or at all.
+    /// payments yet (`STOREFRONT_NOT_WHITELISTED`) or at all. The refund routes
+    /// answer every [`refund_error_code`] this way.
     Api {
         /// The HTTP status code.
         status: u16,

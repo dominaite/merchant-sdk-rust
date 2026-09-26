@@ -50,16 +50,21 @@ mod types;
 mod webhooks;
 
 pub use client::{
-    Client, ClientBuilder, RetryOptions, DEFAULT_BASE_URL, PAYMENT_METHODS_PATH, PING_PATH,
-    SESSIONS_PATH, VERSION,
+    Client, ClientBuilder, RetryOptions, DEFAULT_BASE_URL, PAYMENTS_PATH, PAYMENT_METHODS_PATH,
+    PING_PATH, SESSIONS_PATH, VERSION,
 };
-pub use error::{charge_error_code, revoke_error_code, session_error_code, Error, Result};
+pub use error::{
+    charge_error_code, refund_error_code, revoke_error_code, session_error_code, Error, Result,
+};
 pub use idempotency::IdempotencyKey;
 pub use money::{currency_exponent, to_minor_units};
 pub use signing::{sha256_hex, sign_request, SignRequest};
 pub use types::{
-    charge_status, decline_class, retired_reason, status, stored_payment_method_status,
-    ChargeRequest, CheckoutSession, CheckoutSessionRequest, CheckoutStatus, Customer,
-    PaymentMethodCharge, Ping, StoredPaymentMethod,
+    charge_status, decline_class, refund_failure_code, refund_status, retired_reason, status,
+    stored_payment_method_status, ChargeRequest, CheckoutSession, CheckoutSessionRequest,
+    CheckoutStatus, Customer, PaymentMethodCharge, Ping, Refund, RefundRequest,
+    StoredPaymentMethod,
 };
-pub use webhooks::{verify_webhook, WebhookError, WebhookEvent, DEFAULT_TOLERANCE_SECS};
+pub use webhooks::{
+    verify_webhook, PaymentEventData, WebhookError, WebhookEvent, DEFAULT_TOLERANCE_SECS,
+};

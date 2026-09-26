@@ -422,6 +422,80 @@ shared byte-for-byte with the gateway: the charge vector signs
 `{"amount":2500,"currency":"EUR","orderReference":"order-1043"}`, the revoke vector signs the
 `DELETE` with nothing else.
 
+## Refunds
+
+`create_refund` returns money on a payment, in full or in part. It takes the payment's
+`transaction_id` (what the session or the charge returned) and a `RefundRequest` whose
+idempotency key is required and signed exactly like a charge. Derive the key from YOUR refund
+(the return or credit-note id), never per attempt: the same key answers the same refund and
+never refunds twice, so after a timeout or a 500 you resend it as is.
+
+```rust
+use dominaite::{refund_error_code, refund_status, to_minor_units, Error, IdempotencyKey, RefundRequest};
+
+// A partial refund of 1,500 HUF. HUF has no minor unit at the gateway, so 1500 is 1500.
+let request = RefundRequest::new(IdempotencyKey::new("return-7731")?)
+    .amount(to_minor_units("1500", "HUF")?)
+    .reason("Returned one item");
+
+match client.create_refund(&transaction_id, &request) {
+    Ok(refund) => store_refund(&order_id, &refund.refund_id), // re_..., status pending
+    Err(error) if error.code() == Some(refund_error_code::REFUND_AMOUNT_EXCEEDED) => {
+        // Nothing was queued and the key is not burnt. The message names what is left.
+        show_error(&error.to_string())
+    }
+    Err(error) => return Err(error.into()),
+}
+
+// Everything still refundable: leave the amount out. The body then has no amount key at all.
+let full = RefundRequest::new(IdempotencyKey::new("credit-note-2291")?);
+```
+
+The answer is HTTP 202: the refund is queued, not done. Its `status` is `pending` (queued),
+`processing` (with the payment provider), `succeeded` or `failed`; the last two are final.
+Read it back with `get_refund(transaction_id, refund_id)`, a signed GET with an empty key and
+an empty body, or wait for the `payment.refunded` webhook, which fires once the money has moved
+(its `data.transactionId` is the refund's own transaction, `data.amount` that refund's amount,
+and `data.originalTransactionId` the payment you refunded). A failed refund sends NO webhook,
+so poll `get_refund` if you need to know about failures.
+
+```rust
+let refund = client.get_refund(&transaction_id, &refund_id)?;
+if refund.is_succeeded() {
+    mark_refunded(&order_id, refund.amount);
+} else if let Some(code) = refund.failure() {
+    // REFUND_FAILED, REFUND_AMOUNT_EXCEEDED or PAYMENT_NOT_REFUNDABLE. Final for this key:
+    // a new attempt needs a new key.
+    report_failed_refund(&order_id, code);
+}
+```
+
+`Refund` carries `refund_id` (`re_` plus 32 hex), `transaction_id`, `status`, `amount`,
+`currency`, `failure_code`, `failure_message` and `completed_at`. The optional ones are `None`
+when the gateway leaves them out. `amount` is the amount requested while `pending`
+(`None` for a full refund), the amount being refunded while `processing` (`None` until a full
+refund has been sized), the amount actually refunded once it has succeeded, and always `None` on
+`failed`. `failure()` reads `failure_code` on a failed refund and treats an unknown code as
+`REFUND_FAILED`.
+
+The refund routes answer these codes as `Error::Api` with the status and code set, all in
+`dominaite::refund_error_code`:
+
+| Code | Status | Meaning |
+|---|---|---|
+| `PAYMENT_NOT_FOUND` | 404 | No card-not-present payment with this id under your account. |
+| `REFUND_NOT_FOUND` | 404 | `get_refund` only: not picked up yet right after a 202. Read again for up to 60 seconds. |
+| `PAYMENT_NOT_REFUNDABLE` | 422 | Not paid, already fully refunded, or the rest is already being refunded. Nothing queued, key not burnt. |
+| `REFUND_AMOUNT_EXCEEDED` | 422 | More than what is left to refund. Nothing queued, key not burnt. |
+| `IDEMPOTENCY_KEY_REUSED` | 422 | The key was first used for a different amount, reason or payment. Use a fresh key. |
+| `DUPLICATE_REQUEST` | 409 | A request with this key is still running. Retry with the SAME key for up to 120 seconds. |
+| `IDEMPOTENCY_KEY_REQUIRED` | 400 | The key is missing or too long. |
+
+`refund_error_code::retry_window_seconds(code)` answers 120 for `DUPLICATE_REQUEST`, 60 for
+`REFUND_NOT_FOUND` and `None` for the rest. A 500 means nothing was queued and arrives as
+`Error::Transport`: retry with the same key. `REFUND_FAILED` is never an HTTP error, only a
+`failure_code` on a refund that was accepted and then failed.
+
 ## Webhooks
 
 Webhooks are how you find out a payment succeeded without asking. Point an endpoint at your
@@ -501,6 +575,30 @@ fields you do not recognise. A redelivery keeps the `apiVersion` of its first at
 
 `WebhookEvent` gives you `id`, `event_type` (`type` on the wire), `api_version`, `created_at` and
 `data` as a `serde_json::Value`, whose shape depends on the type.
+
+`event.payment_data()` types `data` on `payment.*` events as `PaymentEventData`
+(`transaction_id`, `status`, `previous_status`, `kind`, `amount`, `gross_amount`,
+`surcharge_amount`, `currency`, `payment_method`, `wallet_type`, `original_transaction_id`,
+`idempotency_key`, `order_reference`, `order_id`, `description`, `payment_method_brand`,
+`payment_method_last4`, `stored_payment_method`) and is `None` on other event types. Webhooks
+spell unset values as explicit `null`; they read as `None`, the same as a missing field.
+
+`payment.succeeded` (and `payment.requires_capture` for an authorization) can carry
+`data.storedPaymentMethod`, the card the payment kept on file. `stored_payment_method` (also
+`event.stored_payment_method()`) is the same `StoredPaymentMethod` that `get_status` returns
+(id, brand, last4, expiry, `status` of `active`, `revoked`, `expired` or `retired`, and
+`retired_reason`).
+
+```json
+"storedPaymentMethod": { "id": "pm_0123456789abcdef0123456789abcdef", "brand": "visa", "last4": "4242", "expiryMonth": 12, "expiryYear": 2030, "status": "active" }
+```
+
+It is `None` (null on the wire) when no card was saved and on every other event. It can also be
+`None` when a card WAS saved, because the card can be stored after the approval was announced:
+a server-to-server sale that succeeded synchronously and a sale settled by a later sweep are
+the known cases. The status read is the source of truth, so on a `save_card` session whose
+event has no `storedPaymentMethod`, call `get_status` to pick the card up. `charge.*` events
+name their card by `data.storedPaymentMethodId` instead.
 
 ### Ordering
 
@@ -600,7 +698,7 @@ string where there is one.
 | `Error::RateLimited { retry_after_seconds }` | 429. The platform allows 60 requests per minute per API key and 120 per minute per IP. | Wait `retry_after_seconds` (or back off yourself when it is `None`), then send the request again with the **same** idempotency key. Never auto-retried: `is_retryable()` is false. |
 | `Error::Charge { status, code, charge, transaction_id, .. }` | `charge_payment_method` got an error code instead of a charge: 409, 422, 502 or 503. | Branch on `code` (see [Stored payment methods](#stored-payment-methods-recurring)). `CHARGE_OUTCOME_UNKNOWN` carries the `transaction_id` to poll; never retry it under a new key. |
 | `Error::Revoke { status, code, .. }` | `revoke_payment_method` was refused: 502 `UPSTREAM_CONTRACT_ERROR` or 503 `MERCHANT_API_UNAVAILABLE`. Nothing changed. | Retry later on 503; contact support on 502. |
-| `Error::Api { status, code, .. }` | Any other rejecting or unexpected response. `code` carries the API's machine-readable reason when it sent one, e.g. `IDEMPOTENCY_KEY_REQUIRED` on a 400, `STOREFRONT_NOT_WHITELISTED` on a 409, `PAYMENT_METHOD_NOT_FOUND` on a charge 404. | Inspect `status` and `code`. A 404 from `get_status` is an unknown transaction id. |
+| `Error::Api { status, code, .. }` | Any other rejecting or unexpected response. `code` carries the API's machine-readable reason when it sent one, e.g. `IDEMPOTENCY_KEY_REQUIRED` on a 400, `STOREFRONT_NOT_WHITELISTED` on a 409, `PAYMENT_METHOD_NOT_FOUND` on a charge 404, and every refund code (see [Refunds](#refunds)). | Inspect `status` and `code`. A 404 from `get_status` is an unknown transaction id. |
 | `Error::Validation { .. }` | Bad arguments (non-positive amount, missing field, malformed key id). | Fix the call; nothing was sent. |
 
 Refusal codes on `Error::Refusal`:
