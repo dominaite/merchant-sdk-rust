@@ -19,6 +19,7 @@ use std::error::Error as StdError;
 use std::fmt;
 
 use crate::client::unix_seconds;
+use crate::types::StoredPaymentMethod;
 
 /// The default clock skew allowed between the signature's timestamp and your
 /// server's clock, in seconds. Matches the server's own tolerance.
@@ -225,6 +226,28 @@ impl WebhookEvent {
     /// - `charge.*` for a one-off charge you initiated: `data.chargeId`.
     pub fn sequence(&self) -> Option<i64> {
         self.data.get("sequence").and_then(Value::as_i64)
+    }
+
+    /// `data.storedPaymentMethod` on `payment.*` events: the card this payment
+    /// kept on file, the same object and type as
+    /// [`CheckoutStatus::stored_payment_method`](crate::CheckoutStatus::stored_payment_method).
+    ///
+    /// `payment.succeeded`, and `payment.requires_capture` for an authorization,
+    /// carry it when the card was stored together with the approval. It is
+    /// `None` (null or absent on the wire) when no card was saved, and on every
+    /// other event. `charge.*` events name their card by
+    /// `data.storedPaymentMethodId` instead.
+    ///
+    /// It can ALSO be `None` when a card was saved: the card can be stored after
+    /// the approval was announced, as on a server-to-server sale that succeeded
+    /// synchronously and on a sale settled by a later sweep. The status read is
+    /// the source of truth: on a `save_card` session whose event has no stored
+    /// payment method, call [`Client::get_status`](crate::Client::get_status) to
+    /// pick it up.
+    ///
+    /// Also `None` when the object does not have the documented shape.
+    pub fn stored_payment_method(&self) -> Option<StoredPaymentMethod> {
+        serde_json::from_value(self.data.get("storedPaymentMethod")?.clone()).ok()
     }
 }
 

@@ -349,3 +349,77 @@ fn a_zero_sequence_is_reported_as_zero_not_absent() {
     let event: WebhookEvent = serde_json::from_str(&body).expect("parses");
     assert_eq!(event.sequence(), Some(0));
 }
+
+// --- storedPaymentMethod on payment.* events --------------------------------
+
+use dominaite::{retired_reason, stored_payment_method_status};
+
+/// The canonical payment.succeeded body with `tail` appended inside `data`.
+fn payment_event_with(tail: &str) -> String {
+    BODY.replacen(
+        r#""idempotencyKey":"order-123"}"#,
+        &format!(r#""idempotencyKey":"order-123"{tail}}}"#),
+        1,
+    )
+}
+
+#[test]
+fn a_payment_event_carries_the_stored_payment_method() {
+    let body = payment_event_with(
+        r#","storedPaymentMethod":{"id":"pm_0123456789abcdef0123456789abcdef","brand":"visa","last4":"4242","expiryMonth":12,"expiryYear":2030,"status":"active","retiredReason":null}"#,
+    );
+    let event = WebhookEvent::parse(&body).expect("parses");
+
+    let method = event
+        .stored_payment_method()
+        .expect("a stored payment method");
+    assert_eq!(method.id, "pm_0123456789abcdef0123456789abcdef");
+    assert_eq!(method.brand.as_deref(), Some("visa"));
+    assert_eq!(method.last4.as_deref(), Some("4242"));
+    assert_eq!(method.expiry_month, Some(12));
+    assert_eq!(method.expiry_year, Some(2030));
+    assert_eq!(method.status, stored_payment_method_status::ACTIVE);
+    assert_eq!(method.retired_reason, None);
+    assert!(method.is_chargeable());
+}
+
+#[test]
+fn a_payment_event_without_a_saved_card_has_no_stored_payment_method() {
+    // Absent (the canonical vector, and how the gateway omits nulls) and an
+    // explicit null read the same.
+    for body in [
+        BODY.to_string(),
+        payment_event_with(r#","storedPaymentMethod":null"#),
+    ] {
+        let event = WebhookEvent::parse(&body).expect("parses");
+        assert_eq!(event.stored_payment_method(), None, "{body}");
+    }
+}
+
+#[test]
+fn a_retired_card_on_a_payment_event_reads_its_reason_and_is_not_chargeable() {
+    let body = payment_event_with(
+        r#","storedPaymentMethod":{"id":"pm_0123456789abcdef0123456789abcdef","brand":"visa","last4":"4242","expiryMonth":12,"expiryYear":2030,"status":"retired","retiredReason":"hard_decline"}"#,
+    );
+    let event = WebhookEvent::parse(&body).expect("parses");
+
+    let method = event
+        .stored_payment_method()
+        .expect("a stored payment method");
+    assert_eq!(method.status, stored_payment_method_status::RETIRED);
+    assert_eq!(
+        method.retired_reason.as_deref(),
+        Some(retired_reason::HARD_DECLINE)
+    );
+    assert!(!method.is_chargeable());
+}
+
+#[test]
+fn a_charge_event_names_its_card_by_id_not_by_object() {
+    let event: WebhookEvent = serde_json::from_str(CHARGE_EVENT).expect("parses");
+    assert_eq!(event.stored_payment_method(), None);
+    assert_eq!(
+        event.data["storedPaymentMethodId"],
+        "pm_0123456789abcdef0123456789abcdef"
+    );
+}
