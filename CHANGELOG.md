@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.1 (unreleased)
+## 0.3.1
 
 - `WebhookEvent` parses a verified webhook body: `id`, `event_type`, `api_version` (`None` when
   absent), `created_at` and `data`. `WebhookEvent::sequence()` reads `data.sequence` on
