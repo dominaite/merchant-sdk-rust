@@ -258,3 +258,94 @@ fn read_crate_source(relative_path: &str) -> String {
         panic!("could not read {}: {error}", path.display());
     })
 }
+
+// --- Parsing the envelope ---------------------------------------------------
+//
+// Parsing happens only after verification, and it must accept both the current
+// envelope (apiVersion, data.sequence) and payloads from servers that predate
+// those fields.
+
+use dominaite::WebhookEvent;
+
+const AGREEMENT_EVENT: &str = r#"{"id":"0b6f2c1e-8a41-4f7d-9c3e-5d2a1b0c9e8f","type":"agreement.past_due","apiVersion":"2026-09-25","createdAt":"2026-09-25T10:00:00Z","data":{"id":"agr_0123456789abcdef0123456789abcdef","planId":"plan_1","customerReference":"cust-7","storedPaymentMethodId":"pm_0123456789abcdef0123456789abcdef","status":"past_due","previousStatus":"active","amount":2500,"currency":"EUR","intervalUnit":"month","intervalCount":1,"periodCount":null,"trialDays":0,"nextChargeAt":"2026-09-24T00:00:00Z","activatedAt":"2026-08-24T00:00:00Z","cancelledAt":null,"version":4,"sequence":3}}"#;
+
+const CHARGE_EVENT: &str = r#"{"id":"5a4b3c2d-1e0f-4a9b-8c7d-6e5f4a3b2c1d","type":"charge.retrying","apiVersion":"2026-09-25","createdAt":"2026-09-24T00:00:05Z","data":{"chargeId":"ch_33333333333343338333333333333333","transactionId":"33333333-3333-4333-8333-333333333333","storedPaymentMethodId":"pm_0123456789abcdef0123456789abcdef","agreementId":"agr_0123456789abcdef0123456789abcdef","customerReference":"cust-7","outcome":"retrying","periodNumber":2,"attemptNumber":1,"amount":2500,"currency":"EUR","paymentMethod":{"brand":"visa","last4":"4242"},"orderReference":null,"description":null,"declineClass":"soft_funds","declineCode":"51","nextAttemptAt":"2026-09-25T00:00:00Z","nextChargeAt":null,"sequence":7}}"#;
+
+#[test]
+fn the_canonical_vector_parses_as_an_old_envelope_without_api_version() {
+    // The signed vector predates apiVersion: it must still verify AND parse.
+    assert_eq!(verify_at(BODY, HEADER, SECRET, NOW), Ok(()));
+    let event = WebhookEvent::parse(BODY).expect("old envelope parses");
+
+    assert_eq!(event.id, "7f9c24e5-1d1f-4c0a-9b6c-2f3a4d5e6f70");
+    assert_eq!(event.event_type, "payment.succeeded");
+    assert_eq!(event.created_at, "2026-08-20T14:00:00Z");
+    assert_eq!(event.api_version, None);
+    assert_eq!(event.sequence(), None);
+    assert_eq!(event.data["amount"], 8440);
+}
+
+#[test]
+fn an_envelope_with_api_version_parses() {
+    let body = BODY.replacen(
+        r#""type":"payment.succeeded","#,
+        r#""type":"payment.succeeded","apiVersion":"2026-09-25","#,
+        1,
+    );
+    let event: WebhookEvent = serde_json::from_str(&body).expect("envelope parses");
+
+    assert_eq!(event.api_version.as_deref(), Some("2026-09-25"));
+    assert_eq!(event.event_type, "payment.succeeded");
+    // payment.* events carry no sequence.
+    assert_eq!(event.sequence(), None);
+}
+
+#[test]
+fn an_agreement_event_carries_sequence_and_created_at() {
+    let event: WebhookEvent = serde_json::from_str(AGREEMENT_EVENT).expect("parses");
+
+    assert_eq!(event.event_type, "agreement.past_due");
+    assert_eq!(event.api_version.as_deref(), Some("2026-09-25"));
+    assert_eq!(event.created_at, "2026-09-25T10:00:00Z");
+    assert_eq!(event.sequence(), Some(3));
+    assert_eq!(event.data["id"], "agr_0123456789abcdef0123456789abcdef");
+}
+
+#[test]
+fn a_charge_event_carries_sequence_and_created_at() {
+    let event: WebhookEvent = serde_json::from_str(CHARGE_EVENT).expect("parses");
+
+    assert_eq!(event.event_type, "charge.retrying");
+    assert_eq!(event.created_at, "2026-09-24T00:00:05Z");
+    assert_eq!(event.sequence(), Some(7));
+    assert_eq!(
+        event.data["agreementId"],
+        "agr_0123456789abcdef0123456789abcdef"
+    );
+    assert_eq!(event.data["periodNumber"], 2);
+}
+
+#[test]
+fn agreement_and_charge_events_from_before_the_counter_still_parse() {
+    for current in [AGREEMENT_EVENT, CHARGE_EVENT] {
+        let old = current
+            .replacen(r#""apiVersion":"2026-09-25","#, "", 1)
+            .replace(r#","sequence":3}"#, "}")
+            .replace(r#","sequence":7}"#, "}");
+        assert!(!old.contains("sequence") && !old.contains("apiVersion"));
+
+        let event: WebhookEvent = serde_json::from_str(&old).expect("old payload parses");
+        assert_eq!(event.api_version, None);
+        assert_eq!(event.sequence(), None);
+        assert!(!event.created_at.is_empty());
+    }
+}
+
+#[test]
+fn a_zero_sequence_is_reported_as_zero_not_absent() {
+    // 0 means "recorded before the counter existed", which is older than any
+    // positive number. It must not collapse into None.
+    let body = AGREEMENT_EVENT.replace(r#""sequence":3"#, r#""sequence":0"#);
+    let event: WebhookEvent = serde_json::from_str(&body).expect("parses");
+    assert_eq!(event.sequence(), Some(0));
+}

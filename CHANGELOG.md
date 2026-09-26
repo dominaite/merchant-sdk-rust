@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1 (unreleased)
+
+- `WebhookEvent` parses a verified webhook body: `id`, `event_type`, `api_version` (`None` when
+  absent), `created_at` and `data`. `WebhookEvent::sequence()` reads `data.sequence` on
+  `agreement.*` and `charge.*` events so you can drop out-of-order deliveries; the README has the
+  ordering rule. Payloads without `apiVersion` or `sequence` still parse.
+- `PaymentMethodCharge::sequence`: optional, `None` until the server sends it.
+
 ## 0.3.0
 
 Breaking. All six Dominaite SDKs move to 0.3.0 together with the same changes.

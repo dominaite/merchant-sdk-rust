@@ -250,6 +250,8 @@ fn charge_payment_method_signs_the_charge_vector_byte_for_byte() {
     assert_eq!(charge.decline_class, None);
     assert_eq!(charge.decline_code, None);
     assert_eq!(charge.transaction_id, CHARGE_TRANSACTION_ID);
+    // A server that does not send sequence yet reads as None.
+    assert_eq!(charge.sequence, None);
     // raw is the unwrapped charge object, not the envelope.
     assert_eq!(charge.raw["chargeId"], CHARGE_ID);
     assert!(charge.raw.get("success").is_none());
@@ -710,4 +712,16 @@ fn revoke_payment_method_maps_a_404_and_a_codeless_5xx() {
         );
         assert!(error.is_retryable());
     }
+}
+
+#[test]
+fn a_charge_answer_with_sequence_exposes_it() {
+    let with_sequence = CHARGE.replacen("}", r#","sequence":5}"#, 1);
+    let server = MockServer::start(vec![charge_envelope(201, None, Some(&with_sequence))]);
+    let charge = client_for(&server)
+        .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
+        .expect("charged");
+
+    assert_eq!(charge.charge_id, CHARGE_ID);
+    assert_eq!(charge.sequence, Some(5));
 }

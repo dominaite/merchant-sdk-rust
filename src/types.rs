@@ -574,6 +574,11 @@ pub struct PaymentMethodCharge {
     /// [`Client::get_status`](crate::Client::get_status).
     #[serde(default)]
     pub transaction_id: String,
+    /// The charge's current sequence, the counter that orders the `charge.*`
+    /// webhooks ([`WebhookEvent::sequence`](crate::WebhookEvent::sequence)).
+    /// `None` when the server does not send it yet.
+    #[serde(default)]
+    pub sequence: Option<i64>,
 
     /// The unwrapped charge object as the gateway sent it, for fields this
     /// struct does not model yet.

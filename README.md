@@ -433,13 +433,13 @@ one.
 unauthenticated stranger POSTing JSON at your server.
 
 ```rust
-use dominaite::{verify_webhook, WebhookError, DEFAULT_TOLERANCE_SECS};
+use dominaite::{verify_webhook, WebhookError, WebhookEvent, DEFAULT_TOLERANCE_SECS};
 
 // `body` must be the RAW request body, byte for byte as received.
 match verify_webhook(body, signature_header, &secret, DEFAULT_TOLERANCE_SECS, None) {
     Ok(()) => {
-        let event: serde_json::Value = serde_json::from_str(body)?;
-        // Dedupe on event["id"], enqueue the work, then answer 2xx.
+        let event = WebhookEvent::parse(body)?;
+        // Dedupe on event.id, enqueue the work, then answer 2xx.
     }
     Err(WebhookError::TimestampOutOfTolerance { .. }) => { /* replay, or your clock drifted */ }
     Err(_) => { /* wrong secret, or the body was modified in flight */ }
@@ -473,6 +473,7 @@ Flat JSON, no `success` wrapper - do not branch on a `success` field, there isn'
 {
   "id": "<delivery id - your dedupe key>",
   "type": "payment.succeeded",
+  "apiVersion": "2026-09-25",
   "createdAt": "<ISO 8601 UTC instant of the transition>",
   "data": {
     "transactionId": "...",
@@ -492,6 +493,38 @@ Flat JSON, no `success` wrapper - do not branch on a `success` field, there isn'
 Amounts are minor units. On `payment.*` events `amount` is what you are PAID (base), while
 `grossAmount` is the card movement; on `payment.refunded` the `amount` is what went back to the
 customer. `surchargeAmount`, `previousStatus`, `kind` and `originalTransactionId` are nullable.
+
+`apiVersion` is the dated version of the payload shape the event was rendered in, currently
+`2026-09-25`. Fields are only ever added under a version, never renamed or removed, so ignore
+fields you do not recognise. A redelivery keeps the `apiVersion` of its first attempt.
+`WebhookEvent::api_version` is `None` on deliveries from servers that predate the field.
+
+`WebhookEvent` gives you `id`, `event_type` (`type` on the wire), `api_version`, `created_at` and
+`data` as a `serde_json::Value`, whose shape depends on the type.
+
+### Ordering
+
+`agreement.*` and `charge.*` events carry `data.sequence`, an integer that counts the announced
+changes of one object; `WebhookEvent::sequence()` reads it (`None` on `payment.*` events and on
+servers that predate it).
+
+> Deliveries can arrive out of order. Keep the highest sequence you have processed per object
+> and discard any event whose sequence is not higher; when you need current state, read the
+> object by id. createdAt can repeat across events, so order by sequence, not createdAt. A
+> sequence of 0 only comes from events recorded before the counter existed; treat it as older
+> than any positive number.
+
+The object is:
+
+- `agreement.*`: the agreement, `data.id`.
+- `charge.*` the platform placed for an agreement: the agreement period, `data.agreementId` plus
+  `data.periodNumber`, so the `charge.retrying` and `charge.failed` events of one period compare
+  across attempts.
+- `charge.*` for a one-off charge you initiated: `data.chargeId`.
+
+A redelivery of an event carries the same sequence. `PaymentMethodCharge::sequence` is the
+charge's current sequence as the charge route returns it (`Option<i64>`, `None` until the server
+sends it).
 
 ### Events
 

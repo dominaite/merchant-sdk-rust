@@ -62,4 +62,4 @@ pub use types::{
     ChargeRequest, CheckoutSession, CheckoutSessionRequest, CheckoutStatus, Customer,
     PaymentMethodCharge, Ping, StoredPaymentMethod,
 };
-pub use webhooks::{verify_webhook, WebhookError, DEFAULT_TOLERANCE_SECS};
+pub use webhooks::{verify_webhook, WebhookError, WebhookEvent, DEFAULT_TOLERANCE_SECS};
