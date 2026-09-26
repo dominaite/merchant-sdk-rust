@@ -15,9 +15,11 @@
   `failure()`, which reads an unknown failure code as `REFUND_FAILED`. New constants:
   `refund_status`, `refund_failure_code`, and `refund_error_code` with
   `retry_window_seconds`. Refund HTTP errors arrive as `Error::Api` with their code.
-- `WebhookEvent::stored_payment_method()`: `data.storedPaymentMethod` on `payment.*` events as
-  the existing `StoredPaymentMethod`. It can be `None` even when a card was saved; the status
-  read is the source of truth.
+- `WebhookEvent::payment_data()` types `data` on `payment.*` events as `PaymentEventData`, with
+  every field the gateway sends, including `stored_payment_method` (the existing
+  `StoredPaymentMethod`, set on `payment.succeeded` and `payment.requires_capture` only).
+  `WebhookEvent::stored_payment_method()` is the shortcut. It can be `None` even when a card was
+  saved; the status read is the source of truth. Explicit nulls read as `None`.
 - The canonical `merchant-api-contract.json` now carries the refund endpoints and vocabularies,
   and the contract test pins them.
 

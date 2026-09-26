@@ -575,16 +575,24 @@ fields you do not recognise. A redelivery keeps the `apiVersion` of its first at
 `WebhookEvent` gives you `id`, `event_type` (`type` on the wire), `api_version`, `created_at` and
 `data` as a `serde_json::Value`, whose shape depends on the type.
 
+`event.payment_data()` types `data` on `payment.*` events as `PaymentEventData`
+(`transaction_id`, `status`, `previous_status`, `kind`, `amount`, `gross_amount`,
+`surcharge_amount`, `currency`, `payment_method`, `wallet_type`, `original_transaction_id`,
+`idempotency_key`, `order_reference`, `order_id`, `description`, `payment_method_brand`,
+`payment_method_last4`, `stored_payment_method`) and is `None` on other event types. Webhooks
+spell unset values as explicit `null`; they read as `None`, the same as a missing field.
+
 `payment.succeeded` (and `payment.requires_capture` for an authorization) can carry
-`data.storedPaymentMethod`, the card the payment kept on file. `event.stored_payment_method()`
-reads it into the same `StoredPaymentMethod` that `get_status` returns (id, brand, last4,
-expiry, `status` of `active`, `revoked`, `expired` or `retired`, and `retired_reason`).
+`data.storedPaymentMethod`, the card the payment kept on file. `stored_payment_method` (also
+`event.stored_payment_method()`) is the same `StoredPaymentMethod` that `get_status` returns
+(id, brand, last4, expiry, `status` of `active`, `revoked`, `expired` or `retired`, and
+`retired_reason`).
 
 ```json
 "storedPaymentMethod": { "id": "pm_0123456789abcdef0123456789abcdef", "brand": "visa", "last4": "4242", "expiryMonth": 12, "expiryYear": 2030, "status": "active" }
 ```
 
-It is `None` (null or absent) when no card was saved and on every other event. It can also be
+It is `None` (null on the wire) when no card was saved and on every other event. It can also be
 `None` when a card WAS saved, because the card can be stored after the approval was announced:
 a server-to-server sale that succeeded synchronously and a sale settled by a later sweep are
 the known cases. The status read is the source of truth, so on a `save_card` session whose

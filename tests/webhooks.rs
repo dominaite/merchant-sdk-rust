@@ -423,3 +423,85 @@ fn a_charge_event_names_its_card_by_id_not_by_object() {
         "pm_0123456789abcdef0123456789abcdef"
     );
 }
+
+// --- Typed payment.* data ---------------------------------------------------
+//
+// Webhooks are serialized with every null spelled out, unlike the merchant API
+// responses, so a payment event carries explicit nulls for everything unset.
+
+const FULL_PAYMENT_EVENT: &str = r#"{"id":"2c1d0e9f-8a7b-4c6d-9e5f-4a3b2c1d0e9f","type":"payment.succeeded","apiVersion":"2026-09-25","createdAt":"2026-09-26T10:00:00Z","data":{"transactionId":"0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0","status":"succeeded","previousStatus":"pending","kind":"sale","amount":8440,"grossAmount":8701,"surchargeAmount":261,"currency":"EUR","paymentMethod":"wallet","walletType":"apple_pay","originalTransactionId":null,"idempotencyKey":"order-123","orderReference":"order-123","orderId":"dom_9a8b7c6d5e4f","description":"Two tickets","paymentMethodBrand":"visa","paymentMethodLast4":"4242","storedPaymentMethod":{"id":"pm_0123456789abcdef0123456789abcdef","brand":"visa","last4":"4242","expiryMonth":12,"expiryYear":2030,"status":"active","retiredReason":null}}}"#;
+
+const NULL_PAYMENT_EVENT: &str = r#"{"id":"3d2e1f0a-9b8c-4d7e-8f6a-5b4c3d2e1f0a","type":"payment.refunded","apiVersion":"2026-09-25","createdAt":"2026-09-26T11:00:00Z","data":{"transactionId":"9f8e7d6c-5b4a-4938-8271-6a5b4c3d2e1f","status":"refunded","previousStatus":null,"kind":null,"amount":2500,"grossAmount":2500,"surchargeAmount":null,"currency":"EUR","paymentMethod":null,"walletType":null,"originalTransactionId":"0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0","idempotencyKey":null,"orderReference":"order-123","orderId":null,"description":null,"paymentMethodBrand":null,"paymentMethodLast4":null,"storedPaymentMethod":null}}"#;
+
+#[test]
+fn a_payment_event_reads_every_gateway_field() {
+    let event = WebhookEvent::parse(FULL_PAYMENT_EVENT).expect("parses");
+    let data = event.payment_data().expect("a payment event");
+
+    assert_eq!(data.transaction_id, "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0");
+    assert_eq!(data.status, "succeeded");
+    assert_eq!(data.previous_status.as_deref(), Some("pending"));
+    assert_eq!(data.kind.as_deref(), Some("sale"));
+    assert_eq!(data.amount, Some(8440));
+    assert_eq!(data.gross_amount, Some(8701));
+    assert_eq!(data.surcharge_amount, Some(261));
+    assert_eq!(data.currency.as_deref(), Some("EUR"));
+    assert_eq!(data.payment_method.as_deref(), Some("wallet"));
+    assert_eq!(data.wallet_type.as_deref(), Some("apple_pay"));
+    assert_eq!(data.original_transaction_id, None);
+    assert_eq!(data.idempotency_key.as_deref(), Some("order-123"));
+    assert_eq!(data.order_reference.as_deref(), Some("order-123"));
+    assert_eq!(data.order_id.as_deref(), Some("dom_9a8b7c6d5e4f"));
+    assert_eq!(data.description.as_deref(), Some("Two tickets"));
+    assert_eq!(data.payment_method_brand.as_deref(), Some("visa"));
+    assert_eq!(data.payment_method_last4.as_deref(), Some("4242"));
+    let method = data.stored_payment_method.expect("a stored card");
+    assert_eq!(method.id, "pm_0123456789abcdef0123456789abcdef");
+    assert!(method.is_chargeable());
+}
+
+#[test]
+fn explicit_nulls_on_a_payment_event_read_as_none() {
+    let event = WebhookEvent::parse(NULL_PAYMENT_EVENT).expect("parses");
+    let data = event.payment_data().expect("a payment event");
+
+    assert_eq!(data.status, "refunded");
+    assert_eq!(data.amount, Some(2500));
+    assert_eq!(
+        data.original_transaction_id.as_deref(),
+        Some("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0")
+    );
+    assert_eq!(data.previous_status, None);
+    assert_eq!(data.kind, None);
+    assert_eq!(data.surcharge_amount, None);
+    assert_eq!(data.payment_method, None);
+    assert_eq!(data.wallet_type, None);
+    assert_eq!(data.idempotency_key, None);
+    assert_eq!(data.order_id, None);
+    assert_eq!(data.description, None);
+    assert_eq!(data.payment_method_brand, None);
+    assert_eq!(data.payment_method_last4, None);
+    assert_eq!(data.stored_payment_method, None);
+    assert_eq!(event.stored_payment_method(), None);
+}
+
+#[test]
+fn the_canonical_vector_reads_as_typed_payment_data() {
+    // Predates the correlation fields and storedPaymentMethod: still parses.
+    let data = WebhookEvent::parse(BODY)
+        .expect("parses")
+        .payment_data()
+        .expect("a payment event");
+    assert_eq!(data.amount, Some(8440));
+    assert_eq!(data.original_transaction_id, None);
+    assert_eq!(data.order_reference, None);
+    assert_eq!(data.stored_payment_method, None);
+}
+
+#[test]
+fn only_payment_events_have_payment_data() {
+    for body in [AGREEMENT_EVENT, CHARGE_EVENT] {
+        let event = WebhookEvent::parse(body).expect("parses");
+        assert_eq!(event.payment_data(), None, "{}", event.event_type);
+    }
+}
