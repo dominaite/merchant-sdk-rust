@@ -476,6 +476,9 @@ Flat JSON, no `success` wrapper - do not branch on a `success` field, there isn'
   "createdAt": "<ISO 8601 UTC instant of the transition>",
   "data": {
     "transactionId": "...",
+    "orderReference": "order-123",
+    "orderId": "dom_0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+    "description": "Pro plan",
     "status": "succeeded",
     "previousStatus": "pending",
     "kind": "sale",
@@ -483,6 +486,10 @@ Flat JSON, no `success` wrapper - do not branch on a `success` field, there isn'
     "grossAmount": 8701,
     "surchargeAmount": 261,
     "currency": "EUR",
+    "paymentMethod": "card",
+    "walletType": null,
+    "paymentMethodBrand": "visa",
+    "paymentMethodLast4": "4242",
     "originalTransactionId": null,
     "idempotencyKey": "order-123"
   }
@@ -492,6 +499,13 @@ Flat JSON, no `success` wrapper - do not branch on a `success` field, there isn'
 Amounts are minor units. On `payment.*` events `amount` is what you are PAID (base), while
 `grossAmount` is the card movement; on `payment.refunded` the `amount` is what went back to the
 customer. `surchargeAmount`, `previousStatus`, `kind` and `originalTransactionId` are nullable.
+
+`orderReference` is your own order id from create session and the field to match deliveries on;
+it is null only for payments that did not start through the API, and `payment.refunded` carries
+the original payment's value. `orderId` is the hosted checkout id, null on refunds. `description`
+is what you sent on create session, null on refunds. `paymentMethodBrand` and `paymentMethodLast4`
+are filled once a card payment was attempted and null otherwise. Every key is always present;
+ignore keys you do not know, more may be added.
 
 ### Events
 
