@@ -385,10 +385,28 @@ pub mod stored_payment_method_status {
     pub const REVOKED: &str = "revoked";
     /// The card's expiry date has passed.
     pub const EXPIRED: &str = "expired";
+    /// The platform stopped the card on its own; `retired_reason` says why. It
+    /// never becomes active again, so ask the customer to save a card again.
+    pub const RETIRED: &str = "retired";
 
     /// The whole vocabulary, in the order the canonical contract lists it. Treat
     /// a value outside it as not chargeable.
-    pub const ALL: [&str; 3] = [ACTIVE, REVOKED, EXPIRED];
+    pub const ALL: [&str; 4] = [ACTIVE, REVOKED, EXPIRED, RETIRED];
+}
+
+/// Why the platform retired a stored payment method, as
+/// [`StoredPaymentMethod::retired_reason`] carries it. Treat a value outside
+/// [`ALL`](retired_reason::ALL) as retired for an unknown reason.
+pub mod retired_reason {
+    /// A charge on it was declined as final.
+    pub const HARD_DECLINE: &str = "hard_decline";
+    /// A charge on it was disputed.
+    pub const CHARGEBACK: &str = "chargeback";
+    /// The payment that saved it was fully refunded or disputed.
+    pub const SOURCE_SALE_REVERSED: &str = "source_sale_reversed";
+
+    /// The whole vocabulary, in the order the canonical contract lists it.
+    pub const ALL: [&str; 3] = [HARD_DECLINE, CHARGEBACK, SOURCE_SALE_REVERSED];
 }
 
 /// A card kept on file. Never the card number, never the PSP token - only what
@@ -416,6 +434,10 @@ pub struct StoredPaymentMethod {
     /// One of the [`stored_payment_method_status`] constants. Compare with
     /// [`StoredPaymentMethod::is_chargeable`] rather than by hand.
     pub status: String,
+    /// One of the [`retired_reason`] constants when the platform retired the
+    /// card, kept if you revoke it afterwards. `None` on every other card.
+    #[serde(default)]
+    pub retired_reason: Option<String>,
 }
 
 impl StoredPaymentMethod {

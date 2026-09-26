@@ -11,8 +11,10 @@
 //! refusal code comes back out of the client as a refusal that keeps its code,
 //! every validation code comes back as a 400 that keeps its code, and the
 //! stored-payment-method vocabularies, field sets and examples (the saved-card
-//! status, a 201 charge, a 402 decline, every coded charge and revoke error,
-//! the bodiless revoke) match too. Every example is pushed through the client
+//! status, a retired card and its reason, a 201 charge, a 402 decline, every
+//! coded charge and revoke error, the bodiless revoke) match too, and the
+//! storefront codes come back as API errors with their status, never as
+//! refusals. Every example is pushed through the client
 //! twice: as spelled, and with its null members removed, because the gateway
 //! omits null fields on the wire.
 
@@ -28,13 +30,15 @@ use serde::forward_to_deserialize_any;
 use serde_json::Value;
 
 use dominaite::{
-    charge_error_code, charge_status, decline_class, revoke_error_code, session_error_code, status,
-    stored_payment_method_status, ChargeRequest, CheckoutSession, CheckoutSessionRequest,
-    CheckoutStatus, Client, Error, IdempotencyKey, PaymentMethodCharge, Ping, StoredPaymentMethod,
+    charge_error_code, charge_status, decline_class, retired_reason, revoke_error_code,
+    session_error_code, status, stored_payment_method_status, ChargeRequest, CheckoutSession,
+    CheckoutSessionRequest, CheckoutStatus, Client, Error, IdempotencyKey, PaymentMethodCharge,
+    Ping, StoredPaymentMethod,
 };
 use support::{MockServer, Reply};
 
 const FIXTURE: &str = include_str!("merchant-api-contract.json");
+const WIRE_FIXTURE: &str = include_str!("merchant-api-wire-contract.json");
 
 const KEY_ID: &str = "dmk_0123456789abcdef0123456789abcdef";
 const SECRET: &str = "dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -507,7 +511,107 @@ fn the_stored_payment_method_object_matches_the_contract() {
         assert_eq!(method.expiry_month, Some(12));
         assert_eq!(method.expiry_year, Some(2029));
         assert_eq!(method.status, stored_payment_method_status::ACTIVE);
+        assert_eq!(method.retired_reason, None, "{form}");
         assert!(method.is_chargeable());
+    }
+}
+
+#[test]
+fn the_retired_reason_vocabulary_is_exactly_the_contracts() {
+    assert_eq!(
+        retired_reason::ALL.to_vec(),
+        strings(&contract()["storedPaymentMethodRetiredReasonVocabulary"]),
+        "the SDK retired reason vocabulary drifted from the contract"
+    );
+}
+
+/// A card the platform retired because the payment that saved it was refunded:
+/// it reads as retired with its reason, and it is not chargeable.
+#[test]
+fn the_retired_card_example_reads_as_retired_and_not_chargeable() {
+    let get_status = endpoint("getStatus");
+    for (form, example) in both_wire_forms(&get_status["retiredCardExample"]) {
+        let server = MockServer::start(vec![Reply::enveloped(&example.to_string())]);
+        let parsed = client_for(&server)
+            .get_status("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0")
+            .unwrap_or_else(|error| panic!("{form}: {error}"));
+
+        assert_eq!(parsed.status, status::REFUNDED, "{form}");
+        assert_eq!(parsed.refunded_amount, Some(8440), "{form}");
+        let method = parsed
+            .stored_payment_method
+            .unwrap_or_else(|| panic!("{form}: the example carries a stored payment method"));
+        assert_eq!(method.id, PAYMENT_METHOD_ID, "{form}");
+        assert_eq!(
+            method.status,
+            stored_payment_method_status::RETIRED,
+            "{form}"
+        );
+        assert_eq!(
+            method.retired_reason.as_deref(),
+            Some(retired_reason::SOURCE_SALE_REVERSED),
+            "{form}"
+        );
+        assert!(!method.is_chargeable(), "{form}");
+    }
+}
+
+#[test]
+fn the_storefront_constants_are_exactly_the_contracts_and_not_refusals() {
+    let codes = strings(&contract()["storefrontErrorCodes"]);
+    assert_eq!(
+        session_error_code::STOREFRONT.to_vec(),
+        codes,
+        "the SDK storefront codes drifted from the contract"
+    );
+    for code in &codes {
+        assert!(
+            !session_error_code::REFUSALS.contains(&code.as_str()),
+            "{code} is not a session refusal"
+        );
+    }
+}
+
+/// The wire contract carries each storefront code's HTTP status and retry
+/// verdict. Each must come back as an API error with that status and code, not
+/// as a refusal, and never retryable.
+#[test]
+fn every_contract_storefront_code_comes_back_as_an_api_error_with_its_status() {
+    let wire: Value = serde_json::from_str(WIRE_FIXTURE).expect("the wire fixture is valid JSON");
+    let entries = wire["errorCodes"]["storefront"]
+        .as_array()
+        .expect("the wire contract lists storefront codes");
+    let codes: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry["code"].as_str().expect("a code"))
+        .collect();
+    assert_eq!(session_error_code::STOREFRONT.to_vec(), codes);
+
+    for entry in entries {
+        let code = entry["code"].as_str().expect("a code");
+        let http_status = entry["httpStatus"].as_u64().expect("an HTTP status") as u16;
+        assert_eq!(
+            entry["retry"],
+            Value::Bool(false),
+            "{code} is never retryable"
+        );
+
+        let server = MockServer::start(vec![Reply::error_envelope(http_status, code, "refused")]);
+        let error = client_for(&server)
+            .create_checkout_session(&session_request())
+            .expect_err("a storefront rejection is not a session");
+
+        assert_eq!(error.code(), Some(code), "{code} lost its code");
+        assert_eq!(
+            error.http_status(),
+            Some(http_status),
+            "{code} lost its status"
+        );
+        assert!(!error.is_retryable(), "{code} will not fix itself");
+        assert!(
+            matches!(error, Error::Api { .. }),
+            "{code} is not a refused payment: got {error:?}"
+        );
     }
 }
 

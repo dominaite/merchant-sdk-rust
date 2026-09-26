@@ -24,6 +24,13 @@ Breaking. All six Dominaite SDKs move to 0.3.0 together with the same changes.
 - `CheckoutStatus::is_terminal()` is now false for `disputed`, which can still resolve either
   way.
 - Docs: a clean replay of an open session returns the original session, not a refusal.
+- Contract refresh (gateway contract 2026-09-16): a stored payment method can be `retired`,
+  `stored_payment_method_status::RETIRED`, and carries `retired_reason: Option<String>` with the
+  `retired_reason` constants `HARD_DECLINE`, `CHARGEBACK` and `SOURCE_SALE_REVERSED`. A retired
+  card is not chargeable and never becomes active again.
+- `session_error_code::STOREFRONT` now lists the storefront codes in the contract's order and
+  is pinned against the contract's `storefrontErrorCodes`: 400 `STOREFRONT_MISMATCH`, 409
+  `STOREFRONT_INACTIVE`, 409 `STOREFRONT_NOT_WHITELISTED`, none retryable, none a refusal.
 
 ### Migrating from 0.2
 
