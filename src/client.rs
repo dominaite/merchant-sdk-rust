@@ -9,7 +9,7 @@ use crate::error::{session_error_code, Error, Result};
 use crate::signing::{sign_request, SignRequest};
 use crate::types::{
     ChargeRequest, CheckoutSession, CheckoutSessionRequest, CheckoutStatus, PaymentMethodCharge,
-    Ping,
+    Ping, Refund, RefundRequest,
 };
 
 /// The production merchant API.
@@ -23,6 +23,11 @@ pub const SESSIONS_PATH: &str = "/merchant-api/checkout/sessions";
 /// `PAYMENT_METHODS_PATH/{payment_method_id}/charges` charges one; DELETE
 /// `PAYMENT_METHODS_PATH/{payment_method_id}` revokes it.
 pub const PAYMENT_METHODS_PATH: &str = "/merchant-api/payment-methods";
+
+/// The canonical path of payments. POST
+/// `PAYMENTS_PATH/{transaction_id}/refunds` refunds one; GET
+/// `PAYMENTS_PATH/{transaction_id}/refunds/{refund_id}` reads a refund back.
+pub const PAYMENTS_PATH: &str = "/merchant-api/payments";
 
 /// The credentials-and-clock smoke test. Creates nothing.
 pub const PING_PATH: &str = "/merchant-api/ping";
@@ -361,12 +366,7 @@ impl Client {
     /// the session asked for one with [`CheckoutSessionRequest::save_card`] and
     /// the payment was approved; `None` otherwise.
     pub fn get_status(&self, transaction_id: &str) -> Result<CheckoutStatus> {
-        let normalized = transaction_id.trim().to_lowercase();
-        if !is_uuid(&normalized) {
-            return Err(Error::validation(
-                "transaction_id must be the UUID returned by create_checkout_session",
-            ));
-        }
+        let normalized = normalize_transaction_id(transaction_id)?;
 
         // GET signs an EMPTY idempotency key and an EMPTY body, and sends no
         // Idempotency-Key header.
@@ -490,6 +490,62 @@ impl Client {
             return Err(Error::revoke(reply.status, code, message, reply.envelope));
         }
         Err(reply.rejection())
+    }
+
+    /// Refunds a payment, in full or in part. Answers HTTP 202 with the refund
+    /// queued, not done: read it back with [`Client::get_refund`], or wait for
+    /// the `payment.refunded` webhook, which fires once the money has moved. A
+    /// failed refund sends no webhook.
+    ///
+    /// `transaction_id` is the id [`Client::create_checkout_session`] or
+    /// [`Client::charge_payment_method`] returned. The refund carries the
+    /// request's required `Idempotency-Key`, signed like a charge: the same key
+    /// answers the same refund and never refunds twice, so after a timeout or a
+    /// 500 resend it WITH THE SAME KEY. A replay answers 202 with the refund as
+    /// it stands now.
+    ///
+    /// Errors it returns:
+    /// - [`Error::Validation`]: bad arguments; nothing was sent.
+    /// - [`Error::Auth`]: wrong credentials, bad signature, clock off, IP not
+    ///   allowlisted.
+    /// - [`Error::Api`]: the gateway refused with one of the
+    ///   [`refund_error_code`](crate::refund_error_code) constants, e.g. 422
+    ///   `REFUND_AMOUNT_EXCEEDED` or 409 `DUPLICATE_REQUEST`; branch on
+    ///   [`Error::code`].
+    /// - [`Error::RateLimited`]: HTTP 429. Wait, then send it again with the
+    ///   same idempotency key.
+    /// - [`Error::Transport`]: network failure or 5xx; nothing was queued on a
+    ///   500. Safe to retry WITH the same idempotency key.
+    pub fn create_refund(&self, transaction_id: &str, request: &RefundRequest) -> Result<Refund> {
+        let transaction_id = normalize_transaction_id(transaction_id)?;
+        let (idempotency_key, body) = prepare_refund_request(request)?;
+        let path = format!("{PAYMENTS_PATH}/{transaction_id}/refunds");
+        let payload = self.request("POST", &path, &body, &idempotency_key)?;
+        parse_refund(payload, 202)
+    }
+
+    /// Reads one refund of a payment: `transaction_id` is the payment,
+    /// `refund_id` the [`Refund::refund_id`] that [`Client::create_refund`]
+    /// returned.
+    ///
+    /// Right after a 202 the refund may not be picked up yet, which answers
+    /// [`Error::Api`] with status 404 and code
+    /// [`REFUND_NOT_FOUND`](crate::refund_error_code::REFUND_NOT_FOUND): read it
+    /// again for up to 60 seconds. `PAYMENT_NOT_FOUND` (404) is a payment that
+    /// is not yours. Poll at a sane pace; the rate limits of
+    /// [`Client::get_status`] apply here too.
+    pub fn get_refund(&self, transaction_id: &str, refund_id: &str) -> Result<Refund> {
+        let transaction_id = normalize_transaction_id(transaction_id)?;
+        let refund_id = normalize_opaque_id(
+            refund_id,
+            "refund_id must be the refund_id returned by create_refund",
+        )?;
+
+        // GET signs an EMPTY idempotency key and an EMPTY body, and sends no
+        // Idempotency-Key header.
+        let path = format!("{PAYMENTS_PATH}/{transaction_id}/refunds/{refund_id}");
+        let payload = self.request("GET", &path, "", "")?;
+        parse_refund(payload, 200)
     }
 
     /// Signs and sends one call, and maps the response onto the error taxonomy:
@@ -860,6 +916,38 @@ fn prepare_charge_request(request: &ChargeRequest) -> Result<(String, String)> {
     Ok((idempotency_key, body))
 }
 
+/// `prepare_charge_request` for a refund: the amount is optional, but when it
+/// is there it follows the same rule, and the body carries no `amount` key at
+/// all for a refund of everything still refundable.
+fn prepare_refund_request(request: &RefundRequest) -> Result<(String, String)> {
+    if matches!(request.amount, Some(amount) if amount <= 0) {
+        return Err(Error::validation(
+            "amount must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR), or None to refund everything still refundable",
+        ));
+    }
+    let idempotency_key = request.idempotency_key.as_str().to_string();
+
+    let body = serde_json::to_string(request).map_err(|error| {
+        Error::validation(format!(
+            "Request parameters are not JSON-encodable: {error}"
+        ))
+    })?;
+
+    Ok((idempotency_key, body))
+}
+
+/// The refund object in `data`, on the 202 and the status read alike.
+fn parse_refund(payload: Value, http_status: u16) -> Result<Refund> {
+    let mut refund: Refund = serde_json::from_value(payload.clone()).map_err(|_| {
+        Error::api(
+            http_status,
+            "The API returned an unexpected refund response",
+        )
+    })?;
+    refund.raw = payload;
+    Ok(refund)
+}
+
 /// The checks shared by every request that moves money: amount, currency,
 /// order reference.
 fn validate_money_params(amount: i64, currency: &str, order_reference: &str) -> Result<()> {
@@ -896,18 +984,36 @@ fn validate_money_params(amount: i64, currency: &str, order_reference: &str) -> 
 /// percent-encoding. The id goes into the signed canonical path verbatim, so
 /// anything else would sign one path and request another.
 fn normalize_payment_method_id(payment_method_id: &str) -> Result<String> {
-    let normalized = payment_method_id.trim();
+    normalize_opaque_id(
+        payment_method_id,
+        "payment_method_id must be the payment_method.id from get_status",
+    )
+}
+
+/// The single-path-segment rule of [`normalize_payment_method_id`], for any
+/// opaque id (`pm_...`, `re_...`) that goes into a signed path.
+fn normalize_opaque_id(id: &str, problem: &str) -> Result<String> {
+    let normalized = id.trim();
     let well_formed = !normalized.is_empty()
         && normalized.len() <= 100
         && normalized
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
     if !well_formed {
-        return Err(Error::validation(
-            "payment_method_id must be the payment_method.id from get_status",
-        ));
+        return Err(Error::validation(problem));
     }
     Ok(normalized.to_string())
+}
+
+/// A transaction id goes into the signed path in lowercase hyphenated form.
+fn normalize_transaction_id(transaction_id: &str) -> Result<String> {
+    let normalized = transaction_id.trim().to_lowercase();
+    if !is_uuid(&normalized) {
+        return Err(Error::validation(
+            "transaction_id must be the UUID returned by create_checkout_session",
+        ));
+    }
+    Ok(normalized)
 }
 
 fn string_field(value: &Value, field: &str) -> Option<String> {
