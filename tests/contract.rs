@@ -14,7 +14,10 @@
 //! status, a retired card and its reason, a 201 charge, a 402 decline, every
 //! coded charge and revoke error, the bodiless revoke) match too, and the
 //! storefront codes come back as API errors with their status, never as
-//! refusals. Every example is pushed through the client
+//! refusals. The refund routes are pinned the same way: their status, error
+//! and failure vocabularies, the refund's field set, and every example (a
+//! partial and a full 202, a succeeded and a failed status read, every error)
+//! through `create_refund` and `get_refund`. Every example is pushed through the client
 //! twice: as spelled, and with its null members removed, because the gateway
 //! omits null fields on the wire.
 
@@ -30,10 +33,11 @@ use serde::forward_to_deserialize_any;
 use serde_json::Value;
 
 use dominaite::{
-    charge_error_code, charge_status, decline_class, retired_reason, revoke_error_code,
-    session_error_code, status, stored_payment_method_status, ChargeRequest, CheckoutSession,
-    CheckoutSessionRequest, CheckoutStatus, Client, Error, IdempotencyKey, PaymentMethodCharge,
-    Ping, StoredPaymentMethod,
+    charge_error_code, charge_status, decline_class, refund_error_code, refund_failure_code,
+    refund_status, retired_reason, revoke_error_code, session_error_code, status,
+    stored_payment_method_status, ChargeRequest, CheckoutSession, CheckoutSessionRequest,
+    CheckoutStatus, Client, Error, IdempotencyKey, PaymentMethodCharge, Ping, Refund,
+    RefundRequest, StoredPaymentMethod,
 };
 use support::{MockServer, Reply};
 
@@ -991,5 +995,215 @@ fn the_revoke_not_found_example_is_a_validation_error_api_error() {
         assert!(matches!(error, Error::Api { .. }), "{form}: {error:?}");
         assert_eq!(error.http_status(), Some(404), "{form}");
         assert_eq!(error.code(), Some("VALIDATION_ERROR"), "{form}");
+    }
+}
+
+const REFUNDED_TRANSACTION_ID: &str = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+
+fn refund_request() -> RefundRequest {
+    RefundRequest::new(idempotency_key("return-7731"))
+}
+
+#[test]
+fn the_refund_vocabularies_are_exactly_the_contracts() {
+    let contract = contract();
+    assert_eq!(
+        refund_status::ALL.to_vec(),
+        strings(&contract["refundStatusVocabulary"]),
+        "the SDK refund status vocabulary drifted from the contract"
+    );
+    assert_eq!(
+        refund_error_code::ALL.to_vec(),
+        strings(&contract["refundErrorCodes"]),
+        "the SDK refund error codes drifted from the contract"
+    );
+    assert_eq!(
+        refund_failure_code::ALL.to_vec(),
+        strings(&contract["refundFailureCodes"]),
+        "the SDK refund failure codes drifted from the contract"
+    );
+}
+
+#[test]
+fn the_refund_endpoints_match_the_contract() {
+    let create = endpoint("createRefund");
+    assert_eq!(create["method"], "POST");
+    assert_eq!(
+        create["path"],
+        "/merchant-api/payments/{transactionId}/refunds"
+    );
+    assert_eq!(create["httpStatus"], 202);
+    assert_fields::<Refund>("Refund", &strings(&create["fields"]));
+
+    let read = endpoint("getRefund");
+    assert_eq!(read["method"], "GET");
+    assert_eq!(
+        read["path"],
+        "/merchant-api/payments/{transactionId}/refunds/{refundId}"
+    );
+    assert_eq!(read["httpStatus"], 200);
+    assert_fields::<Refund>("Refund", &strings(&read["fields"]));
+
+    // The examples omit null fields, as the wire does, so each carries a subset
+    // of the declared fields and never anything else.
+    let declared = strings(&create["fields"]);
+    for (name, example) in [
+        ("partialExample", &create["partialExample"]),
+        ("fullExample", &create["fullExample"]),
+        ("succeededExample", &read["succeededExample"]),
+        ("failedExample", &read["failedExample"]),
+    ] {
+        for key in keys(&example["data"]) {
+            assert!(declared.contains(&key), "{name} carries undeclared {key}");
+        }
+    }
+}
+
+#[test]
+fn every_contract_refund_status_round_trips_with_its_terminal_verdict() {
+    let data = endpoint("getRefund")["succeededExample"]["data"].clone();
+    for value in strings(&contract()["refundStatusVocabulary"]) {
+        let mut payload = data.clone();
+        payload["status"] = Value::String(value.clone());
+        let refund: Refund = serde_json::from_value(payload).expect("deserializes");
+        assert_eq!(refund.status, value);
+        assert_eq!(
+            refund.is_terminal(),
+            value == refund_status::SUCCEEDED || value == refund_status::FAILED,
+            "{value}"
+        );
+        assert_eq!(
+            refund.is_succeeded(),
+            value == refund_status::SUCCEEDED,
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn the_create_refund_examples_come_back_as_pending_refunds() {
+    let create = endpoint("createRefund");
+    for (example, amount, currency) in [
+        ("partialExample", Some(2500), "EUR"),
+        ("fullExample", None, "HUF"),
+    ] {
+        for (form, body) in both_wire_forms(&create[example]) {
+            let label = format!("{example} ({form})");
+            let server = MockServer::start(vec![Reply::Json(202, body.to_string())]);
+            let refund = client_for(&server)
+                .create_refund(REFUNDED_TRANSACTION_ID, &refund_request())
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+
+            assert_eq!(refund.refund_id, create[example]["data"]["refundId"]);
+            assert_eq!(refund.transaction_id, REFUNDED_TRANSACTION_ID);
+            assert_eq!(refund.status, refund_status::PENDING, "{label}");
+            assert_eq!(refund.amount, amount, "{label}");
+            assert_eq!(refund.currency, currency, "{label}");
+            assert_eq!(refund.failure_code, None, "{label}");
+            assert_eq!(refund.failure_message, None, "{label}");
+            assert_eq!(refund.completed_at, None, "{label}");
+            assert!(!refund.is_terminal(), "{label}");
+            assert_eq!(
+                refund.raw, body["data"],
+                "{label}: raw is the refund object"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_get_refund_examples_come_back_succeeded_and_failed() {
+    let read = endpoint("getRefund");
+
+    for (form, body) in both_wire_forms(&read["succeededExample"]) {
+        let server = MockServer::start(vec![Reply::Json(200, body.to_string())]);
+        let refund = client_for(&server)
+            .get_refund(
+                REFUNDED_TRANSACTION_ID,
+                "re_7c1e9a2b4d6f48a0b3c5d7e9f1a2b3c4",
+            )
+            .unwrap_or_else(|error| panic!("succeeded ({form}): {error}"));
+        assert!(refund.is_succeeded(), "{form}");
+        assert!(refund.is_terminal(), "{form}");
+        assert_eq!(refund.amount, Some(2500), "{form}");
+        assert_eq!(refund.currency, "EUR", "{form}");
+        assert_eq!(
+            refund.completed_at.as_deref(),
+            Some("2026-09-26T10:05:40.1200000Z"),
+            "{form}"
+        );
+        assert_eq!(refund.failure(), None, "{form}");
+    }
+
+    for (form, body) in both_wire_forms(&read["failedExample"]) {
+        let server = MockServer::start(vec![Reply::Json(200, body.to_string())]);
+        let refund = client_for(&server)
+            .get_refund(
+                REFUNDED_TRANSACTION_ID,
+                "re_9e3a1c4d6f8b40c2d5e7f9a1b3c4d5e6",
+            )
+            .unwrap_or_else(|error| panic!("failed ({form}): {error}"));
+        assert_eq!(refund.status, refund_status::FAILED, "{form}");
+        assert!(refund.is_terminal(), "{form}");
+        // A failed refund never carries an amount.
+        assert_eq!(refund.amount, None, "{form}");
+        assert_eq!(
+            refund.failure_code.as_deref(),
+            Some(refund_failure_code::REFUND_FAILED),
+            "{form}"
+        );
+        assert_eq!(
+            refund.failure(),
+            Some(refund_failure_code::REFUND_FAILED),
+            "{form}"
+        );
+        assert_eq!(
+            refund.failure_message.as_deref(),
+            read["failedExample"]["data"]["failureMessage"].as_str(),
+            "{form}"
+        );
+    }
+}
+
+#[test]
+fn every_refund_error_example_comes_back_as_an_api_error_with_its_code() {
+    let codes = strings(&contract()["refundErrorCodes"]);
+
+    for (route, read) in [("createRefund", false), ("getRefund", true)] {
+        let examples = endpoint(route)["errorExamples"].clone();
+        let examples = examples.as_array().expect("an array");
+        assert!(!examples.is_empty(), "{route} lists error examples");
+
+        for example in examples {
+            let http_status = example["httpStatus"].as_u64().expect("a status") as u16;
+            let code = example["code"].as_str().expect("a code");
+            assert!(codes.contains(&code.to_string()), "{code} is a listed code");
+            assert_eq!(example["body"]["error"]["code"], code);
+
+            for (form, body) in both_wire_forms(&example["body"]) {
+                let label = format!("{route} {code} ({http_status}, {form})");
+                let server = MockServer::start(vec![Reply::Json(http_status, body.to_string())]);
+                let client = client_for(&server);
+                let error = if read {
+                    client.get_refund(
+                        REFUNDED_TRANSACTION_ID,
+                        "re_7c1e9a2b4d6f48a0b3c5d7e9f1a2b3c4",
+                    )
+                } else {
+                    client.create_refund(REFUNDED_TRANSACTION_ID, &refund_request())
+                }
+                .expect_err(&label);
+
+                assert!(!error.is_retryable(), "{label}");
+                assert_eq!(error.http_status(), Some(http_status), "{label}");
+                assert_eq!(error.code(), Some(code), "{label}");
+                match error {
+                    Error::Api { message, .. } => {
+                        assert_eq!(message, example["body"]["error"]["message"], "{label}")
+                    }
+                    other => panic!("{label}: expected an API error, got {other:?}"),
+                }
+            }
+        }
     }
 }
