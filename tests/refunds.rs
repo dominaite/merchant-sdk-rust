@@ -127,7 +127,7 @@ fn a_full_refund_sends_no_amount_key_at_all() {
     assert_eq!(recorded.header("Idempotency-Key"), Some(REFUND_KEY));
     assert_signature_matches(&recorded, &refunds_path(), REFUND_KEY);
 
-    // A full refund reads no amount until it succeeds.
+    // A pending full refund reads no amount yet.
     assert_eq!(refund.amount, None);
     assert_eq!(refund.status, refund_status::PENDING);
 }

@@ -727,9 +727,10 @@ pub struct Refund {
     /// One of the [`refund_status`] constants. Compare with
     /// [`Refund::is_succeeded`] and [`Refund::is_terminal`] rather than by hand.
     pub status: String,
-    /// MINOR units. Before success, the amount requested (`None` for a refund of
-    /// everything still refundable); on `succeeded`, the amount actually
-    /// refunded; always `None` on `failed`.
+    /// MINOR units. On `pending`, the amount requested (`None` for a refund of
+    /// everything still refundable); on `processing`, the amount being refunded
+    /// (`None` until such a refund has been sized); on `succeeded`, the amount
+    /// actually refunded; always `None` on `failed`.
     #[serde(default)]
     pub amount: Option<i64>,
     /// ISO 4217 code of the payment. A refund is always in the payment's

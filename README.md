@@ -472,8 +472,9 @@ if refund.is_succeeded() {
 
 `Refund` carries `refund_id` (`re_` plus 32 hex), `transaction_id`, `status`, `amount`,
 `currency`, `failure_code`, `failure_message` and `completed_at`. The optional ones are `None`
-when the gateway leaves them out. `amount` is the amount requested until the refund succeeds
-(`None` for a full refund), the amount actually refunded once it has, and always `None` on
+when the gateway leaves them out. `amount` is the amount requested while `pending`
+(`None` for a full refund), the amount being refunded while `processing` (`None` until a full
+refund has been sized), the amount actually refunded once it has succeeded, and always `None` on
 `failed`. `failure()` reads `failure_code` on a failed refund and treats an unknown code as
 `REFUND_FAILED`.
 
