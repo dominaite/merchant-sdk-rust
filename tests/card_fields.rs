@@ -155,8 +155,8 @@ fn the_fields_example_comes_back_with_integration_and_client_secret() {
         session.transaction_id,
         "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d"
     );
-    assert_eq!(session.cashier_key, "ck_live_blox_8c7d6e5f4a3b2c1d");
-    assert_eq!(session.cashier_token, "ctok_blox_0a1b2c3d4e5f6a7b");
+    assert_eq!(session.cashier_key, "ck_live_fields_8c7d6e5f4a3b2c1d");
+    assert_eq!(session.cashier_token, "ctok_fields_0a1b2c3d4e5f6a7b");
 }
 
 #[test]
