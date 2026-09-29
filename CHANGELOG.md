@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.2 (unreleased)
+
+- Card fields: `CheckoutSessionRequest::integration(Integration)` (`Integration::Widget` or
+  `Integration::Fields`, omitted when not set), and `CheckoutSession::integration` and
+  `CheckoutSession::client_secret` on the response. `client_secret` is `Some` only for fields
+  sessions. Card fields are enabled per merchant on request; see the README.
+- Contract fixture: `integrationVocabulary`, the two new checkout fields and a fields session
+  example.
+
 ## 0.3.1
 
 - `WebhookEvent` parses a verified webhook body: `id`, `event_type`, `api_version` (`None` when
