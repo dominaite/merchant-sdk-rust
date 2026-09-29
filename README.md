@@ -312,6 +312,47 @@ A session is valid for about 2 hours. If the payer comes back later, create a ne
 re-rendering the widget for a stored session, read the status first: a completed session's
 widget shows "session is closed or expired", which reads as an error to someone who just paid.
 
+## Card fields
+
+Card fields put the card form in your own page instead of the hosted widget. They are enabled
+per merchant on request: ask Dominaite support. On an account without them,
+`Integration::Fields` is an `Error::Api` with HTTP status 400 and code `INVALID_SELECTION`.
+
+Ask for them when you create the session:
+
+```rust
+use dominaite::Integration;
+
+let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042", key)
+    .integration(Integration::Fields); // not set = Integration::Widget
+let session = client.create_checkout_session(&request)?;
+```
+
+`session.integration` echoes what the session was created for. A fields session also carries
+`client_secret`, the browser credential for that one session. Hand `transaction_id`,
+`integration`, `cashier_key`, `cashier_token` and `client_secret` to the payment page, escaped
+like any templated value, and never log the secret. The integration is part of the idempotency
+identity: the same key with a different integration is `IDEMPOTENCY_KEY_REUSED`.
+
+```html
+<div id="checkout"></div>
+<script src="https://pay.dominaite.com/v1/checkout.js"></script>
+<script>
+  const checkout = Dominaite.checkout({
+    transactionId: "TRANSACTION_ID_FROM_SESSION",
+    integration: "fields",
+    cashierKey: "CASHIER_KEY_FROM_SESSION",
+    cashierToken: "CASHIER_TOKEN_FROM_SESSION",
+    clientSecret: "CLIENT_SECRET_FROM_SESSION",
+  })
+  checkout.on("success", () => { /* show the thank-you screen */ })
+  checkout.mount("#checkout")
+</script>
+```
+
+Browser events are for the payer's screen only. Mark the order paid only from the
+`payment.succeeded` webhook or a `get_status` read, exactly as with the widget.
+
 ## Stored payment methods (recurring)
 
 A session can ask the payer to save their card for later. Set `save_card(true)` on the request;
