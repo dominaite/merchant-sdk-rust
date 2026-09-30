@@ -62,7 +62,7 @@ pub use signing::{sha256_hex, sign_request, SignRequest};
 pub use types::{
     charge_status, decline_class, refund_failure_code, refund_status, retired_reason, status,
     stored_payment_method_status, ChargeRequest, CheckoutSession, CheckoutSessionRequest,
-    CheckoutStatus, Customer, PaymentMethodCharge, Ping, Refund, RefundRequest,
+    CheckoutStatus, Customer, Integration, PaymentMethodCharge, Ping, Refund, RefundRequest,
     StoredPaymentMethod,
 };
 pub use webhooks::{

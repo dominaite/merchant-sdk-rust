@@ -319,7 +319,7 @@ fn the_create_envelope_carries_exactly_the_contract_fields() {
     let mut expected = strings(&create["fields"]);
     expected.sort();
 
-    for example in ["successExample", "refusalExample"] {
+    for example in ["successExample", "fieldsSuccessExample", "refusalExample"] {
         let mut keys: Vec<String> = create[example]
             .as_object()
             .expect("an object")

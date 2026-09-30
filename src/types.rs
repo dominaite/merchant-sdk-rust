@@ -106,6 +106,14 @@ pub struct CheckoutSessionRequest {
     /// last four digits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub save_card: Option<bool>,
+    /// How the payer enters the card: [`Integration::Widget`] (the default when
+    /// `None`) or [`Integration::Fields`], card fields in your own page. Card
+    /// fields are enabled per merchant on request; asking for them on an account
+    /// without them is a 400 `INVALID_SELECTION`. Part of the idempotency
+    /// identity: replaying a key with a different integration is
+    /// `IDEMPOTENCY_KEY_REUSED`. `None` sends no integration field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration: Option<Integration>,
 
     /// Required. It travels in the header and in the signature, never in the
     /// body. Retrying with the same key never creates a second payment, so on a
@@ -140,6 +148,7 @@ impl CheckoutSessionRequest {
             theme: None,
             description: None,
             save_card: None,
+            integration: None,
             idempotency_key,
             extra: Map::new(),
         }
@@ -182,6 +191,13 @@ impl CheckoutSessionRequest {
         self
     }
 
+    /// Picks the widget or card fields. See
+    /// [`CheckoutSessionRequest::integration`].
+    pub fn integration(mut self, value: Integration) -> Self {
+        self.integration = Some(value);
+        self
+    }
+
     /// Adds a body field this struct does not model yet.
     pub fn extra(mut self, key: impl Into<String>, value: Value) -> Self {
         self.extra.insert(key.into(), value);
@@ -213,10 +229,46 @@ pub struct CheckoutSession {
     /// ISO 8601. Sessions are valid for about 2 hours.
     #[serde(default)]
     pub expires_at: Option<String>,
+    /// What the session was created for: `"widget"` or `"fields"` (compare with
+    /// [`Integration::as_str`]). Kept as a string so a value this crate does not
+    /// know yet still parses. For fields, `cashier_key` and `cashier_token` are
+    /// the card fields key and session token.
+    #[serde(default)]
+    pub integration: String,
+    /// Set only for [`Integration::Fields`]: the browser credential the
+    /// checkout.js drop-in sends for this session. Opaque, at most 128
+    /// characters, the same on every replay. Hand it to the payer's page with
+    /// the other session values; never log it or keep it past the session.
+    #[serde(default)]
+    pub client_secret: Option<String>,
 
     /// The unparsed payload, for fields this struct does not model yet.
     #[serde(skip)]
     pub raw: Value,
+}
+
+/// How the payer enters the card on a checkout session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Integration {
+    /// The hosted cashier widget. The default.
+    Widget,
+    /// Card fields rendered in your own page by the checkout.js drop-in.
+    /// Enabled per merchant on request.
+    Fields,
+}
+
+impl Integration {
+    /// The whole vocabulary, in the order the canonical contract lists it.
+    pub const ALL: [Integration; 2] = [Integration::Widget, Integration::Fields];
+
+    /// The wire value: `"widget"` or `"fields"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Integration::Widget => "widget",
+            Integration::Fields => "fields",
+        }
+    }
 }
 
 /// Transaction status wire values returned by
