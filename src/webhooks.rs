@@ -300,6 +300,12 @@ pub struct PaymentEventData {
     /// The hosted checkout order id; `None` off the hosted path.
     #[serde(default)]
     pub order_id: Option<String>,
+    /// The payment processor's reference for the transaction. `None` until it
+    /// is known, and on a sale settled by reconciliation without a processor
+    /// webhook. Refund and cancel events carry the original sale's reference.
+    /// Older gateways omit it.
+    #[serde(default)]
+    pub psp_reference: Option<String>,
     /// The description you sent on create session.
     #[serde(default)]
     pub description: Option<String>,

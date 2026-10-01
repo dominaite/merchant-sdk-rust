@@ -26,6 +26,31 @@ fn status_ok() -> Reply {
     )
 }
 
+fn status_with(extra: &str) -> Reply {
+    Reply::enveloped(&format!(
+        r#"{{"transactionId":"11111111-1111-4111-8111-111111111111","orderId":"dom_42","orderReference":"order-1042","status":"succeeded","amount":2500,"currency":"EUR"{extra}}}"#
+    ))
+}
+
+#[test]
+fn get_status_reads_psp_reference_when_set_and_none_when_null_or_absent() {
+    for (extra, expected) in [
+        (r#","pspReference":"psp_8841""#, Some("psp_8841")),
+        (r#","pspReference":null"#, None),
+        ("", None),
+    ] {
+        let server = MockServer::start(vec![status_with(extra)]);
+        let status = client_for(&server)
+            .get_status(TRANSACTION_ID)
+            .expect("status read");
+        assert_eq!(
+            status.psp_reference.as_deref(),
+            expected,
+            "body tail: {extra}"
+        );
+    }
+}
+
 /// A refusal is an HTTP 200 whose unwrapped payload says success: false.
 fn refusal(code: &str) -> Reply {
     Reply::enveloped(&format!(
