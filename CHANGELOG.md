@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 (unreleased)
+## 0.4.0
 
 - Card fields: `CheckoutSessionRequest::integration(Integration)` (`Integration::Widget` or
   `Integration::Fields`, omitted when not set), and `CheckoutSession::integration` and
