@@ -6,9 +6,11 @@
   `Integration::Fields`, omitted when not set), and `CheckoutSession::integration` and
   `CheckoutSession::client_secret` on the response. `client_secret` is `Some` only for fields
   sessions. Card fields are enabled per merchant on request; see the README.
-- `psp_reference`: optional, on `CheckoutStatus` and `PaymentEventData` (`data.pspReference` on
-  `payment.*` webhooks). The processor's reference for the transaction, `None` until known or
-  from gateways that predate it. Not sent on `charge.*` events.
+- Processor reference: `CheckoutStatus::psp_reference` and `PaymentEventData::psp_reference`. The
+  payment processor's reference for the transaction, `None` until known and on a sale settled by
+  reconciliation without a processor webhook. Refund and cancel events carry the original sale's
+  reference. Not on `charge.*` events.
+- Contract fixture: `pspReference` in the status read fields and examples.
 - Contract fixture: `integrationVocabulary`, the two new checkout fields and a fields session
   example.
 
