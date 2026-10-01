@@ -126,6 +126,7 @@
         "transactionId",
         "orderId",
         "orderReference",
+        "pspReference",
         "status",
         "amount",
         "currency",

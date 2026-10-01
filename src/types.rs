@@ -326,6 +326,11 @@ pub struct CheckoutStatus {
     /// Your own order id, echoed back.
     #[serde(default)]
     pub order_reference: Option<String>,
+    /// The payment processor's reference for the transaction. `None` until it
+    /// is known, and on a sale settled by reconciliation without a processor
+    /// webhook. Older gateways omit it.
+    #[serde(default)]
+    pub psp_reference: Option<String>,
     /// One of the [`status`] constants. Compare with [`CheckoutStatus::is_paid`]
     /// rather than by hand.
     pub status: String,

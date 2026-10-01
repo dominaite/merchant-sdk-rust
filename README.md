@@ -620,7 +620,7 @@ fields you do not recognise. A redelivery keeps the `apiVersion` of its first at
 `event.payment_data()` types `data` on `payment.*` events as `PaymentEventData`
 (`transaction_id`, `status`, `previous_status`, `kind`, `amount`, `gross_amount`,
 `surcharge_amount`, `currency`, `payment_method`, `wallet_type`, `original_transaction_id`,
-`idempotency_key`, `order_reference`, `order_id`, `description`, `payment_method_brand`,
+`idempotency_key`, `order_reference`, `order_id`, `psp_reference`, `description`, `payment_method_brand`,
 `payment_method_last4`, `stored_payment_method`) and is `None` on other event types. Webhooks
 spell unset values as explicit `null`; they read as `None`, the same as a missing field.
 
@@ -818,3 +818,5 @@ and use a fresh key.
 - `order_reference` - your own id, echoed back. This is what you search for in your dashboard,
   so put your order or cart id there.
 - `order_id` (`dom_...`) - the provider-facing correlation id. You never need it.
+- `psp_reference` - the payment processor's reference for the transaction, on `get_status` and
+  `payment.*` webhooks. `None` until known; refund and cancel events carry the original sale's.
