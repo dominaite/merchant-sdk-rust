@@ -592,6 +592,10 @@ Flat JSON, no `success` wrapper - do not branch on a `success` field, there isn'
   "createdAt": "<ISO 8601 UTC instant of the transition>",
   "data": {
     "transactionId": "...",
+    "orderReference": "order-123",
+    "orderId": "dom_0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+    "pspReference": "...",
+    "description": "Pro plan",
     "status": "succeeded",
     "previousStatus": "pending",
     "kind": "sale",
@@ -599,6 +603,10 @@ Flat JSON, no `success` wrapper - do not branch on a `success` field, there isn'
     "grossAmount": 8701,
     "surchargeAmount": 261,
     "currency": "EUR",
+    "paymentMethod": "card",
+    "walletType": null,
+    "paymentMethodBrand": "visa",
+    "paymentMethodLast4": "4242",
     "originalTransactionId": null,
     "idempotencyKey": "order-123"
   }
@@ -608,6 +616,16 @@ Flat JSON, no `success` wrapper - do not branch on a `success` field, there isn'
 Amounts are minor units. On `payment.*` events `amount` is what you are PAID (base), while
 `grossAmount` is the card movement; on `payment.refunded` the `amount` is what went back to the
 customer. `surchargeAmount`, `previousStatus`, `kind` and `originalTransactionId` are nullable.
+
+Every `payment.*` event carries the same identification fields. `orderReference` is your own
+order reference, the field to match deliveries to orders on; it is null for payments not
+started through the API, and refund and cancel events carry the original payment's.
+`orderId` is the hosted checkout order id, null on refunds, cancellations and payments outside
+hosted checkout. `pspReference` is the payment processor's reference, null until the processor
+reports it (read `get_status` later to pick it up); refund and cancel events carry the original
+sale's. `description` is what you sent on create session, null on refunds and cancellations.
+`paymentMethodBrand` and `paymentMethodLast4` are filled once a card payment was attempted and
+null otherwise. `idempotencyKey` is null on refund and dispute events.
 
 `apiVersion` is the dated version of the payload shape the event was rendered in, currently
 `2026-09-25`. Fields are only ever added under a version, never renamed or removed, so ignore
