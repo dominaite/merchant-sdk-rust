@@ -33,11 +33,11 @@ use serde::forward_to_deserialize_any;
 use serde_json::Value;
 
 use dominaite::{
-    charge_error_code, charge_status, decline_class, refund_error_code, refund_failure_code,
-    refund_status, retired_reason, revoke_error_code, session_error_code, status,
-    stored_payment_method_status, ChargeRequest, CheckoutSession, CheckoutSessionRequest,
-    CheckoutStatus, Client, Error, IdempotencyKey, PaymentMethodCharge, Ping, Refund,
-    RefundRequest, StoredPaymentMethod,
+    charge_error_code, charge_status, decline_class, payment_method, refund_error_code,
+    refund_failure_code, refund_status, retired_reason, revoke_error_code, session_error_code,
+    status, stored_payment_method_status, wallet_type, ChargeRequest, CheckoutSession,
+    CheckoutSessionRequest, CheckoutStatus, Client, Error, IdempotencyKey, PaymentMethodCharge,
+    Ping, Refund, RefundRequest, StoredPaymentMethod,
 };
 use support::{MockServer, Reply};
 
@@ -295,6 +295,11 @@ fn get_status_matches_the_contract() {
     // Null in the example, and null is not zero: nothing was refunded, and the
     // SDK must not invent a 0 that reads as "a refund of nothing happened".
     assert_eq!(parsed.refunded_amount, None);
+    assert_eq!(
+        parsed.payment_method.as_deref(),
+        Some(payment_method::WALLET)
+    );
+    assert_eq!(parsed.wallet_type.as_deref(), Some(wallet_type::APPLE_PAY));
     assert_eq!(
         parsed.created_at.as_deref(),
         Some("2026-08-21T09:15:30.000Z")
@@ -616,6 +621,50 @@ fn every_contract_storefront_code_comes_back_as_an_api_error_with_its_status() {
             matches!(error, Error::Api { .. }),
             "{code} is not a refused payment: got {error:?}"
         );
+    }
+}
+
+#[test]
+fn a_wallet_the_sdk_does_not_know_yet_still_reads_as_a_wallet() {
+    let mut example = endpoint("getStatus")["example"].clone();
+    example["walletType"] = Value::String("some_new_pay".to_string());
+
+    for (form, example) in both_wire_forms(&example) {
+        let server = MockServer::start(vec![Reply::enveloped(&example.to_string())]);
+        let parsed = client_for(&server)
+            .get_status("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0")
+            .unwrap_or_else(|error| panic!("{form}: {error}"));
+        assert_eq!(
+            parsed.payment_method.as_deref(),
+            Some(payment_method::WALLET),
+            "{form}"
+        );
+        assert_eq!(
+            parsed.wallet_type.as_deref(),
+            Some("some_new_pay"),
+            "{form}"
+        );
+        assert!(!wallet_type::ALL.contains(&"some_new_pay"));
+    }
+}
+
+#[test]
+fn a_card_payment_reads_no_wallet_in_both_wire_forms() {
+    let mut example = endpoint("getStatus")["example"].clone();
+    example["paymentMethod"] = Value::String(payment_method::CARD.to_string());
+    example["walletType"] = Value::Null;
+
+    for (form, example) in both_wire_forms(&example) {
+        let server = MockServer::start(vec![Reply::enveloped(&example.to_string())]);
+        let parsed = client_for(&server)
+            .get_status("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0")
+            .unwrap_or_else(|error| panic!("{form}: {error}"));
+        assert_eq!(
+            parsed.payment_method.as_deref(),
+            Some(payment_method::CARD),
+            "{form}"
+        );
+        assert_eq!(parsed.wallet_type, None, "{form}");
     }
 }
 

@@ -718,6 +718,14 @@ way).
 awaiting capture, which is why `is_paid()` (settled) and `is_terminal()` (finished) both answer
 false for it. Never treat it as an abandoned order.
 
+`status.payment_method` says how the payer paid (`card`, `wallet`, `bank_transfer` or `sepa`,
+the `dominaite::payment_method` constants) and `status.wallet_type` which wallet (`apple_pay`,
+`google_pay`, `samsung_pay`, the `dominaite::wallet_type` constants). Both are `None` while the
+payment is open and on older transactions, and `wallet_type` is `None` for non-wallet payments.
+They are reporting data, not a money-flow switch: a wallet payment refunds, captures and
+disputes like a card, so do not branch payment handling on them. A `wallet_type` outside the
+constants is a wallet added after this release, still valid.
+
 Call this from your server, never from the browser, and poll after the payer returns to you or
 on your order timeout - not in a tight loop. The platform allows 60 requests per minute per API
 key and 120 per minute per IP; over that you get `Error::RateLimited`.

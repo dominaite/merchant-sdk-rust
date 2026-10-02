@@ -278,10 +278,12 @@ pub struct PaymentEventData {
     /// ISO 4217 currency.
     #[serde(default)]
     pub currency: Option<String>,
-    /// How the payer paid, as a category: `card`, `wallet`, ...
+    /// How the payer paid, one of the [`payment_method`](crate::payment_method)
+    /// constants.
     #[serde(default)]
     pub payment_method: Option<String>,
-    /// The wallet, e.g. `apple_pay`; set only for wallet payments.
+    /// The wallet, usually one of the [`wallet_type`](crate::wallet_type)
+    /// constants; set only for wallet payments. Unknown values are valid wallets.
     #[serde(default)]
     pub wallet_type: Option<String>,
     /// The transaction this one hangs off: the refunded payment on
