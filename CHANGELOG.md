@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Wallet reporting: `CheckoutStatus::payment_method` and `CheckoutStatus::wallet_type`, both
+  `Option<String>`. `None` while the payment is open and on older transactions; `wallet_type` is
+  `None` for non-wallet payments and keeps a wallet value it does not know. Reporting data only,
+  a wallet payment refunds and disputes like a card. New constants: `payment_method` (`card`,
+  `wallet`, `bank_transfer`, `sepa`) and `wallet_type` (`apple_pay`, `google_pay`,
+  `samsung_pay`), with `wallet_type::ALL` pinned against the gateway contract.
+- Contract fixtures: `paymentMethod` and `walletType` in the status read fields and examples,
+  and the `wallets` section in the wire contract.
+
 ## 0.4.0
 
 - Card fields: `CheckoutSessionRequest::integration(Integration)` (`Integration::Widget` or
