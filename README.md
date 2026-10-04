@@ -56,11 +56,10 @@ Set your credentials and the environment you are pointing at:
 ```sh
 export DOMINAITE_KEY_ID=dmk_...      # Website integration tab
 export DOMINAITE_SECRET=dms_...      # shown once when you generated the key
-# Dev: the payments function app, whose Azure Functions route prefix is /api.
-# Confirm the host for your environment before the first call.
-export DOMINAITE_BASE_URL=https://func-dom-gw-payments-dev-gwc-01.azurewebsites.net/api
 # Production needs no DOMINAITE_BASE_URL - the SDK defaults to
 # https://api.dominaite.com/payments
+# For a test environment, set it to that environment's base URL:
+# export DOMINAITE_BASE_URL=https://...
 ```
 
 A dev key against production is a guaranteed `INVALID_API_KEY`: keys are issued per
@@ -192,8 +191,9 @@ HMAC-SHA256 with your secret, UTF-8 throughout. Two things to get right:
 
 - GET signs an EMPTY idempotency key and an EMPTY body, and sends no `Idempotency-Key` header.
   The payload is still five lines.
-- The signed path NEVER includes the base URL's own prefix. On dev you POST to
-  `.../api/merchant-api/checkout/sessions` but you sign `/merchant-api/checkout/sessions`.
+- The signed path NEVER includes the base URL's own prefix. On production you POST to
+  `https://api.dominaite.com/payments/merchant-api/checkout/sessions` but you sign
+  `/merchant-api/checkout/sessions`.
 
 ## Ping before your first mint
 
