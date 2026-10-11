@@ -926,7 +926,17 @@ fn classify_status(
 /// second serialization would let key ordering or escaping drift between the
 /// signature and the wire.
 fn prepare_session_request(request: &CheckoutSessionRequest) -> Result<(String, String)> {
-    validate_money_params(request.amount, &request.currency, &request.order_reference)?;
+    if request.verify_only == Some(true) {
+        // The platform sets the verification amount, so the gateway takes 0 only.
+        if request.amount != 0 {
+            return Err(Error::validation(
+                "amount must be 0 with verify_only: the platform sets the verification amount",
+            ));
+        }
+        validate_order_params(&request.currency, &request.order_reference)?;
+    } else {
+        validate_money_params(request.amount, &request.currency, &request.order_reference)?;
+    }
     let idempotency_key = request.idempotency_key.as_str().to_string();
 
     let body = serde_json::to_string(request).map_err(|error| {
@@ -994,6 +1004,12 @@ fn validate_money_params(amount: i64, currency: &str, order_reference: &str) -> 
             "amount must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR)",
         ));
     }
+    validate_order_params(currency, order_reference)
+}
+
+/// Currency and order reference: the part of [`validate_money_params`] that a
+/// verify-only session, which moves no money, still needs.
+fn validate_order_params(currency: &str, order_reference: &str) -> Result<()> {
     if currency.trim().is_empty() {
         return Err(Error::validation("Missing required parameter: currency"));
     }

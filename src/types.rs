@@ -55,6 +55,42 @@ impl Customer {
     }
 }
 
+/// A customer's acceptance of the platform consent text for recurring
+/// charges, sent with a subscription session or an agreement.
+///
+/// All three fields are required together. `text_version` names a version of
+/// the PLATFORM consent text, never your own wording: the contract lists the
+/// published versions in `recurring.consentTextVersions` (today
+/// `recurring-2026-09`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Consent {
+    /// The version of the platform consent text your page showed the
+    /// customer, e.g. `recurring-2026-09`.
+    pub text_version: String,
+    /// When the customer accepted, ISO 8601 UTC, e.g. `2026-10-11T09:30:00Z`.
+    /// Not in the future.
+    pub accepted_at: String,
+    /// The customer's IPv4 or IPv6 address at acceptance.
+    pub ip: String,
+}
+
+impl Consent {
+    /// The customer accepted `text_version` at `accepted_at` (ISO 8601 UTC)
+    /// from `ip`.
+    pub fn new(
+        text_version: impl Into<String>,
+        accepted_at: impl Into<String>,
+        ip: impl Into<String>,
+    ) -> Consent {
+        Consent {
+            text_version: text_version.into(),
+            accepted_at: accepted_at.into(),
+            ip: ip.into(),
+        }
+    }
+}
+
 /// The parameters for [`Client::create_checkout_session`](crate::Client::create_checkout_session).
 ///
 /// `amount`, `currency`, `order_reference` and the idempotency key are required
@@ -69,13 +105,18 @@ impl Customer {
 /// let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042", key)
 ///     .customer(Customer::new().first_name("Ana").email("ana@example.com"))
 ///     .language("bg");
+///
+/// // Save a card with no payment: amount 0 and verify_only.
+/// let key = IdempotencyKey::new("verify-customer-77")?;
+/// let verify = CheckoutSessionRequest::new(0, "EUR", "customer-77", key).verify_only(true);
 /// # Ok(())
 /// # }
 /// ```
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckoutSessionRequest {
-    /// The amount in MINOR units: `2500` is 25.00 EUR. Integers only.
+    /// The amount in MINOR units: `2500` is 25.00 EUR. Integers only. Above 0,
+    /// except on a verify-only session, where it must be 0.
     pub amount: i64,
     /// ISO 4217 currency, e.g. `"EUR"`.
     pub currency: String,
@@ -91,10 +132,12 @@ pub struct CheckoutSessionRequest {
     /// ISO 639-1 widget UI language.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
-    /// `"light"`, `"dark"` or `"bright"`.
+    /// `"light"`, `"dark"` or `"bright"`, at most 20 characters. `None` keeps
+    /// your dashboard default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
-    /// Free-text description.
+    /// The payment description shown on the checkout page, at most 500
+    /// characters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Ask the gateway to keep the card on file once this payment is approved, so
@@ -114,6 +157,36 @@ pub struct CheckoutSessionRequest {
     /// `IDEMPOTENCY_KEY_REUSED`. `None` sends no integration field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integration: Option<Integration>,
+    /// Saves the payer's card with no payment. The checkout places a small
+    /// authorization, saves the card and releases the authorization; nobody is
+    /// charged. `amount` must be 0, the card is always saved, the integration
+    /// must be the widget, and `agreement_id` is refused. A non-null
+    /// [`CheckoutStatus::stored_payment_method`] is what says the card is
+    /// verified.
+    ///
+    /// Off until we switch it on for your account: before that, the session is
+    /// refused with [`Error::Forbidden`](crate::Error::Forbidden) and code
+    /// `VERIFY_ONLY_NOT_ENABLED`. [`IdempotencyKey::for_order`] needs an amount
+    /// above 0, so build the key with [`IdempotencyKey::new`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify_only: Option<bool>,
+    /// The `agr_` handle of a PENDING agreement. It makes this the subscription
+    /// session that takes the agreement's first payment, saves the card and
+    /// activates the agreement. Amount and currency must be the agreement's
+    /// own (on a plan with a trial only the currency is held).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agreement_id: Option<String>,
+    /// Only with `agreement_id`: the customer's acceptance of the platform
+    /// consent text. Required unless the agreement already carries consent
+    /// from its create call; when sent, it replaces what the agreement held.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consent: Option<Consent>,
+    /// The id of the storefront (online location) this payment belongs to.
+    /// `None` uses your default storefront, or your only active one. An id
+    /// that is not one of your storefronts is a 404; a key bound to one
+    /// storefront refuses a different id with `STOREFRONT_MISMATCH`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location_id: Option<String>,
 
     /// Required. It travels in the header and in the signature, never in the
     /// body. Retrying with the same key never creates a second payment, so on a
@@ -149,6 +222,10 @@ impl CheckoutSessionRequest {
             description: None,
             save_card: None,
             integration: None,
+            verify_only: None,
+            agreement_id: None,
+            consent: None,
+            location_id: None,
             idempotency_key,
             extra: Map::new(),
         }
@@ -195,6 +272,34 @@ impl CheckoutSessionRequest {
     /// [`CheckoutSessionRequest::integration`].
     pub fn integration(mut self, value: Integration) -> Self {
         self.integration = Some(value);
+        self
+    }
+
+    /// Saves the card with no payment; send amount 0. See
+    /// [`CheckoutSessionRequest::verify_only`].
+    pub fn verify_only(mut self, value: bool) -> Self {
+        self.verify_only = Some(value);
+        self
+    }
+
+    /// Takes the first payment of a pending agreement. See
+    /// [`CheckoutSessionRequest::agreement_id`].
+    pub fn agreement_id(mut self, value: impl Into<String>) -> Self {
+        self.agreement_id = Some(value.into());
+        self
+    }
+
+    /// Records the customer's consent with the agreement. See
+    /// [`CheckoutSessionRequest::consent`].
+    pub fn consent(mut self, value: Consent) -> Self {
+        self.consent = Some(value);
+        self
+    }
+
+    /// Attributes the payment to one of your storefronts. See
+    /// [`CheckoutSessionRequest::location_id`].
+    pub fn location_id(mut self, value: impl Into<String>) -> Self {
+        self.location_id = Some(value.into());
         self
     }
 
