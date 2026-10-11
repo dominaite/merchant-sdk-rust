@@ -8,8 +8,8 @@ use serde_json::Value;
 use crate::error::{session_error_code, Error, Result};
 use crate::signing::{sign_request, SignRequest};
 use crate::types::{
-    ChargeRequest, CheckoutSession, CheckoutSessionRequest, CheckoutStatus, PaymentMethodCharge,
-    Ping, Refund, RefundRequest,
+    ChargeRequest, CheckoutSession, CheckoutSessionRequest, CheckoutStatus, IntegrationContract,
+    PaymentMethodCharge, Ping, Refund, RefundRequest,
 };
 
 /// The production merchant API.
@@ -31,6 +31,9 @@ pub const PAYMENTS_PATH: &str = "/merchant-api/payments";
 
 /// The credentials-and-clock smoke test. Creates nothing.
 pub const PING_PATH: &str = "/merchant-api/ping";
+
+/// The machine-readable integration contract. GET only.
+pub const INTEGRATION_CONTRACT_PATH: &str = "/merchant-api/integration/contract";
 
 /// This SDK's version, reported in the User-Agent.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -253,6 +256,22 @@ impl Client {
             .map_err(|_| Error::api(200, "The API returned an unexpected ping response"))?;
         ping.raw = payload;
         Ok(ping)
+    }
+
+    /// Reads the machine-readable integration contract: the routes, fields,
+    /// vocabularies and error codes of this API version. Check
+    /// [`IntegrationContract::version`] in a startup or CI check to learn when
+    /// the API moved on.
+    ///
+    /// Every key can read it, whatever its scopes. The API does not check the
+    /// credentials on this route at all, so a successful read proves nothing
+    /// about them: use [`Client::ping`] for that.
+    pub fn get_integration_contract(&self) -> Result<IntegrationContract> {
+        let payload = self.request("GET", INTEGRATION_CONTRACT_PATH, "", "")?;
+        let mut contract: IntegrationContract = serde_json::from_value(payload.clone())
+            .map_err(|_| Error::api(200, "The API returned an unexpected integration contract"))?;
+        contract.raw = payload;
+        Ok(contract)
     }
 
     /// Opens a hosted checkout session for one payment.

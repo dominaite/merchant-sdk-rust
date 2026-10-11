@@ -50,8 +50,8 @@ mod types;
 mod webhooks;
 
 pub use client::{
-    Client, ClientBuilder, RetryOptions, DEFAULT_BASE_URL, PAYMENTS_PATH, PAYMENT_METHODS_PATH,
-    PING_PATH, SESSIONS_PATH, VERSION,
+    Client, ClientBuilder, RetryOptions, DEFAULT_BASE_URL, INTEGRATION_CONTRACT_PATH,
+    PAYMENTS_PATH, PAYMENT_METHODS_PATH, PING_PATH, SESSIONS_PATH, VERSION,
 };
 pub use error::{
     auth_error_code, charge_error_code, rate_limit_error_code, refund_error_code,
@@ -64,8 +64,8 @@ pub use types::{
     agreement_status, charge_status, decline_class, payment_method, refund_failure_code,
     refund_status, retired_reason, status, stored_payment_method_status, wallet_type,
     AgreementSummary, ChargeRequest, CheckoutSession, CheckoutSessionRequest, CheckoutStatus,
-    Consent, Customer, Integration, PaymentMethodCharge, Ping, Refund, RefundRequest,
-    StoredPaymentMethod,
+    Consent, Customer, Integration, IntegrationContract, PaymentMethodCharge, Ping, Refund,
+    RefundRequest, StoredPaymentMethod,
 };
 pub use webhooks::{
     verify_webhook, PaymentEventData, WebhookError, WebhookEvent, DEFAULT_TOLERANCE_SECS,

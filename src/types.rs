@@ -672,6 +672,31 @@ pub struct Ping {
     pub raw: Value,
 }
 
+/// What [`Client::get_integration_contract`](crate::Client::get_integration_contract)
+/// returns: the machine-readable contract the API serves, with the routes,
+/// fields, vocabularies and error codes of this API version.
+///
+/// The fields below are the ones code usually checks. Every other section
+/// (`errorCodes`, `recurring`, `transactions`, ...) is in `raw`, as sent.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegrationContract {
+    /// The contract version, a date such as `2026-09-16`.
+    #[serde(default)]
+    pub version: String,
+    /// The payment status vocabulary: every value [`CheckoutStatus::status`]
+    /// can take.
+    #[serde(default)]
+    pub statuses: Vec<String>,
+    /// Every webhook event type, e.g. `payment.succeeded`.
+    #[serde(default)]
+    pub webhook_event_catalog: Vec<String>,
+
+    /// The whole contract as sent.
+    #[serde(skip)]
+    pub raw: Value,
+}
+
 /// Stored payment method status wire values, on [`StoredPaymentMethod::status`].
 pub mod stored_payment_method_status {
     /// Chargeable.
