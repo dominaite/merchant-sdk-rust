@@ -9,7 +9,9 @@ use crate::idempotency::IdempotencyKey;
 
 /// Reads a JSON boolean, and null or absent as false. The gateway omits a flag
 /// that is not set, and a null must never fail the whole response.
-fn false_when_null<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+pub(crate) fn false_when_null<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<bool, D::Error> {
     Ok(Option::<bool>::deserialize(deserializer)?.unwrap_or(false))
 }
 
@@ -664,7 +666,11 @@ pub struct IntegrationContract {
     /// can take.
     #[serde(default)]
     pub statuses: Vec<String>,
-    /// Every webhook event type, e.g. `payment.succeeded`.
+    /// The `payment.*` event types, e.g. `payment.succeeded`. The
+    /// `agreement.*`, `charge.*` and `verification.*` types are not in this
+    /// list: the contract lists them under `recurring.webhookEvents` and
+    /// `verification.webhookEvents`, which `raw` keeps. The
+    /// [`event_type`] constants name all of them.
     #[serde(default)]
     pub webhook_event_catalog: Vec<String>,
 

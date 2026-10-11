@@ -508,3 +508,73 @@ fn only_payment_events_have_payment_data() {
         assert_eq!(event.payment_data(), None, "{}", event.event_type);
     }
 }
+
+// Verification events: a verify-only session's data, typed like a payment's.
+
+const VERIFICATION_SUCCEEDED: &str = r#"{"id":"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d","type":"verification.succeeded","apiVersion":"2026-10-01","createdAt":"2026-10-11T09:00:00Z","data":{"transactionId":"44444444-4444-4444-8444-444444444444","status":"requires_capture","previousStatus":"pending","amount":100,"currency":"EUR","originalTransactionId":null,"idempotencyKey":"verify-customer-77","verifyOnly":true,"declineClass":null,"storedPaymentMethod":{"id":"pm_0123456789abcdef0123456789abcdef","brand":"visa","last4":"4242","expiryMonth":12,"expiryYear":2030,"status":"active","retiredReason":null}}}"#;
+
+fn verification_failed(decline_class: &str) -> String {
+    format!(
+        r#"{{"id":"8b7c6d5e-4f3a-4b2c-9d1e-0f9a8b7c6d5e","type":"verification.failed","createdAt":"2026-10-11T09:00:00Z","data":{{"transactionId":"44444444-4444-4444-8444-444444444444","status":"failed","previousStatus":"pending","amount":100,"currency":"EUR","verifyOnly":true,"declineClass":{decline_class},"storedPaymentMethod":null}}}}"#
+    )
+}
+
+#[test]
+fn a_verification_succeeded_event_carries_the_saved_card_and_verify_only() {
+    let event = WebhookEvent::parse(VERIFICATION_SUCCEEDED).expect("parses");
+    assert_eq!(
+        event.event_type,
+        dominaite::event_type::VERIFICATION_SUCCEEDED
+    );
+
+    let data = event.payment_data().expect("typed data");
+    assert!(data.verify_only);
+    assert_eq!(data.decline_class, None);
+    assert_eq!(data.amount, Some(100));
+    let card = event.stored_payment_method().expect("the saved card");
+    assert_eq!(card.id, "pm_0123456789abcdef0123456789abcdef");
+    assert!(card.is_chargeable());
+}
+
+#[test]
+fn a_verification_failed_event_says_why_with_the_decline_class() {
+    let declined = WebhookEvent::parse(&verification_failed(r#""hard""#)).expect("parses");
+    let data = declined.payment_data().expect("typed data");
+    assert!(data.verify_only);
+    assert_eq!(
+        data.decline_class.as_deref(),
+        Some(dominaite::decline_class::HARD)
+    );
+    assert_eq!(declined.stored_payment_method(), None);
+
+    // An abandoned checkout has no decline class.
+    let abandoned = WebhookEvent::parse(&verification_failed("null")).expect("parses");
+    assert_eq!(
+        abandoned.payment_data().expect("typed data").decline_class,
+        None
+    );
+}
+
+#[test]
+fn a_payment_event_is_never_verify_only() {
+    for body in [
+        BODY.to_string(),
+        payment_event_with(r#","verifyOnly":false,"declineClass":null"#),
+        payment_event_with(r#","verifyOnly":null"#),
+    ] {
+        let data = WebhookEvent::parse(&body)
+            .expect("parses")
+            .payment_data()
+            .expect("typed data");
+        assert!(!data.verify_only, "{body}");
+        assert_eq!(data.decline_class, None, "{body}");
+    }
+}
+
+#[test]
+fn only_payment_and_verification_events_have_payment_data() {
+    for body in [AGREEMENT_EVENT, CHARGE_EVENT] {
+        let event = WebhookEvent::parse(body).expect("parses");
+        assert_eq!(event.payment_data(), None, "{}", event.event_type);
+    }
+}
