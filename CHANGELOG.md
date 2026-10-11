@@ -55,7 +55,8 @@
   `samsung_pay`), with `wallet_type::ALL` pinned against the gateway contract.
 - Contract fixtures: `paymentMethod` and `walletType` in the status read fields and examples,
   and the `wallets` section in the wire contract.
-- Wire contract fixture: regenerated from production, with the authorization error group.
+- Contract fixture: the new status read, checkout session and charge fields, with examples. Wire
+  contract fixture: the authorization error group.
 
 ### Changed
 
