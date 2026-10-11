@@ -183,7 +183,8 @@ pub struct WebhookEvent {
     /// The delivery id. Your dedupe key: the same event can arrive twice.
     pub id: String,
     /// The event type, e.g. `payment.succeeded`, `agreement.past_due`,
-    /// `charge.failed`. `type` on the wire.
+    /// `charge.failed`: one of the [`event_type`](crate::event_type)
+    /// constants, or a type this SDK does not know yet. `type` on the wire.
     #[serde(rename = "type")]
     pub event_type: String,
     /// The dated version of the payload shape the event was rendered in, e.g.
@@ -228,24 +229,33 @@ impl WebhookEvent {
         self.data.get("sequence").and_then(Value::as_i64)
     }
 
-    /// `data` of a `payment.*` event, typed. `None` on every other event type,
-    /// and when `data` does not have the documented shape.
+    /// `data` of a `payment.*` or a `verification.*` event, typed. `None` on
+    /// every other event type, and when `data` does not have the documented
+    /// shape.
+    ///
+    /// A `verification.*` event carries the payment fields of the verify-only
+    /// session, with [`PaymentEventData::verify_only`] true. A verify-only
+    /// session never sends a `payment.*` event.
     pub fn payment_data(&self) -> Option<PaymentEventData> {
-        if !self.event_type.starts_with("payment.") {
+        if !(self.event_type.starts_with("payment.")
+            || self.event_type.starts_with("verification."))
+        {
             return None;
         }
         serde_json::from_value(self.data.clone()).ok()
     }
 
     /// Shortcut for [`PaymentEventData::stored_payment_method`]: the card a
-    /// `payment.succeeded` or `payment.requires_capture` event says this payment
-    /// kept on file. `None` on every other event; read the caveat on the field.
+    /// `payment.succeeded`, `payment.requires_capture` or
+    /// `verification.succeeded` event says this payment kept on file. `None`
+    /// on every other event; read the caveat on the field.
     pub fn stored_payment_method(&self) -> Option<StoredPaymentMethod> {
         self.payment_data()?.stored_payment_method
     }
 }
 
-/// `data` on a `payment.*` event, from [`WebhookEvent::payment_data`].
+/// `data` on a `payment.*` or a `verification.*` event, from
+/// [`WebhookEvent::payment_data`].
 ///
 /// Webhooks spell a missing value as an explicit `null`; the SDK reads null
 /// and absent alike as `None`. Fields are only ever added, so older deliveries
@@ -320,11 +330,11 @@ pub struct PaymentEventData {
     /// The card this payment kept on file, the same object and type as
     /// [`CheckoutStatus::stored_payment_method`](crate::CheckoutStatus::stored_payment_method).
     ///
-    /// Only `payment.succeeded`, and `payment.requires_capture` for an
-    /// authorization, carry it, when the card was stored together with the
-    /// approval. It is `None` when no card was saved and on every other
-    /// `payment.*` event. `charge.*` events name their card by
-    /// `data.storedPaymentMethodId` instead.
+    /// Only `payment.succeeded`, `payment.requires_capture` for an
+    /// authorization, and `verification.succeeded` carry it, when the card was
+    /// stored together with the approval or the check. It is `None` when no
+    /// card was saved and on every other event. `charge.*` events name their
+    /// card by `data.storedPaymentMethodId` instead.
     ///
     /// It can ALSO be `None` when a card was saved: the card can be stored after
     /// the approval was announced, as on a server-to-server sale that succeeded
@@ -334,6 +344,17 @@ pub struct PaymentEventData {
     /// pick it up.
     #[serde(default)]
     pub stored_payment_method: Option<StoredPaymentMethod>,
+    /// True on a `verification.*` event: the data of a verify-only session.
+    /// False on every `payment.*` event, and on deliveries from servers that
+    /// predate the field.
+    #[serde(default, deserialize_with = "crate::types::false_when_null")]
+    pub verify_only: bool,
+    /// On `payment.failed` and `verification.failed`: the class of the
+    /// decline, one of the [`decline_class`](crate::decline_class) constants,
+    /// or a class this SDK does not know yet. It can be `None`, for example
+    /// when nobody declined the payment.
+    #[serde(default)]
+    pub decline_class: Option<String>,
 }
 
 struct SignatureHeader<'a> {

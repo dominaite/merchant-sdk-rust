@@ -298,6 +298,63 @@ fn charge_payment_method_sends_the_callers_key_and_the_description_last() {
     assert_signature_matches(&recorded, &charge_path(), "sub-8817-2026-10");
 }
 
+/// A charge under an agreement names it in the signed body, and a field this
+/// SDK does not model yet still reaches the gateway, after the modelled ones.
+#[test]
+fn a_charge_sends_the_agreement_and_the_extra_fields_in_the_signed_body() {
+    let server = MockServer::start(vec![charge_ok()]);
+    client_for(&server)
+        .charge_payment_method(
+            PAYMENT_METHOD_ID,
+            &ChargeRequest::new(1990, "EUR", "sub-8817-2026-10", key("sub-8817-2026-10"))
+                .description("Monthly plan")
+                .agreement_id("agr_0123456789abcdef0123456789abcdef")
+                .extra("futureField", serde_json::json!({"nested": true})),
+        )
+        .expect("charged");
+
+    let recorded = server.only_request();
+    assert_eq!(
+        recorded.body,
+        concat!(
+            r#"{"amount":1990,"currency":"EUR","orderReference":"sub-8817-2026-10","#,
+            r#""description":"Monthly plan","agreementId":"agr_0123456789abcdef0123456789abcdef","#,
+            r#""futureField":{"nested":true}}"#
+        )
+    );
+    assert_signature_matches(&recorded, &charge_path(), "sub-8817-2026-10");
+}
+
+#[test]
+fn a_charge_under_an_agreement_reads_the_agreement_and_the_sequence_back() {
+    let server = MockServer::start(vec![charge_envelope(
+        201,
+        None,
+        Some(
+            r#"{"chargeId":"ch_33333333333343338333333333333333","status":"succeeded","transactionId":"33333333-3333-4333-8333-333333333333","agreementId":"agr_0123456789abcdef0123456789abcdef","sequence":2}"#,
+        ),
+    )]);
+    let charge = client_for(&server)
+        .charge_payment_method(
+            PAYMENT_METHOD_ID,
+            &charge_request().agreement_id("agr_0123456789abcdef0123456789abcdef"),
+        )
+        .expect("charged");
+
+    assert_eq!(
+        charge.agreement_id.as_deref(),
+        Some("agr_0123456789abcdef0123456789abcdef")
+    );
+    assert_eq!(charge.sequence, Some(2));
+
+    // A one-off charge names no agreement.
+    let server = MockServer::start(vec![charge_ok()]);
+    let charge = client_for(&server)
+        .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
+        .expect("charged");
+    assert_eq!(charge.agreement_id, None);
+}
+
 #[test]
 fn a_402_decline_is_a_result_with_a_decline_class_not_an_error() {
     // The envelope says success=false and names CHARGE_DECLINED, but the charge
@@ -330,6 +387,31 @@ fn a_402_decline_is_a_result_with_a_decline_class_not_an_error() {
         charge.transaction_id,
         "33333333-3333-4333-8333-333333333334"
     );
+}
+
+/// A 402 whose decline class is null or missing is still a failed charge,
+/// never an error.
+#[test]
+fn a_402_without_a_decline_class_is_still_a_failed_charge() {
+    for data in [
+        r#"{"chargeId":"ch_33333333333343338333333333333334","status":"failed","declineClass":null,"declineCode":"05","transactionId":"33333333-3333-4333-8333-333333333334"}"#,
+        r#"{"chargeId":"ch_33333333333343338333333333333334","status":"failed","declineCode":"05","transactionId":"33333333-3333-4333-8333-333333333334"}"#,
+    ] {
+        let server = MockServer::start(vec![charge_envelope(
+            402,
+            Some(("CHARGE_DECLINED", "declined")),
+            Some(data),
+        )]);
+
+        let charge = client_for(&server)
+            .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
+            .expect("a decline is a result");
+
+        assert_eq!(charge.status, charge_status::FAILED, "{data}");
+        assert_eq!(charge.decline_class, None, "{data}");
+        assert_eq!(charge.decline_code.as_deref(), Some("05"), "{data}");
+        assert!(charge.is_terminal());
+    }
 }
 
 #[test]

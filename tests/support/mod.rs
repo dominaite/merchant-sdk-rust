@@ -19,6 +19,8 @@ pub enum Reply {
     /// A 429 carrying a JSON error envelope, plus the `Retry-After` value
     /// verbatim when there is one.
     RateLimited(Option<String>),
+    /// A 429 with this `Retry-After` value and this body, as sent.
+    RateLimitedWith(Option<String>, String),
     /// A 200 that announces and then streams this many bytes of filler, for
     /// proving the client stops reading a body that never ends.
     Oversized(usize),
@@ -201,6 +203,12 @@ fn serve_one(mut stream: TcpStream, reply: Reply, recorder: &Arc<Mutex<Vec<Recor
                 &extra,
                 r#"{"success":false,"error":{"code":"RATE_LIMIT_EXCEEDED","message":"too many requests"}}"#,
             );
+        }
+        Reply::RateLimitedWith(retry_after, payload) => {
+            let extra = retry_after
+                .map(|value| format!("Retry-After: {value}\r\n"))
+                .unwrap_or_default();
+            write_body(&mut stream, 429, "application/json", &extra, &payload);
         }
     }
 }

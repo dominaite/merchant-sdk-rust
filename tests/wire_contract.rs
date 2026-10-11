@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-use dominaite::{status, wallet_type, CheckoutStatus};
+use dominaite::{auth_error_code, event_type, status, wallet_type, CheckoutStatus};
 
 const WIRE: &str = include_str!("merchant-api-wire-contract.json");
 
@@ -79,6 +79,53 @@ fn the_status_type_carries_every_wallet_reporting_field_as_an_optional_string() 
             .expect("deserializes");
     assert_eq!(bare.payment_method, None);
     assert_eq!(bare.wallet_type, None);
+}
+
+fn codes_with_status(group: &Value) -> Vec<(&str, u64)> {
+    group
+        .as_array()
+        .expect("an error group is an array")
+        .iter()
+        .map(|entry| {
+            (
+                entry["code"].as_str().expect("code is a string"),
+                entry["httpStatus"]
+                    .as_u64()
+                    .expect("httpStatus is a number"),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn the_401_codes_match_the_gateways_auth_group_in_order() {
+    let wire = wire();
+    let expected: Vec<(&str, u64)> = auth_error_code::AUTHENTICATION
+        .iter()
+        .map(|code| (*code, 401))
+        .collect();
+    assert_eq!(codes_with_status(&wire["errorCodes"]["auth"]), expected);
+}
+
+#[test]
+fn the_403_codes_match_the_gateways_authorization_group_in_order() {
+    let wire = wire();
+    let expected: Vec<(&str, u64)> = auth_error_code::AUTHORIZATION
+        .iter()
+        .map(|code| (*code, 403))
+        .collect();
+    assert_eq!(
+        codes_with_status(&wire["errorCodes"]["authorization"]),
+        expected
+    );
+}
+
+#[test]
+fn payment_event_types_match_the_gateways_catalog_in_order() {
+    assert_eq!(
+        event_type::PAYMENT.to_vec(),
+        strings(&wire()["webhookEventCatalog"])
+    );
 }
 
 #[test]

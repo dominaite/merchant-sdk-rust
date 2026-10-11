@@ -5,8 +5,9 @@ mod support;
 use std::time::Duration;
 
 use dominaite::{
-    session_error_code, sign_request, CheckoutSessionRequest, Client, Error, IdempotencyKey,
-    RetryOptions, SignRequest, SESSIONS_PATH,
+    auth_error_code, rate_limit_error_code, session_error_code, sign_request,
+    CheckoutSessionRequest, Client, Error, IdempotencyKey, RetryOptions, SignRequest,
+    SESSIONS_PATH,
 };
 use support::{MockServer, Recorded, Reply};
 
@@ -223,12 +224,7 @@ fn replay_codes_arrive_as_http_200_refusals() {
 
 #[test]
 fn every_401_code_becomes_an_auth_error() {
-    for code in [
-        "INVALID_API_KEY",
-        "INVALID_SIGNATURE",
-        "TIMESTAMP_OUT_OF_RANGE",
-        "IP_NOT_ALLOWED",
-    ] {
+    for code in auth_error_code::AUTHENTICATION {
         let server = MockServer::start(vec![Reply::error_envelope(401, code, "nope")]);
         let error = client_for(&server)
             .create_checkout_session(&request())
@@ -236,19 +232,121 @@ fn every_401_code_becomes_an_auth_error() {
 
         assert!(matches!(error, Error::Auth { .. }), "{code}: {error}");
         assert_eq!(error.code(), Some(code));
+        assert_eq!(error.http_status(), Some(401));
         assert!(!error.is_retryable());
     }
 }
 
+/// A 403 was signed correctly: the key id, the secret and the clock are fine,
+/// so it is its own variant and never carries the 401 clock hint.
 #[test]
-fn a_403_is_an_auth_error_too() {
-    let server = MockServer::start(vec![Reply::error_envelope(403, "IP_NOT_ALLOWED", "nope")]);
+fn a_403_insufficient_scope_is_forbidden_and_names_the_scope() {
+    let server = MockServer::start(vec![Reply::error_envelope(
+        403,
+        "INSUFFICIENT_SCOPE",
+        "This API key does not have the 'payments' scope this route requires",
+    )]);
     let error = client_for(&server)
         .create_checkout_session(&request())
         .expect_err("rejected");
 
-    assert_eq!(error.code(), Some("IP_NOT_ALLOWED"));
-    assert!(matches!(error, Error::Auth { .. }));
+    assert!(matches!(error, Error::Forbidden { .. }), "{error:?}");
+    assert_eq!(error.code(), Some(auth_error_code::INSUFFICIENT_SCOPE));
+    assert_eq!(error.http_status(), Some(403));
+    assert!(!error.is_retryable());
+
+    let message = error.to_string();
+    assert!(message.contains("'payments' scope"), "{message}");
+    assert!(
+        message.contains("use a key that holds this scope"),
+        "{message}"
+    );
+    assert!(!message.contains("clock"), "{message}");
+}
+
+#[test]
+fn a_403_verify_only_not_enabled_says_we_switch_it_on() {
+    let server = MockServer::start(vec![Reply::error_envelope(
+        403,
+        "VERIFY_ONLY_NOT_ENABLED",
+        "Verify-only sessions are not enabled for this account.",
+    )]);
+    let error = client_for(&server)
+        .create_checkout_session(&request())
+        .expect_err("rejected");
+
+    assert!(matches!(error, Error::Forbidden { .. }), "{error:?}");
+    assert_eq!(error.code(), Some(auth_error_code::VERIFY_ONLY_NOT_ENABLED));
+
+    let message = error.to_string();
+    assert!(
+        message.contains("We switch it on for your account"),
+        "{message}"
+    );
+    assert!(!message.contains("clock"), "{message}");
+}
+
+#[test]
+fn the_clock_hint_is_for_401_only() {
+    // No message at all, so the SDK's own fallback is what the caller reads.
+    for (status, code, variant_ok) in [
+        (401, "INVALID_SIGNATURE", true),
+        (403, "SOMETHING_NEW", false),
+    ] {
+        let server = MockServer::start(vec![Reply::Json(
+            status,
+            format!(r#"{{"success":false,"error":{{"code":"{code}"}}}}"#),
+        )]);
+        let error = client_for(&server)
+            .create_checkout_session(&request())
+            .expect_err("rejected");
+
+        assert_eq!(matches!(error, Error::Auth { .. }), variant_ok, "{error:?}");
+        assert_eq!(
+            matches!(error, Error::Forbidden { .. }),
+            !variant_ok,
+            "{error:?}"
+        );
+        assert_eq!(error.code(), Some(code));
+        assert_eq!(
+            error.to_string().contains("server clock"),
+            status == 401,
+            "{status}: {error}"
+        );
+    }
+}
+
+/// The envelope travels with the error, so what the typed fields do not carry
+/// (the per-field validation errors, a code's params) is still readable.
+#[test]
+fn an_api_error_keeps_the_whole_envelope() {
+    let body = r#"{"success":false,"error":{"code":"VALIDATION_ERROR","message":"invalid","statusCode":400,"validationErrors":[{"field":"amount","message":"too small","code":"MIN_VALUE"}],"params":{"min":1}}}"#;
+    let server = MockServer::start(vec![Reply::Json(400, body.to_string())]);
+    let error = client_for(&server)
+        .create_checkout_session(&request())
+        .expect_err("rejected");
+
+    match &error {
+        Error::Api {
+            status, code, raw, ..
+        } => {
+            assert_eq!(*status, 400);
+            assert_eq!(code.as_deref(), Some("VALIDATION_ERROR"));
+            assert_eq!(raw["error"]["validationErrors"][0]["code"], "MIN_VALUE");
+            assert_eq!(raw["error"]["params"]["min"], 1);
+        }
+        other => panic!("expected an API error, got {other:?}"),
+    }
+
+    // A body that is not JSON has no envelope to keep.
+    let server = MockServer::start(vec![Reply::Html(400, "<html>no</html>".to_string())]);
+    let error = client_for(&server)
+        .create_checkout_session(&request())
+        .expect_err("rejected");
+    assert!(
+        matches!(&error, Error::Api { raw, .. } if raw.is_null()),
+        "{error:?}"
+    );
 }
 
 #[test]
@@ -400,12 +498,75 @@ fn a_429_is_a_rate_limit_error_carrying_retry_after() {
         matches!(
             error,
             Error::RateLimited {
-                retry_after_seconds: Some(30)
+                retry_after_seconds: Some(30),
+                ..
             }
         ),
         "{error}"
     );
     assert_eq!(error.http_status(), Some(429));
+    assert_eq!(
+        error.code(),
+        Some(rate_limit_error_code::RATE_LIMIT_EXCEEDED)
+    );
+}
+
+/// The charge route's own limits are 429s too. The code tells them apart, and
+/// the raw body keeps the limit's window for the caller.
+#[test]
+fn a_charge_limit_429_keeps_its_code_and_params() {
+    let server = MockServer::start(vec![Reply::RateLimitedWith(
+        Some("120".into()),
+        r#"{"success":false,"error":{"code":"CHARGE_VELOCITY_EXCEEDED","message":"limit","params":{"window":86400,"limit":10}}}"#
+            .to_string(),
+    )]);
+    let error = client_for(&server)
+        .create_checkout_session(&request())
+        .expect_err("rate limited");
+
+    match &error {
+        Error::RateLimited {
+            retry_after_seconds,
+            code,
+            raw,
+        } => {
+            assert_eq!(*retry_after_seconds, Some(120));
+            assert_eq!(
+                code.as_deref(),
+                Some(rate_limit_error_code::CHARGE_VELOCITY_EXCEEDED)
+            );
+            assert_eq!(raw["error"]["params"]["window"], 86400);
+        }
+        other => panic!("expected a rate limit error, got {other:?}"),
+    }
+    assert!(
+        error.to_string().contains("CHARGE_VELOCITY_EXCEEDED"),
+        "{error}"
+    );
+}
+
+/// A limiter in front of the API answers with whatever body it likes; that is
+/// still a rate limit, just without a code.
+#[test]
+fn a_429_without_a_json_body_is_still_a_rate_limit_error() {
+    for reply in [
+        Reply::RateLimitedWith(Some("5".into()), "<html>slow down</html>".to_string()),
+        Reply::RateLimitedWith(None, String::new()),
+    ] {
+        let server = MockServer::start(vec![reply]);
+        let error = client_for(&server)
+            .create_checkout_session(&request())
+            .expect_err("rate limited");
+
+        match &error {
+            Error::RateLimited { code, raw, .. } => {
+                assert_eq!(*code, None);
+                assert!(raw.is_null(), "{raw}");
+            }
+            other => panic!("expected a rate limit error, got {other:?}"),
+        }
+        assert_eq!(error.code(), None);
+    }
 }
 
 #[test]
@@ -428,7 +589,8 @@ fn a_429_without_a_usable_retry_after_leaves_it_none() {
             matches!(
                 error,
                 Error::RateLimited {
-                    retry_after_seconds: None
+                    retry_after_seconds: None,
+                    ..
                 }
             ),
             "{label}: {error}"
@@ -456,7 +618,8 @@ fn a_caller_supplied_agent_still_gets_a_rate_limit_error_on_429() {
         matches!(
             error,
             Error::RateLimited {
-                retry_after_seconds: None
+                retry_after_seconds: None,
+                ..
             }
         ),
         "{error}"

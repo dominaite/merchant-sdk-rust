@@ -1,9 +1,19 @@
 //! Request and response shapes.
 
-use serde::{Deserialize, Serialize};
+use std::fmt;
+
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
 use crate::idempotency::IdempotencyKey;
+
+/// Reads a JSON boolean, and null or absent as false. The gateway omits a flag
+/// that is not set, and a null must never fail the whole response.
+pub(crate) fn false_when_null<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<bool, D::Error> {
+    Ok(Option::<bool>::deserialize(deserializer)?.unwrap_or(false))
+}
 
 /// Optional payer details. Prefilled fields are hidden from the payer in the
 /// widget, so the checkout form stays short.
@@ -55,6 +65,50 @@ impl Customer {
     }
 }
 
+/// A customer's acceptance of the terms for recurring charges, sent with a
+/// subscription session or an agreement.
+///
+/// All three fields are required together. What `text_version` names depends
+/// on where you send it:
+///
+/// - On a subscription session ([`CheckoutSessionRequest::consent`]): a
+///   version of the PLATFORM consent text, never your own wording. The
+///   contract lists the published versions in `recurring.consentTextVersions`
+///   (today `recurring-2026-09`).
+/// - On an agreement ([`AgreementRequest::consent`]): your own label for the
+///   wording the customer accepted, 1 to 50 characters, e.g. `terms-2026-09`.
+///   The subscription session uses the agreement's consent only when this
+///   label is one of the platform versions; otherwise send consent on the
+///   session too.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Consent {
+    /// The version of the consent text the customer accepted; the type docs
+    /// say which versions each route takes.
+    pub text_version: String,
+    /// When the customer accepted, ISO 8601 UTC, e.g. `2026-10-11T09:30:00Z`.
+    /// Not in the future.
+    pub accepted_at: String,
+    /// The customer's IPv4 or IPv6 address at acceptance.
+    pub ip: String,
+}
+
+impl Consent {
+    /// The customer accepted `text_version` at `accepted_at` (ISO 8601 UTC)
+    /// from `ip`.
+    pub fn new(
+        text_version: impl Into<String>,
+        accepted_at: impl Into<String>,
+        ip: impl Into<String>,
+    ) -> Consent {
+        Consent {
+            text_version: text_version.into(),
+            accepted_at: accepted_at.into(),
+            ip: ip.into(),
+        }
+    }
+}
+
 /// The parameters for [`Client::create_checkout_session`](crate::Client::create_checkout_session).
 ///
 /// `amount`, `currency`, `order_reference` and the idempotency key are required
@@ -69,13 +123,18 @@ impl Customer {
 /// let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042", key)
 ///     .customer(Customer::new().first_name("Ana").email("ana@example.com"))
 ///     .language("bg");
+///
+/// // Save a card with no payment: amount 0 and verify_only.
+/// let key = IdempotencyKey::new("verify-customer-77")?;
+/// let verify = CheckoutSessionRequest::new(0, "EUR", "customer-77", key).verify_only(true);
 /// # Ok(())
 /// # }
 /// ```
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckoutSessionRequest {
-    /// The amount in MINOR units: `2500` is 25.00 EUR. Integers only.
+    /// The amount in MINOR units: `2500` is 25.00 EUR. Integers only. Above 0,
+    /// except on a verify-only session, where it must be 0.
     pub amount: i64,
     /// ISO 4217 currency, e.g. `"EUR"`.
     pub currency: String,
@@ -91,10 +150,12 @@ pub struct CheckoutSessionRequest {
     /// ISO 639-1 widget UI language.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
-    /// `"light"`, `"dark"` or `"bright"`.
+    /// `"light"`, `"dark"` or `"bright"`, at most 20 characters. `None` keeps
+    /// your dashboard default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
-    /// Free-text description.
+    /// The payment description shown on the checkout page, at most 500
+    /// characters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Ask the gateway to keep the card on file once this payment is approved, so
@@ -114,6 +175,43 @@ pub struct CheckoutSessionRequest {
     /// `IDEMPOTENCY_KEY_REUSED`. `None` sends no integration field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integration: Option<Integration>,
+    /// Saves the payer's card with no payment. The checkout places a small
+    /// authorization, saves the card and releases the authorization; nobody is
+    /// charged. `amount` must be 0, the card is always saved, the integration
+    /// must be the widget, and `agreement_id` is refused. A non-null
+    /// [`CheckoutStatus::stored_payment_method`] is what says the card is
+    /// verified.
+    ///
+    /// Off until we switch it on for your account: before that, the session is
+    /// refused with [`Error::Forbidden`](crate::Error::Forbidden) and code
+    /// `VERIFY_ONLY_NOT_ENABLED`. [`IdempotencyKey::for_order`] needs an amount
+    /// above 0, so build the key with [`IdempotencyKey::new`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify_only: Option<bool>,
+    /// The `agr_` handle of a PENDING agreement from
+    /// [`Client::create_agreement`](crate::Client::create_agreement). It makes
+    /// this the subscription session that takes the agreement's first payment,
+    /// saves the card and activates the agreement. Amount and currency must be
+    /// the agreement's own (on a plan with a trial only the currency is held).
+    ///
+    /// A subscription session the API cannot open is refused with
+    /// [`Error::Refusal`](crate::Error::Refusal) and nothing is created, for
+    /// example code `AGREEMENT_NOT_PENDING`, `AGREEMENT_SESSION_OPEN` or
+    /// `SUBSCRIPTIONS_NOT_ENABLED`. The contract lists every code under
+    /// `recurring.subscriptionSessionOutcomes`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agreement_id: Option<String>,
+    /// Only with `agreement_id`: the customer's acceptance of the platform
+    /// consent text. Required unless the agreement already carries consent
+    /// from its create call; when sent, it replaces what the agreement held.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consent: Option<Consent>,
+    /// The id of the storefront (online location) this payment belongs to.
+    /// `None` uses your default storefront, or your only active one. An id
+    /// that is not one of your storefronts is a 404; a key bound to one
+    /// storefront refuses a different id with `STOREFRONT_MISMATCH`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location_id: Option<String>,
 
     /// Required. It travels in the header and in the signature, never in the
     /// body. Retrying with the same key never creates a second payment, so on a
@@ -149,6 +247,10 @@ impl CheckoutSessionRequest {
             description: None,
             save_card: None,
             integration: None,
+            verify_only: None,
+            agreement_id: None,
+            consent: None,
+            location_id: None,
             idempotency_key,
             extra: Map::new(),
         }
@@ -198,6 +300,34 @@ impl CheckoutSessionRequest {
         self
     }
 
+    /// Saves the card with no payment; send amount 0. See
+    /// [`CheckoutSessionRequest::verify_only`].
+    pub fn verify_only(mut self, value: bool) -> Self {
+        self.verify_only = Some(value);
+        self
+    }
+
+    /// Takes the first payment of a pending agreement. See
+    /// [`CheckoutSessionRequest::agreement_id`].
+    pub fn agreement_id(mut self, value: impl Into<String>) -> Self {
+        self.agreement_id = Some(value.into());
+        self
+    }
+
+    /// Records the customer's consent with the agreement. See
+    /// [`CheckoutSessionRequest::consent`].
+    pub fn consent(mut self, value: Consent) -> Self {
+        self.consent = Some(value);
+        self
+    }
+
+    /// Attributes the payment to one of your storefronts. See
+    /// [`CheckoutSessionRequest::location_id`].
+    pub fn location_id(mut self, value: impl Into<String>) -> Self {
+        self.location_id = Some(value.into());
+        self
+    }
+
     /// Adds a body field this struct does not model yet.
     pub fn extra(mut self, key: impl Into<String>, value: Value) -> Self {
         self.extra.insert(key.into(), value);
@@ -241,6 +371,14 @@ pub struct CheckoutSession {
     /// the other session values; never log it or keep it past the session.
     #[serde(default)]
     pub client_secret: Option<String>,
+    /// The `agr_` handle of the agreement this session takes the first payment
+    /// for. `None` on a one-off checkout.
+    #[serde(default)]
+    pub agreement_id: Option<String>,
+    /// True for a verify-only session: `amount` is the platform's verification
+    /// hold, released once the card is saved. False on a payment session.
+    #[serde(default, deserialize_with = "false_when_null")]
+    pub verify_only: bool,
 
     /// The unparsed payload, for fields this struct does not model yet.
     #[serde(skip)]
@@ -415,6 +553,36 @@ pub struct CheckoutStatus {
     /// category of how the payer paid (`card`, `wallet`, ...).
     #[serde(default)]
     pub stored_payment_method: Option<StoredPaymentMethod>,
+    /// What to do with a `failed` payment, one of the [`decline_class`]
+    /// constants, or a class this SDK does not know yet. It can be `None`, for
+    /// example when nobody declined the payment. Never read `None` as `hard`;
+    /// if you retry, retry as you would for `soft_other`. It is `None` on every
+    /// status other than `failed`.
+    #[serde(default)]
+    pub decline_class: Option<String>,
+    /// True when this is a merchant-initiated charge on a stored card (a
+    /// recurring charge), false for a hosted-checkout session.
+    #[serde(default, deserialize_with = "false_when_null")]
+    pub is_recurring: bool,
+    /// True for a verify-only session: a card check, not a payment. `status`
+    /// stays the raw status (`requires_capture`, then `cancelled` once the hold
+    /// is released); a non-null `stored_payment_method` is what says the card
+    /// is verified. False on every other session.
+    #[serde(default, deserialize_with = "false_when_null")]
+    pub verify_only: bool,
+    /// The agreement this session took the first payment for, or the
+    /// agreement a recurring charge was placed under. `None` on a one-off
+    /// checkout or charge. Still `pending` after a declined or abandoned
+    /// subscription session: that is how you learn the subscription did not
+    /// start.
+    #[serde(default)]
+    pub agreement: Option<AgreementSummary>,
+    /// The `data.sequence` of the latest `charge.*` webhook about this
+    /// transaction, so you can order this read against those events. 0 on a
+    /// checkout payment and before the first `charge.*` event. `None` when the
+    /// server does not send it.
+    #[serde(default)]
+    pub sequence: Option<i64>,
 
     /// The unparsed payload, for fields this struct does not model yet.
     #[serde(skip)]
@@ -479,6 +647,35 @@ pub struct Ping {
     pub clock_skew_seconds: i64,
 
     /// The unparsed payload, for fields this struct does not model yet.
+    #[serde(skip)]
+    pub raw: Value,
+}
+
+/// What [`Client::get_integration_contract`](crate::Client::get_integration_contract)
+/// returns: the machine-readable contract the API serves, with the routes,
+/// fields, vocabularies and error codes of this API version.
+///
+/// The fields below are the ones code usually checks. Every other section
+/// (`errorCodes`, `recurring`, `transactions`, ...) is in `raw`, as sent.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegrationContract {
+    /// The contract version, a date such as `2026-09-16`.
+    #[serde(default)]
+    pub version: String,
+    /// The payment status vocabulary: every value [`CheckoutStatus::status`]
+    /// can take.
+    #[serde(default)]
+    pub statuses: Vec<String>,
+    /// The `payment.*` event types, e.g. `payment.succeeded`. The
+    /// `agreement.*`, `charge.*` and `verification.*` types are not in this
+    /// list: the contract lists them under `recurring.webhookEvents` and
+    /// `verification.webhookEvents`, which `raw` keeps. The
+    /// [`event_type`] constants name all of them.
+    #[serde(default)]
+    pub webhook_event_catalog: Vec<String>,
+
+    /// The whole contract as sent.
     #[serde(skip)]
     pub raw: Value,
 }
@@ -560,7 +757,8 @@ impl StoredPaymentMethod {
 ///
 /// `amount`, `currency`, `order_reference` and the idempotency key are required
 /// and come from [`ChargeRequest::new`]; the rest are builder methods. The body
-/// is exactly these fields, in this order - it is what gets signed.
+/// is these fields in this order, then the `extra` fields - it is what gets
+/// signed.
 ///
 /// ```
 /// use dominaite::{ChargeRequest, IdempotencyKey};
@@ -581,9 +779,16 @@ pub struct ChargeRequest {
     pub currency: String,
     /// Your own order id, at most 100 characters. It shows up in your dashboard.
     pub order_reference: String,
-    /// Free-text description.
+    /// Free text stored on the transaction, at most 500 characters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// The `agr_` handle of the agreement this charge is made under. Without
+    /// it, the charge is yours to back with the customer's agreement, and only
+    /// the per-charge cap and the volume limits apply. With it, the agreement
+    /// must be yours, linked to this payment method and carrying consent, and
+    /// the amount must fit the agreement; the charge records it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agreement_id: Option<String>,
 
     /// Required. It travels in the header and in the signature, never in the
     /// body. Retrying with the same key never charges the card twice, so on a
@@ -591,6 +796,11 @@ pub struct ChargeRequest {
     /// never mint one per attempt.
     #[serde(skip)]
     pub idempotency_key: IdempotencyKey,
+
+    /// Any additional field the API accepts that this struct does not model yet.
+    /// These are merged into the JSON body, after the fields above.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 impl ChargeRequest {
@@ -608,13 +818,28 @@ impl ChargeRequest {
             currency: currency.into(),
             order_reference: order_reference.into(),
             description: None,
+            agreement_id: None,
             idempotency_key,
+            extra: Map::new(),
         }
     }
 
     /// Sets the description.
     pub fn description(mut self, value: impl Into<String>) -> Self {
         self.description = Some(value.into());
+        self
+    }
+
+    /// Makes the charge under this agreement. See
+    /// [`ChargeRequest::agreement_id`].
+    pub fn agreement_id(mut self, value: impl Into<String>) -> Self {
+        self.agreement_id = Some(value.into());
+        self
+    }
+
+    /// Adds a body field this struct does not model yet.
+    pub fn extra(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.extra.insert(key.into(), value);
         self
     }
 }
@@ -624,7 +849,8 @@ pub mod charge_status {
     /// The card was charged.
     pub const SUCCEEDED: &str = "succeeded";
     /// The issuer declined (HTTP 402); see
-    /// [`PaymentMethodCharge::decline_class`](crate::PaymentMethodCharge::decline_class).
+    /// [`PaymentMethodCharge::decline_class`](crate::PaymentMethodCharge::decline_class),
+    /// which can be `None`.
     pub const FAILED: &str = "failed";
     /// Not terminal: poll [`Client::get_status`](crate::Client::get_status)
     /// with the charge's transaction id.
@@ -637,8 +863,10 @@ pub mod charge_status {
     pub const ALL: [&str; 4] = [SUCCEEDED, FAILED, PENDING, CANCELLED];
 }
 
-/// Decline class wire values, on [`PaymentMethodCharge::decline_class`](crate::PaymentMethodCharge::decline_class). Coarse
-/// enough to act on without reading the issuer's code.
+/// Decline class wire values, on [`PaymentMethodCharge::decline_class`](crate::PaymentMethodCharge::decline_class)
+/// and [`CheckoutStatus::decline_class`]. Coarse enough to act on without
+/// reading the issuer's code. A value outside this list is a class added after
+/// this release.
 pub mod decline_class {
     /// Do not retry this card; ask the customer for another one.
     pub const HARD: &str = "hard";
@@ -656,8 +884,8 @@ pub mod decline_class {
 
 /// What [`Client::charge_payment_method`](crate::Client::charge_payment_method)
 /// returns, for a placed charge (HTTP 201) and for a provider decline (HTTP 402,
-/// `status` `failed`) alike. A decline is a result, not an error: `decline_class`
-/// says what to do next. Also carried on [`Error::Charge`](crate::Error::Charge)
+/// `status` `failed`) alike. A decline is a result, not an error: `decline_class`,
+/// when set, says what to do next. Also carried on [`Error::Charge`](crate::Error::Charge)
 /// when the gateway attached the charge row to its answer.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -669,21 +897,30 @@ pub struct PaymentMethodCharge {
     /// [`PaymentMethodCharge::is_paid`] and [`PaymentMethodCharge::is_terminal`]
     /// rather than by hand.
     pub status: String,
-    /// One of the [`decline_class`] constants, set on a 402 decline; `None`
-    /// everywhere else (the SDK reads absent as `None`).
+    /// One of the [`decline_class`] constants, or a class this SDK does not
+    /// know yet. It can be `None`, for example when nobody declined the
+    /// payment. [`Client::get_status`](crate::Client::get_status) carries the
+    /// latest class. Never read `None` as `hard`. It is `None` on every status
+    /// other than `failed`.
     #[serde(default)]
     pub decline_class: Option<String>,
-    /// The raw decline code, for your logs; branch on `decline_class` instead.
-    /// `None` when `decline_class` is.
+    /// The issuer's decline code, verbatim, for your logs; branch on
+    /// `decline_class` instead. Set on a failed charge when the issuer sent one.
     #[serde(default)]
     pub decline_code: Option<String>,
     /// The transaction the charge created; readable with
     /// [`Client::get_status`](crate::Client::get_status).
     #[serde(default)]
     pub transaction_id: String,
+    /// The `agr_` handle of the agreement the charge was made under, when the
+    /// request named one.
+    #[serde(default)]
+    pub agreement_id: Option<String>,
     /// The charge's current sequence, the counter that orders the `charge.*`
     /// webhooks ([`WebhookEvent::sequence`](crate::WebhookEvent::sequence)).
-    /// `None` when the server does not send it yet.
+    /// 0 while pending. A replay returns the first answer as it was, so it can
+    /// be lower than a later webhook's; the status read carries the live
+    /// value. `None` when the server does not send it.
     #[serde(default)]
     pub sequence: Option<i64>,
 
@@ -716,8 +953,8 @@ impl PaymentMethodCharge {
 /// The idempotency key is required and comes from [`RefundRequest::new`]; the
 /// amount and reason are builder methods. Leave the amount out to refund
 /// everything still refundable: the body then carries no `amount` at all, not a
-/// null. The body is exactly these fields, in this order - it is what gets
-/// signed.
+/// null. The body is these fields in this order, then the `extra` fields - it
+/// is what gets signed.
 ///
 /// ```
 /// use dominaite::{to_minor_units, IdempotencyKey, RefundRequest};
@@ -750,6 +987,11 @@ pub struct RefundRequest {
     /// it as is: the same key answers the same refund and never refunds twice.
     #[serde(skip)]
     pub idempotency_key: IdempotencyKey,
+
+    /// Any additional field the API accepts that this struct does not model yet.
+    /// These are merged into the JSON body, after the fields above.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 impl RefundRequest {
@@ -760,6 +1002,7 @@ impl RefundRequest {
             amount: None,
             reason: None,
             idempotency_key,
+            extra: Map::new(),
         }
     }
 
@@ -773,6 +1016,12 @@ impl RefundRequest {
     /// Sets the reason stored with the refund.
     pub fn reason(mut self, value: impl Into<String>) -> Self {
         self.reason = Some(value.into());
+        self
+    }
+
+    /// Adds a body field this struct does not model yet.
+    pub fn extra(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.extra.insert(key.into(), value);
         self
     }
 }
@@ -896,4 +1145,989 @@ impl Refund {
                 .unwrap_or(refund_failure_code::REFUND_FAILED),
         )
     }
+}
+
+/// What [`Client::list_refunds`](crate::Client::list_refunds) returns: the
+/// refunds of one payment and its refund totals.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefundList {
+    /// The payment whose refunds these are.
+    #[serde(default)]
+    pub transaction_id: String,
+    /// ISO 4217 code of the payment and of every amount here.
+    #[serde(default)]
+    pub currency: String,
+    /// MINOR units refunded so far, from every source: the API, the dashboard
+    /// and the payment processor.
+    #[serde(default)]
+    pub refunded_amount: i64,
+    /// MINOR units a new refund can take now: what is not refunded yet, minus
+    /// the refunds still in progress. 0 when the payment cannot be refunded.
+    #[serde(default)]
+    pub refundable_amount: i64,
+    /// The refunds you created through the API, newest first, each in the
+    /// shape [`Client::get_refund`](crate::Client::get_refund) answers. A
+    /// refund made in the dashboard is not in this list, but the two totals
+    /// count it.
+    #[serde(default)]
+    pub refunds: Vec<Refund>,
+
+    /// The unwrapped list as the gateway sent it, for fields this struct does
+    /// not model yet.
+    #[serde(skip)]
+    pub raw: Value,
+}
+
+/// The parameters for [`Client::create_plan`](crate::Client::create_plan): a
+/// price and a billing interval you sell.
+///
+/// `name`, `amount`, `currency`, `interval_unit` and the idempotency key are
+/// required and come from [`PlanRequest::new`]; the rest are builder methods.
+/// The body is these fields in this order, then the `extra` fields. The
+/// amount, the currency and the interval never change once the plan exists:
+/// to change a price, create a new plan and archive the old one with
+/// [`Client::delete_plan`](crate::Client::delete_plan).
+///
+/// ```
+/// use dominaite::{interval_unit, IdempotencyKey, PlanRequest};
+///
+/// # fn main() -> Result<(), dominaite::Error> {
+/// let key = IdempotencyKey::new("plan-pro-monthly")?;
+/// // 1990 = 19.90 EUR every month, after a 14-day trial.
+/// let request = PlanRequest::new("Pro", 1990, "EUR", interval_unit::MONTH, key)
+///     .trial_days(14)
+///     .cancel_url("https://shop.example/account/cancel");
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanRequest {
+    /// The display name, 1 to 100 characters.
+    pub name: String,
+    /// The charge per period in MINOR units: `1990` is 19.90 EUR.
+    pub amount: i64,
+    /// ISO 4217 currency, three upper-case letters, e.g. `"EUR"`.
+    pub currency: String,
+    /// One of the [`interval_unit`] constants.
+    pub interval_unit: String,
+    /// How many units make one billing period: every 3 months is
+    /// [`interval_unit::MONTH`] with 3. The period is at most one year: 365
+    /// days, 52 weeks, 12 months or 1 year. `None` sends nothing, and the API
+    /// uses 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval_count: Option<u32>,
+    /// The number of periods after which an agreement completes on its own,
+    /// at least 1. `None` bills until the agreement is cancelled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period_count: Option<u32>,
+    /// The days between activation and the first charge, 0 to 365. `None` or
+    /// 0 is no trial.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trial_days: Option<u32>,
+    /// Your page where the customer cancels the subscription: an absolute
+    /// `https` URL, at most 2048 characters. The platform puts it as the
+    /// cancel link on every receipt and decline notice it emails to your
+    /// customer. Without it, those emails tell the customer to contact you.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancel_url: Option<String>,
+
+    /// Required. It travels in the header and in the signature, never in the
+    /// body. The same key with the same body answers the plan it created, so
+    /// a create whose answer you lost is safe to send again with the same
+    /// key. Derive it from your own plan record, never mint one per attempt.
+    #[serde(skip)]
+    pub idempotency_key: IdempotencyKey,
+
+    /// Any additional field the API accepts that this struct does not model yet.
+    /// These are merged into the JSON body, after the fields above.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl PlanRequest {
+    /// A plan that charges `amount` MINOR units of `currency` every
+    /// `interval_unit`. The key is required: derive it from your own plan
+    /// record.
+    pub fn new(
+        name: impl Into<String>,
+        amount: i64,
+        currency: impl Into<String>,
+        interval_unit: impl Into<String>,
+        idempotency_key: IdempotencyKey,
+    ) -> Self {
+        PlanRequest {
+            name: name.into(),
+            amount,
+            currency: currency.into(),
+            interval_unit: interval_unit.into(),
+            interval_count: None,
+            period_count: None,
+            trial_days: None,
+            cancel_url: None,
+            idempotency_key,
+            extra: Map::new(),
+        }
+    }
+
+    /// Sets how many units make one billing period.
+    pub fn interval_count(mut self, value: u32) -> Self {
+        self.interval_count = Some(value);
+        self
+    }
+
+    /// Sets the number of periods after which agreements complete.
+    pub fn period_count(mut self, value: u32) -> Self {
+        self.period_count = Some(value);
+        self
+    }
+
+    /// Sets the trial in days.
+    pub fn trial_days(mut self, value: u32) -> Self {
+        self.trial_days = Some(value);
+        self
+    }
+
+    /// Sets the page where the customer cancels.
+    pub fn cancel_url(mut self, value: impl Into<String>) -> Self {
+        self.cancel_url = Some(value.into());
+        self
+    }
+
+    /// Adds a body field this struct does not model yet.
+    pub fn extra(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.extra.insert(key.into(), value);
+        self
+    }
+}
+
+/// The parameters for [`Client::update_plan`](crate::Client::update_plan). A
+/// field you do not set keeps its value. The amount, the currency and the
+/// interval cannot change.
+///
+/// ```
+/// use dominaite::PlanUpdate;
+///
+/// // A new name, and no trial for the agreements created from now on.
+/// let update = PlanUpdate::new().name("Pro 2027").trial_days(0);
+/// ```
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanUpdate {
+    /// The new display name, 1 to 100 characters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The new trial in days, 0 to 365, for the agreements created from now
+    /// on. 0 removes the trial.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trial_days: Option<u32>,
+    /// The new cancel page, an absolute `https` URL, on the emails from now
+    /// on. An empty string removes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancel_url: Option<String>,
+
+    /// Any additional field the API accepts that this struct does not model yet.
+    /// These are merged into the JSON body, after the fields above.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl PlanUpdate {
+    /// An update that changes nothing yet. Set at least one field: the API
+    /// refuses an empty update.
+    pub fn new() -> Self {
+        PlanUpdate::default()
+    }
+
+    /// Sets the new display name.
+    pub fn name(mut self, value: impl Into<String>) -> Self {
+        self.name = Some(value.into());
+        self
+    }
+
+    /// Sets the new trial in days. 0 removes the trial.
+    pub fn trial_days(mut self, value: u32) -> Self {
+        self.trial_days = Some(value);
+        self
+    }
+
+    /// Sets the new cancel page. An empty string removes it.
+    pub fn cancel_url(mut self, value: impl Into<String>) -> Self {
+        self.cancel_url = Some(value.into());
+        self
+    }
+
+    /// Adds a body field this struct does not model yet.
+    pub fn extra(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.extra.insert(key.into(), value);
+        self
+    }
+}
+
+/// A subscription plan, as [`Client::create_plan`](crate::Client::create_plan),
+/// [`Client::get_plan`](crate::Client::get_plan) and the other plan methods
+/// return it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Plan {
+    /// `plan_` followed by 32 hex characters. It is case-sensitive: store it
+    /// and send it back exactly as it is.
+    pub id: String,
+    /// The display name.
+    #[serde(default)]
+    pub name: String,
+    /// The charge per period in MINOR units of `currency`.
+    #[serde(default)]
+    pub amount: i64,
+    /// ISO 4217 currency.
+    #[serde(default)]
+    pub currency: String,
+    /// One of the [`interval_unit`] constants, or a unit this SDK does not
+    /// know yet.
+    #[serde(default)]
+    pub interval_unit: String,
+    /// How many units make one billing period.
+    #[serde(default)]
+    pub interval_count: i64,
+    /// The number of periods after which agreements complete. `None` bills
+    /// until cancelled.
+    #[serde(default)]
+    pub period_count: Option<i64>,
+    /// The trial in days for the agreements created from now on. 0 is no
+    /// trial.
+    #[serde(default)]
+    pub trial_days: i64,
+    /// One of the [`plan_status`] constants, or a status this SDK does not
+    /// know yet. Compare with [`Plan::is_active`].
+    #[serde(default)]
+    pub status: String,
+    /// The page where the customer cancels. `None` when the plan has none.
+    #[serde(default)]
+    pub cancel_url: Option<String>,
+    /// ISO 8601 UTC creation time.
+    #[serde(default)]
+    pub created_at: String,
+    /// ISO 8601 UTC, when the plan was archived. `None` while it is active.
+    #[serde(default)]
+    pub archived_at: Option<String>,
+
+    /// The unwrapped plan object as the gateway sent it, for fields this
+    /// struct does not model yet.
+    #[serde(skip)]
+    pub raw: Value,
+}
+
+impl Plan {
+    /// True only for `active`: the plan accepts new agreements. An unknown
+    /// status reads as not active.
+    pub fn is_active(&self) -> bool {
+        self.status == plan_status::ACTIVE
+    }
+}
+
+/// Interval unit wire values, on [`PlanRequest::interval_unit`] and
+/// [`Plan::interval_unit`].
+pub mod interval_unit {
+    /// Days. At most 365 per period.
+    pub const DAY: &str = "day";
+    /// Weeks. At most 52 per period.
+    pub const WEEK: &str = "week";
+    /// Months. At most 12 per period.
+    pub const MONTH: &str = "month";
+    /// Years. At most 1 per period.
+    pub const YEAR: &str = "year";
+
+    /// The whole vocabulary, in the order the contract lists it.
+    pub const ALL: [&str; 4] = [DAY, WEEK, MONTH, YEAR];
+}
+
+/// Plan status wire values, on [`Plan::status`]. A value outside this list is
+/// a status added after this release; treat it as not active.
+pub mod plan_status {
+    /// The plan accepts new agreements.
+    pub const ACTIVE: &str = "active";
+    /// [`Client::delete_plan`](crate::Client::delete_plan) archived it: it
+    /// accepts no new agreements, and the agreements it has continue.
+    pub const ARCHIVED: &str = "archived";
+
+    /// The whole vocabulary, in the order the contract lists it.
+    pub const ALL: [&str; 2] = [ACTIVE, ARCHIVED];
+}
+
+/// The parameters for [`Client::create_agreement`](crate::Client::create_agreement):
+/// subscribe one of your customers to a plan.
+///
+/// `plan_id`, `customer_reference` and the idempotency key are required and
+/// come from [`AgreementRequest::new`]; the rest are builder methods. The body
+/// is these fields in this order, then the `extra` fields. The agreement is
+/// created `pending` and nothing is charged: the subscription session
+/// ([`CheckoutSessionRequest::agreement_id`]) takes the first payment, saves
+/// the card and activates it.
+///
+/// ```
+/// use dominaite::{AgreementRequest, IdempotencyKey};
+///
+/// # fn main() -> Result<(), dominaite::Error> {
+/// let key = IdempotencyKey::new("subscription-8817")?;
+/// let request = AgreementRequest::new(
+///     "plan_0123456789abcdef0123456789abcdef",
+///     "customer-77",
+///     key,
+/// );
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgreementRequest {
+    /// The `plan_` handle of one of your active plans.
+    pub plan_id: String,
+    /// Your own id for the customer, 1 to 100 characters, the same on every
+    /// agreement of this customer.
+    pub customer_reference: String,
+    /// The `pm_` handle of an active card this customer already saved through
+    /// checkout, to bill instead of saving a new card in the subscription
+    /// session. The card must come from a payment in the plan's currency.
+    /// Requires `consent`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_payment_method_id: Option<String>,
+    /// The customer's acceptance, when your own page captured it. Required
+    /// with `stored_payment_method_id` and with `max_amount_per_period`.
+    /// Without them you can leave it out, and the subscription session
+    /// captures it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consent: Option<Consent>,
+    /// Only for a variable amount (a seat price plus usage): the most one
+    /// charge under the agreement may be, in MINOR units of the plan's
+    /// currency, at least the plan's amount. One charge per period is
+    /// allowed, so this is also the cap per period. Requires `consent`. Leave
+    /// it out for a fixed agreement: every charge is then exactly the plan's
+    /// amount.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_amount_per_period: Option<i64>,
+
+    /// Required. It travels in the header and in the signature, never in the
+    /// body. The same key with the same body answers the agreement it
+    /// created, so a create whose answer you lost is safe to send again with
+    /// the same key. Derive it from your own subscription record.
+    #[serde(skip)]
+    pub idempotency_key: IdempotencyKey,
+
+    /// Any additional field the API accepts that this struct does not model yet.
+    /// These are merged into the JSON body, after the fields above.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl AgreementRequest {
+    /// An agreement that subscribes `customer_reference` to `plan_id`. The key
+    /// is required: derive it from your own subscription record.
+    pub fn new(
+        plan_id: impl Into<String>,
+        customer_reference: impl Into<String>,
+        idempotency_key: IdempotencyKey,
+    ) -> Self {
+        AgreementRequest {
+            plan_id: plan_id.into(),
+            customer_reference: customer_reference.into(),
+            stored_payment_method_id: None,
+            consent: None,
+            max_amount_per_period: None,
+            idempotency_key,
+            extra: Map::new(),
+        }
+    }
+
+    /// Bills this saved card. Requires [`AgreementRequest::consent`].
+    pub fn stored_payment_method_id(mut self, value: impl Into<String>) -> Self {
+        self.stored_payment_method_id = Some(value.into());
+        self
+    }
+
+    /// Sets the consent your own page captured.
+    pub fn consent(mut self, value: Consent) -> Self {
+        self.consent = Some(value);
+        self
+    }
+
+    /// Makes this a variable agreement with this cap per charge. Requires
+    /// [`AgreementRequest::consent`].
+    pub fn max_amount_per_period(mut self, value: i64) -> Self {
+        self.max_amount_per_period = Some(value);
+        self
+    }
+
+    /// Adds a body field this struct does not model yet.
+    pub fn extra(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.extra.insert(key.into(), value);
+        self
+    }
+}
+
+/// A subscription agreement, as
+/// [`Client::create_agreement`](crate::Client::create_agreement) and
+/// [`Client::get_agreement`](crate::Client::get_agreement) return it.
+///
+/// It keeps its own copy of the plan's price and interval from the time it was
+/// created, so it does not change when the plan changes.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Agreement {
+    /// `agr_` followed by 32 hex characters. It is case-sensitive: store it
+    /// and send it back exactly as it is.
+    pub id: String,
+    /// The `plan_` handle the agreement was created from.
+    #[serde(default)]
+    pub plan_id: String,
+    /// Your own id for the customer, as sent.
+    #[serde(default)]
+    pub customer_reference: String,
+    /// The `pm_` handle of the card on file. `None` until a card is saved.
+    #[serde(default)]
+    pub stored_payment_method_id: Option<String>,
+    /// One of the [`agreement_status`] constants, or a status this SDK does
+    /// not know yet. Compare with [`Agreement::is_active`].
+    #[serde(default)]
+    pub status: String,
+    /// The charge per period in MINOR units of `currency`.
+    #[serde(default)]
+    pub amount: i64,
+    /// On a variable agreement, the most one charge may be, in MINOR units.
+    /// `None` on a fixed agreement: every charge is exactly `amount`.
+    #[serde(default)]
+    pub max_amount_per_period: Option<i64>,
+    /// ISO 4217 currency. One currency per agreement.
+    #[serde(default)]
+    pub currency: String,
+    /// One of the [`interval_unit`] constants, or a unit this SDK does not
+    /// know yet.
+    #[serde(default)]
+    pub interval_unit: String,
+    /// How many units make one billing period.
+    #[serde(default)]
+    pub interval_count: i64,
+    /// The number of periods. `None` bills until cancelled.
+    #[serde(default)]
+    pub period_count: Option<i64>,
+    /// The trial in days.
+    #[serde(default)]
+    pub trial_days: i64,
+    /// ISO 8601 UTC of the next scheduled charge. `None` while pending and
+    /// once the agreement has ended.
+    #[serde(default)]
+    pub next_charge_at: Option<String>,
+    /// Why the agreement is `past_due`: one of the [`past_due_reason`]
+    /// constants, or a reason this SDK does not know yet. `None` in every
+    /// other status.
+    #[serde(default)]
+    pub past_due_reason: Option<String>,
+    /// ISO 8601 UTC, when the agreement went past due. `None` in every other
+    /// status.
+    #[serde(default)]
+    pub past_due_at: Option<String>,
+    /// The recorded consent and the platform's receipt of it. `None` until
+    /// consent is captured.
+    #[serde(default)]
+    pub consent: Option<ConsentRecord>,
+    /// Starts at 1. It goes up when the price changes for a future period.
+    #[serde(default)]
+    pub version: i64,
+    /// The agreement's transition counter as of this read: the
+    /// `data.sequence` of the latest `agreement.*` webhook about it, 0 before
+    /// its first transition. Compare it with the highest sequence you
+    /// processed, as you do for an event
+    /// ([`WebhookEvent::sequence`](crate::WebhookEvent::sequence)).
+    #[serde(default)]
+    pub sequence: i64,
+    /// ISO 8601 UTC creation time.
+    #[serde(default)]
+    pub created_at: String,
+    /// ISO 8601 UTC, when the agreement went active. `None` while pending.
+    #[serde(default)]
+    pub activated_at: Option<String>,
+    /// ISO 8601 UTC, when you cancelled it. `None` unless cancelled.
+    #[serde(default)]
+    pub cancelled_at: Option<String>,
+
+    /// The unwrapped agreement object as the gateway sent it, for fields this
+    /// struct does not model yet.
+    #[serde(skip)]
+    pub raw: Value,
+}
+
+impl Agreement {
+    /// True only for `active`: the customer paid the first period and the
+    /// platform charges each period. An unknown status reads as not active.
+    pub fn is_active(&self) -> bool {
+        self.status == agreement_status::ACTIVE
+    }
+}
+
+/// The consent recorded on an [`Agreement`]: the three fields exactly as they
+/// were sent (on the agreement or on the subscription session), plus the
+/// platform's own receipt, which no request can set.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsentRecord {
+    /// The consent text version, as sent.
+    #[serde(default)]
+    pub text_version: String,
+    /// When the customer accepted, ISO 8601 UTC, as sent.
+    #[serde(default)]
+    pub accepted_at: Option<String>,
+    /// The customer's IP address at acceptance, as sent.
+    #[serde(default)]
+    pub ip: String,
+    /// When the consent reached the platform, ISO 8601 UTC, by the server
+    /// clock.
+    #[serde(default)]
+    pub received_at: Option<String>,
+    /// The address of the server that sent the consent to the platform, not
+    /// the customer's. `None` unless the platform's own network edge recorded
+    /// it.
+    #[serde(default)]
+    pub received_from_ip: Option<String>,
+}
+
+/// The agreement on a status read: enough to know whether the subscription
+/// started. Read the whole agreement with
+/// [`Client::get_agreement`](crate::Client::get_agreement).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgreementSummary {
+    /// The `agr_` handle.
+    #[serde(default)]
+    pub id: String,
+    /// One of the [`agreement_status`] constants, or a status this SDK does
+    /// not know yet.
+    #[serde(default)]
+    pub status: String,
+    /// ISO 8601 UTC of the next scheduled charge. `None` while pending and once
+    /// the agreement has ended.
+    #[serde(default)]
+    pub next_charge_at: Option<String>,
+}
+
+/// Agreement status wire values, on [`Agreement::status`] and
+/// [`AgreementSummary::status`]. A value outside this list is a status added
+/// after this release; treat it as not active.
+pub mod agreement_status {
+    /// Created, nothing charged yet. The subscription session activates it.
+    pub const PENDING: &str = "pending";
+    /// The customer paid the first period and the card is on file; the
+    /// platform charges each period.
+    pub const ACTIVE: &str = "active";
+    /// The platform gave up on the current period on this card, and makes no
+    /// further attempt on it; `past_due_reason` says why. It stays past due
+    /// until the period is paid on another card, which makes it active again,
+    /// or until you cancel it. A soft decline that is still retried leaves
+    /// the agreement active.
+    pub const PAST_DUE: &str = "past_due";
+    /// You cancelled it. No further charge, ever. The platform never cancels
+    /// an agreement on its own.
+    pub const CANCELLED: &str = "cancelled";
+    /// Every period of the plan was charged.
+    pub const COMPLETED: &str = "completed";
+    /// A terminal failure. Reserved: the platform does not set it today. An
+    /// agreement whose period cannot be collected is `past_due` instead.
+    pub const FAILED: &str = "failed";
+
+    /// The whole vocabulary, in the order the contract lists it.
+    pub const ALL: [&str; 6] = [PENDING, ACTIVE, PAST_DUE, CANCELLED, COMPLETED, FAILED];
+}
+
+/// Why an agreement is past due, on [`Agreement::past_due_reason`]. A value
+/// outside this list is a reason added after this release.
+pub mod past_due_reason {
+    /// The card's expiry month is over. Ask the customer for a new card.
+    pub const CARD_EXPIRED: &str = "card_expired";
+    /// The card on file is no longer active, or the agreement has no card.
+    /// Ask the customer for a new card.
+    pub const CARD_REVOKED: &str = "card_revoked";
+    /// The issuer declined, and a retry on the same card does not help.
+    pub const HARD_DECLINE: &str = "hard_decline";
+    /// The soft declines used up all the retries.
+    pub const DUNNING_EXHAUSTED: &str = "dunning_exhausted";
+    /// The issuer wants strong customer authentication. The card is good, but
+    /// the next payment needs the customer present for a challenge.
+    pub const SCA_REQUIRED: &str = "sca_required";
+    /// The charge was refused for a reason that no retry fixes.
+    pub const UNPROCESSABLE: &str = "unprocessable";
+
+    /// The whole vocabulary, in the gateway's order.
+    pub const ALL: [&str; 6] = [
+        CARD_EXPIRED,
+        CARD_REVOKED,
+        HARD_DECLINE,
+        DUNNING_EXHAUSTED,
+        SCA_REQUIRED,
+        UNPROCESSABLE,
+    ];
+}
+
+/// What a webhook endpoint's `Debug` output prints instead of its signing
+/// secret.
+const REDACTED_WEBHOOK_SECRET: &str = "whsec_***redacted***";
+
+/// The parameters for
+/// [`Client::create_webhook_endpoint`](crate::Client::create_webhook_endpoint).
+///
+/// `url`, `events` and the idempotency key are required and come from
+/// [`WebhookEndpointRequest::new`]. The body is these fields in this order,
+/// then the `extra` fields.
+///
+/// ```
+/// use dominaite::{event_type, IdempotencyKey, WebhookEndpointRequest};
+///
+/// # fn main() -> Result<(), dominaite::Error> {
+/// let key = IdempotencyKey::new("webhook-orders-2026-10")?;
+/// let request = WebhookEndpointRequest::new(
+///     "https://shop.example/webhooks/dominaite",
+///     [event_type::PAYMENT_SUCCEEDED, event_type::PAYMENT_REFUNDED],
+///     key,
+/// );
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookEndpointRequest {
+    /// The URL that receives the deliveries: HTTPS on a public host, at most
+    /// 500 characters.
+    pub url: String,
+    /// The event types to deliver, 1 to 50 entries, from the [`event_type`]
+    /// constants. Duplicates count once. Matching is exact.
+    pub events: Vec<String>,
+
+    /// Required. It travels in the header and in the signature, never in the
+    /// body. After a timeout or a 503, send the request again WITH THE SAME
+    /// KEY: the retry replaces an endpoint that the lost attempt registered. A
+    /// new key cannot do that. Use a fresh key for each new endpoint.
+    #[serde(skip)]
+    pub idempotency_key: IdempotencyKey,
+
+    /// Any additional field the API accepts that this struct does not model yet.
+    /// These are merged into the JSON body, after the fields above.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl WebhookEndpointRequest {
+    /// An endpoint at `url` for the `events` you name. The key is required.
+    pub fn new<I, S>(url: impl Into<String>, events: I, idempotency_key: IdempotencyKey) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        WebhookEndpointRequest {
+            url: url.into(),
+            events: events.into_iter().map(Into::into).collect(),
+            idempotency_key,
+            extra: Map::new(),
+        }
+    }
+
+    /// Adds a body field this struct does not model yet.
+    pub fn extra(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.extra.insert(key.into(), value);
+        self
+    }
+}
+
+/// A webhook endpoint, as
+/// [`Client::create_webhook_endpoint`](crate::Client::create_webhook_endpoint)
+/// and [`Client::list_webhook_endpoints`](crate::Client::list_webhook_endpoints)
+/// return it.
+///
+/// Its `Debug` output never shows the signing secret, in `secret` or in
+/// `raw`.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookEndpoint {
+    /// The endpoint id, a UUID.
+    /// [`Client::delete_webhook_endpoint`](crate::Client::delete_webhook_endpoint)
+    /// takes it.
+    pub id: String,
+    /// The URL as registered.
+    #[serde(default)]
+    pub url: String,
+    /// The event types delivered to this endpoint.
+    #[serde(default)]
+    pub events: Vec<String>,
+    /// One of the [`webhook_endpoint_status`] constants, or a status this SDK
+    /// does not know yet.
+    #[serde(default)]
+    pub status: String,
+    /// ISO 8601 UTC, when the endpoint was registered.
+    #[serde(default)]
+    pub created_at: String,
+    /// The signing secret, `whsec_` followed by 64 hex characters. Only the
+    /// first answer of a create carries it: a replay and the list leave it
+    /// out, and no route shows it again. Store it in your secret store at
+    /// once, and verify deliveries with it through
+    /// [`verify_webhook`](crate::verify_webhook). Lost it? Delete the endpoint
+    /// and create it again. Never log it.
+    #[serde(default)]
+    pub secret: Option<String>,
+
+    /// The unwrapped endpoint object as the gateway sent it, for fields this
+    /// struct does not model yet. It holds the secret too, when there is one.
+    #[serde(skip)]
+    pub raw: Value,
+}
+
+impl fmt::Debug for WebhookEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut raw = self.raw.clone();
+        if let Some(secret) = raw.get_mut("secret").filter(|secret| !secret.is_null()) {
+            *secret = Value::from(REDACTED_WEBHOOK_SECRET);
+        }
+        f.debug_struct("WebhookEndpoint")
+            .field("id", &self.id)
+            .field("url", &self.url)
+            .field("events", &self.events)
+            .field("status", &self.status)
+            .field("created_at", &self.created_at)
+            .field(
+                "secret",
+                &self.secret.as_ref().map(|_| REDACTED_WEBHOOK_SECRET),
+            )
+            .field("raw", &raw)
+            .finish()
+    }
+}
+
+/// Webhook endpoint status wire values, on [`WebhookEndpoint::status`].
+pub mod webhook_endpoint_status {
+    /// Deliveries are sent.
+    pub const ACTIVE: &str = "active";
+    /// Deliveries are paused: the endpoint was switched off in the dashboard,
+    /// or after repeated failed deliveries. It does not count toward the limit
+    /// of 25 active endpoints.
+    pub const INACTIVE: &str = "inactive";
+
+    /// The whole vocabulary, in the order the contract lists it.
+    pub const ALL: [&str; 2] = [ACTIVE, INACTIVE];
+}
+
+/// The webhook event types, the `type` of a
+/// [`WebhookEvent`](crate::WebhookEvent) and the values of
+/// [`WebhookEndpointRequest::events`]. Three groups, as the API lists them. A
+/// type outside these lists is one added after this release; ignore an event
+/// you do not know.
+pub mod event_type {
+    /// The payment succeeded. Only this event means that the money is in
+    /// hand.
+    pub const PAYMENT_SUCCEEDED: &str = "payment.succeeded";
+    /// The payment failed.
+    pub const PAYMENT_FAILED: &str = "payment.failed";
+    /// The payment is authorized and waits for a capture, for example an
+    /// approved pre-authorization hold.
+    pub const PAYMENT_REQUIRES_CAPTURE: &str = "payment.requires_capture";
+    /// The payment was voided before it completed.
+    pub const PAYMENT_CANCELLED: &str = "payment.cancelled";
+    /// The checkout was never paid, and the platform closed it.
+    pub const PAYMENT_ABANDONED: &str = "payment.abandoned";
+    /// A refund completed. One event for each refund, partial or full.
+    pub const PAYMENT_REFUNDED: &str = "payment.refunded";
+    /// The payment was disputed (a chargeback).
+    pub const PAYMENT_DISPUTED: &str = "payment.disputed";
+
+    /// The subscription session's payment was approved, and the agreement
+    /// went active.
+    pub const AGREEMENT_ACTIVATED: &str = "agreement.activated";
+    /// The platform gave up on the current period on the agreement's card.
+    pub const AGREEMENT_PAST_DUE: &str = "agreement.past_due";
+    /// You cancelled the agreement.
+    pub const AGREEMENT_CANCELLED: &str = "agreement.cancelled";
+    /// A charge on a stored card was approved: one you made, or one the
+    /// platform placed for an agreement period.
+    pub const CHARGE_SUCCEEDED: &str = "charge.succeeded";
+    /// A charge on a stored card was declined, and nothing more is tried for
+    /// it.
+    pub const CHARGE_FAILED: &str = "charge.failed";
+    /// An agreement period was declined softly, and the platform tries the
+    /// same card again later. The agreement stays active.
+    pub const CHARGE_RETRYING: &str = "charge.retrying";
+
+    /// A verify-only session checked the card. Nobody was charged. The saved
+    /// card is in `data.storedPaymentMethod`; when that is null, read the
+    /// status.
+    pub const VERIFICATION_SUCCEEDED: &str = "verification.succeeded";
+    /// A verify-only session ended with no card saved: the issuer declined, or
+    /// the payer abandoned the checkout.
+    pub const VERIFICATION_FAILED: &str = "verification.failed";
+
+    /// The `payment.*` types, in the order of the contract's
+    /// `webhookEventCatalog`.
+    pub const PAYMENT: [&str; 7] = [
+        PAYMENT_SUCCEEDED,
+        PAYMENT_FAILED,
+        PAYMENT_REQUIRES_CAPTURE,
+        PAYMENT_CANCELLED,
+        PAYMENT_ABANDONED,
+        PAYMENT_REFUNDED,
+        PAYMENT_DISPUTED,
+    ];
+
+    /// The `agreement.*` and `charge.*` types, in the order of the contract's
+    /// `recurring.webhookEvents`.
+    pub const RECURRING: [&str; 6] = [
+        AGREEMENT_ACTIVATED,
+        AGREEMENT_PAST_DUE,
+        AGREEMENT_CANCELLED,
+        CHARGE_SUCCEEDED,
+        CHARGE_FAILED,
+        CHARGE_RETRYING,
+    ];
+
+    /// The `verification.*` types of a verify-only session, in the order of
+    /// the contract's `verification.webhookEvents`.
+    pub const VERIFICATION: [&str; 2] = [VERIFICATION_SUCCEEDED, VERIFICATION_FAILED];
+}
+
+/// The parameters for [`Client::list_transactions`](crate::Client::list_transactions):
+/// one page of your payments created in a window.
+///
+/// `from` and `to` are required and come from [`TransactionListParams::new`];
+/// the rest are builder methods. A parameter you do not set is left out of
+/// the query string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionListParams {
+    /// The window start, inclusive, on the payment's creation time: ISO 8601
+    /// UTC, e.g. `2026-10-01T00:00:00Z`. A date alone is midnight UTC.
+    pub from: String,
+    /// The window end, exclusive: ISO 8601 UTC, later than `from` and at most
+    /// 31 days after it. For a statement, end the window a few minutes in the
+    /// past, so payments still being written are not missed.
+    pub to: String,
+    /// Only payments that are in this status now: one of the [`status`]
+    /// constants.
+    pub status: Option<String>,
+    /// Items per page, 1 to 100. The API's default is 50.
+    pub limit: Option<u32>,
+    /// The [`TransactionPage::next_cursor`] of the previous page, unchanged.
+    /// Leave it out for the first page.
+    pub cursor: Option<String>,
+}
+
+impl TransactionListParams {
+    /// The first page of the window from `from` (inclusive) to `to`
+    /// (exclusive).
+    pub fn new(from: impl Into<String>, to: impl Into<String>) -> Self {
+        TransactionListParams {
+            from: from.into(),
+            to: to.into(),
+            status: None,
+            limit: None,
+            cursor: None,
+        }
+    }
+
+    /// Lists only the payments in this status.
+    pub fn status(mut self, value: impl Into<String>) -> Self {
+        self.status = Some(value.into());
+        self
+    }
+
+    /// Sets the page size, 1 to 100.
+    pub fn limit(mut self, value: u32) -> Self {
+        self.limit = Some(value);
+        self
+    }
+
+    /// Asks for the page after the one that answered this cursor.
+    pub fn cursor(mut self, value: impl Into<String>) -> Self {
+        self.cursor = Some(value.into());
+        self
+    }
+}
+
+/// One page of [`Client::list_transactions`](crate::Client::list_transactions).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionPage {
+    /// The payments of this page, oldest first by `created_at`, then by
+    /// `transaction_id`. Empty when the window has none.
+    #[serde(default)]
+    pub items: Vec<Transaction>,
+    /// The cursor of the next page. `None` on the last page of the window.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+
+    /// The unwrapped page as the gateway sent it, for fields this struct does
+    /// not model yet.
+    #[serde(skip)]
+    pub raw: Value,
+}
+
+/// One payment in a [`TransactionPage`]. The fields and values agree with the
+/// status read ([`CheckoutStatus`]) of the same `transaction_id`, with the
+/// status at the time of the read.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Transaction {
+    /// The payment id, as the session or the charge returned it.
+    pub transaction_id: String,
+    /// Your own order id from the session create call. `None` when none was
+    /// sent.
+    #[serde(default)]
+    pub order_reference: Option<String>,
+    /// How the payment was taken: one of the [`transaction_type`] constants,
+    /// or a type this SDK does not know yet.
+    #[serde(default, rename = "type")]
+    pub transaction_type: String,
+    /// One of the [`status`] constants, or a status this SDK does not know
+    /// yet. The same value the status read answers.
+    #[serde(default)]
+    pub status: String,
+    /// The payment amount in MINOR units of `currency`.
+    #[serde(default)]
+    pub amount: i64,
+    /// ISO 4217 currency.
+    #[serde(default)]
+    pub currency: String,
+    /// ISO 8601 UTC, when the payment was created. The window and the order
+    /// use this time.
+    #[serde(default)]
+    pub created_at: String,
+    /// ISO 8601 UTC, when the payment first succeeded. `None` when it never
+    /// succeeded, and on older payments that succeeded before this time was
+    /// recorded.
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    /// On a `charge`: the `pm_` handle of the saved card that was charged.
+    /// `None` on a checkout payment, and on an old charge that did not record
+    /// its card.
+    #[serde(default)]
+    pub stored_payment_method_id: Option<String>,
+    /// The total refunded so far, in MINOR units. `None` when nothing was
+    /// refunded.
+    #[serde(default)]
+    pub refunded_amount: Option<i64>,
+
+    /// This item as the gateway sent it, for fields this struct does not
+    /// model yet.
+    #[serde(skip)]
+    pub raw: Value,
+}
+
+/// How a payment in the transaction list was taken, on
+/// [`Transaction::transaction_type`]. A value outside this list is a type
+/// added after this release.
+pub mod transaction_type {
+    /// The payer paid on the hosted checkout.
+    pub const PAYMENT: &str = "payment";
+    /// A saved card was charged: by your server through
+    /// [`Client::charge_payment_method`](crate::Client::charge_payment_method),
+    /// or by the platform for an agreement period.
+    pub const CHARGE: &str = "charge";
+    /// A verify-only session saved a card. Not a purchase: the verification
+    /// amount is released, or refunded when it was captured. Leave it out of
+    /// revenue.
+    pub const VERIFICATION: &str = "verification";
+
+    /// The whole vocabulary, in the order the contract lists it.
+    pub const ALL: [&str; 3] = [PAYMENT, CHARGE, VERIFICATION];
 }

@@ -738,20 +738,7 @@ fn charge_payment_method_matches_the_contract() {
     assert_eq!(charge["httpStatus"], 201);
     assert_eq!(charge["declinedHttpStatus"], 402);
 
-    // `sequence` is modelled ahead of the fixture: the gateway adds it to the
-    // charge answer in a follow-up, and the SDK reads it as optional so it works
-    // against servers that do not send it yet. Once the refreshed fixture lists
-    // it, this allowance fails and must be deleted.
-    const AHEAD_OF_FIXTURE: [&str; 1] = ["sequence"];
-    let mut modelled = strings(&charge["fields"]);
-    for field in AHEAD_OF_FIXTURE {
-        assert!(
-            !modelled.iter().any(|f| f == field),
-            "the fixture now lists {field}; remove it from AHEAD_OF_FIXTURE"
-        );
-        modelled.push(field.to_string());
-    }
-    assert_fields::<PaymentMethodCharge>("PaymentMethodCharge", &modelled);
+    assert_fields::<PaymentMethodCharge>("PaymentMethodCharge", &strings(&charge["fields"]));
 
     // Both examples are envelopes whose data carries exactly the declared
     // fields, nulls included.

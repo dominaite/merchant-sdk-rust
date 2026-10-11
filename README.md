@@ -16,7 +16,7 @@ through. A git dependency works today:
 
 ```toml
 [dependencies]
-dominaite = { git = "https://github.com/dominaite/merchant-sdk-rust", tag = "v0.4.0" }
+dominaite = { git = "https://github.com/dominaite/merchant-sdk-rust", tag = "v0.5.0" }
 ```
 
 To work on the SDK itself:
@@ -42,13 +42,32 @@ on NTP - signatures older than 5 minutes are rejected with `TIMESTAMP_OUT_OF_RAN
 If the key has an IP allowlist, calls from anywhere else fail with `IP_NOT_ALLOWED`. The
 allowlist is managed on the same dashboard tab.
 
+### Key scopes
+
+Each key holds one or more scopes. A route answers only a key that holds its scope:
+
+| Scope | What the key can call |
+|---|---|
+| `payments` | Checkout sessions and status reads, stored card charges and revokes, refunds, plans and agreements. |
+| `transactions:read` | `list_transactions`. |
+| `webhooks:manage` | `create_webhook_endpoint`, `list_webhook_endpoints` and `delete_webhook_endpoint`. |
+
+A key holds `payments` alone, or one or both of the other two scopes. A key with
+`transactions:read` or `webhooks:manage` is a reporting key, and it is not bound to one
+storefront. A key issued without scopes holds `payments`. The scopes of a key are fixed when it
+is issued: to change them, issue a new key. Every key can call `ping` and
+`get_integration_contract`.
+
+A call with a key that does not hold the scope fails with `Error::Forbidden`, code
+`INSUFFICIENT_SCOPE` (HTTP 403). Nothing was created. Use a key that holds the scope.
+
 ## Quickstart (zero to a signed session against dev)
 
 Everything below is copy-paste. It assumes an empty directory and nothing installed.
 
 ```sh
 cargo new my-checkout && cd my-checkout
-cargo add --git https://github.com/dominaite/merchant-sdk-rust --tag v0.4.0 dominaite
+cargo add --git https://github.com/dominaite/merchant-sdk-rust --tag v0.5.0 dominaite
 ```
 
 Set your credentials and the environment you are pointing at:
@@ -403,7 +422,7 @@ match client.charge_payment_method(
             Some(decline_class::HARD) => stop_charging(&method_id),      // never retry
             Some(decline_class::SOFT_FUNDS) => retry_in_a_few_days(),
             Some(decline_class::SOFT_SCA_REQUIRED) => bring_the_payer_back(), // needs a session
-            _ => retry_later(),                                              // soft_other
+            _ => retry_later(), // soft_other, a class added later, or no class
         },
     },
     Err(Error::Charge { code, transaction_id, .. }) => match code.as_str() {
@@ -422,10 +441,11 @@ match client.charge_payment_method(
 ```
 
 `charge_payment_method` returns `Ok` for HTTP 201 and for HTTP 402 alike. A decline is a result,
-not an error: the 402 charge has `status: "failed"` and a `decline_class` (`hard`, `soft_funds`,
-`soft_sca_required` or `soft_other`) plus the provider's `decline_code`. `is_paid()` and
-`is_terminal()` read the same way they do on a session status; `pending` is the one status
-that is not terminal.
+not an error: the 402 charge has `status: "failed"`, a `decline_class` (`hard`, `soft_funds`,
+`soft_sca_required` or `soft_other`) and the provider's `decline_code`. `decline_class` can be
+`None`, for example when nobody declined the payment. `get_status` carries the latest class.
+Never read `None` as `hard`. `is_paid()` and `is_terminal()` read the same way they do on a
+session status; `pending` is the one status that is not terminal.
 
 `Error::Charge` is the gateway answering with an error code instead of a charge: HTTP 409
 (`PAYMENT_METHOD_NOT_ACTIVE`, `DUPLICATE_REQUEST`), 422 (`IDEMPOTENCY_KEY_REUSED`), 502
@@ -462,6 +482,117 @@ shared byte-for-byte with the gateway: the charge vector signs
 `00000000-0000-4000-8000-000000000003` and body
 `{"amount":2500,"currency":"EUR","orderReference":"order-1043"}`, the revoke vector signs the
 `DELETE` with nothing else.
+
+### Save a card without a payment
+
+Set `verify_only(true)` on the session to save a card with no payment. Send an amount of 0: the
+platform sets the amount of the check. Any other amount fails with `Error::Validation` before
+anything is sent. The session always saves the card, so you do not need `save_card`. It works
+only with the widget. The API refuses it with `save_card(false)`, with `Integration::Fields`
+and with an `agreement_id`.
+
+```rust
+use dominaite::{CheckoutSessionRequest, IdempotencyKey};
+
+let request = CheckoutSessionRequest::new(
+    0,
+    "EUR",
+    "card-check-8817",
+    IdempotencyKey::new("card-check-8817")?,
+)
+.verify_only(true);
+let session = client.create_checkout_session(&request)?;
+```
+
+The checkout places a small authorization to check the card. The platform releases it within
+about 15 minutes, and nobody is charged. On the status read, `verify_only` is true. Its
+`status` is `requires_capture`, then `cancelled` when the authorization is released. A
+`stored_payment_method` that is not `None` tells you that the card is verified.
+
+A verify-only session sends `verification.succeeded` or `verification.failed`, never a
+`payment.*` event. On `verification.failed`, `decline_class` tells you why. It can be `None`,
+for example when nobody declined the card. In `list_transactions` the session is a row of type
+`verification`, and it is not revenue.
+
+Verify-only sessions work only on an account where they are switched on. We switch it on for
+your account. Until then, the call fails with `Error::Forbidden`, code `VERIFY_ONLY_NOT_ENABLED`
+(HTTP 403). Nothing was created, and you can use the same idempotency key again.
+
+## Subscriptions
+
+A plan is a recurring price that you sell. An agreement subscribes one of your customers to a
+plan. The platform then charges the saved card each period.
+
+1. Create a plan once for each price with `create_plan`.
+2. Create an agreement for the customer with `create_agreement`. It starts `pending` and
+   charges nothing.
+3. Create a subscription session: `create_checkout_session` with the `agreement_id` and the
+   customer's `consent`. The checkout takes the first payment and saves the card.
+4. When that payment is approved, the agreement goes `active`. The platform then charges each
+   period and sends the `agreement.*` and `charge.*` webhooks.
+
+```rust
+use dominaite::{
+    interval_unit, AgreementRequest, CheckoutSessionRequest, Consent, IdempotencyKey, PlanRequest,
+};
+
+let plan = client.create_plan(&PlanRequest::new(
+    "Pro monthly",
+    1999, // minor units, each period
+    "EUR",
+    interval_unit::MONTH, // day, week, month or year
+    IdempotencyKey::new("plan-pro-monthly-1999-EUR")?,
+))?;
+
+let agreement = client.create_agreement(&AgreementRequest::new(
+    &plan.id,
+    customer_id, // your own id for the customer
+    IdempotencyKey::new(format!("subscription-{subscription_id}"))?,
+))?;
+
+let session = client.create_checkout_session(
+    &CheckoutSessionRequest::new(
+        agreement.amount, // the agreement's amount, exactly
+        &agreement.currency,
+        format!("subscription-{subscription_id}"),
+        IdempotencyKey::new(format!("subscription-{subscription_id}-first"))?,
+    )
+    .agreement_id(&agreement.id)
+    // The version of the platform consent text that your page showed.
+    .consent(Consent::new("recurring-2026-09", accepted_at, customer_ip)),
+)?;
+```
+
+On the subscription session, the consent `text_version` is the version of the platform consent
+text that your page showed: one of `recurring.consentTextVersions` in the integration contract.
+On `create_agreement`, the consent `text_version` is your own label for your own wording.
+Without a trial, the session amount is the agreement's amount. With a trial, you choose the
+session amount, and the first scheduled charge comes when the trial ends. When the session
+cannot start the subscription, it fails with `Error::Refusal`, for example with code
+`SUBSCRIPTIONS_NOT_ENABLED` or `AGREEMENT_NOT_PENDING`.
+
+The amount, the currency and the interval of a plan never change. For a new price, create a new
+plan and archive the old one with `delete_plan`. The existing agreements keep their own price.
+`update_plan` changes only the name, the trial and the cancel page (`PlanUpdate`). It sends no
+`Idempotency-Key`, because the API does not replay a plan update.
+
+`create_plan` and `create_agreement` need an idempotency key. The same key with the same body
+answers the same object again, so you can repeat a create that timed out. The same key with
+another body fails with `Error::Api`, code `IDEMPOTENCY_KEY_REUSED` (422).
+
+`get_agreement` answers the `status` (the `agreement_status` constants) and `next_charge_at`. On
+`past_due` it also answers `past_due_reason` (the `past_due_reason` constants) and `past_due_at`.
+For `card_expired` and `card_revoked`, ask the customer for a new card. The status read of a
+subscription session carries `is_recurring`, `agreement` (`id`, `status`, `next_charge_at`) and
+`sequence`.
+
+`cancel_agreement` stops all further charges. It does not reverse a charge that was already
+placed. Cancelling a cancelled agreement succeeds again. A completed or failed agreement fails
+with `Error::Api`, code `AGREEMENT_ENDED` (409).
+
+The plan and agreement methods fail with `Error::Api` and the API's code, for example
+`PLAN_NOT_FOUND` (404), `PLAN_NOT_ACTIVE` (409) or `AGREEMENT_CONSENT_REQUIRED` (422). The whole
+answer is in its `raw`.
 
 ## Refunds
 
@@ -537,12 +668,28 @@ The refund routes answer these codes as `Error::Api` with the status and code se
 `Error::Transport`: retry with the same key. `REFUND_FAILED` is never an HTTP error, only a
 `failure_code` on a refund that was accepted and then failed.
 
+### List the refunds of a payment
+
+`list_refunds(transaction_id)` answers the refunds that you created through the API, newest
+first, in the shape `get_refund` answers. It also answers two totals of the payment:
+`refunded_amount` and `refundable_amount`. The totals also count the refunds made in the
+dashboard. Use `refundable_amount` to size the next refund. An unknown payment fails with
+`Error::Api`, code `PAYMENT_NOT_FOUND` (404).
+
+```rust
+let list = client.list_refunds(&transaction_id)?;
+if list.refundable_amount > 0 {
+    offer_refund(&order_id, list.refundable_amount);
+}
+```
+
 ## Webhooks
 
 Webhooks are how you find out a payment succeeded without asking. Point an endpoint at your
 server on the dashboard's **Webhooks** tab, pick the events you care about, and store the
 `whsec_...` secret it shows you - it is shown exactly once, and regenerating it kills the old
-one.
+one. You can also register endpoints from your code: see
+[Manage endpoints with the API](#manage-endpoints-with-the-api).
 
 **Verify the signature before you parse the body.** An unverified webhook is an
 unauthenticated stranger POSTing JSON at your server.
@@ -635,11 +782,13 @@ fields you do not recognise. A redelivery keeps the `apiVersion` of its first at
 `WebhookEvent` gives you `id`, `event_type` (`type` on the wire), `api_version`, `created_at` and
 `data` as a `serde_json::Value`, whose shape depends on the type.
 
-`event.payment_data()` types `data` on `payment.*` events as `PaymentEventData`
-(`transaction_id`, `status`, `previous_status`, `kind`, `amount`, `gross_amount`,
-`surcharge_amount`, `currency`, `payment_method`, `wallet_type`, `original_transaction_id`,
-`idempotency_key`, `order_reference`, `order_id`, `psp_reference`, `description`, `payment_method_brand`,
-`payment_method_last4`, `stored_payment_method`) and is `None` on other event types. Webhooks
+`event.payment_data()` types `data` on `payment.*` and `verification.*` events as
+`PaymentEventData` (`transaction_id`, `status`, `previous_status`, `kind`, `amount`,
+`gross_amount`, `surcharge_amount`, `currency`, `payment_method`, `wallet_type`,
+`original_transaction_id`, `idempotency_key`, `order_reference`, `order_id`, `psp_reference`,
+`description`, `payment_method_brand`, `payment_method_last4`, `stored_payment_method`,
+`verify_only`, `decline_class`) and is `None` on other event types. `verify_only` is true only
+on a `verification.*` event. Webhooks
 spell unset values as explicit `null`; they read as `None`, the same as a missing field.
 
 `payment.succeeded` (and `payment.requires_capture` for an authorization) can carry
@@ -685,9 +834,16 @@ sends it).
 
 ### Events
 
-`payment.succeeded`, `payment.failed`, `payment.requires_capture`, `payment.cancelled`,
-`payment.abandoned`, `payment.refunded`, `payment.disputed`. That is the whole set, exact case;
-registering anything else is rejected.
+The `dominaite::event_type` constants name every event type, in three groups:
+
+- `event_type::PAYMENT`: `payment.succeeded`, `payment.failed`, `payment.requires_capture`,
+  `payment.cancelled`, `payment.abandoned`, `payment.refunded`, `payment.disputed`.
+- `event_type::RECURRING`: `agreement.activated`, `agreement.past_due`, `agreement.cancelled`,
+  `charge.succeeded`, `charge.failed`, `charge.retrying`.
+- `event_type::VERIFICATION`: `verification.succeeded`, `verification.failed`.
+
+An endpoint can subscribe to any of them, exact case. Registering anything else is rejected.
+Ignore an event type that you do not know: a later release can add one.
 
 `payment.succeeded` is the only signal that means money is in hand. `requires_capture` includes
 approved pre-auth holds, `cancelled` is a pre-completion void only, `abandoned` is the sweep's
@@ -712,6 +868,48 @@ Webhooks complement your reconciliation sweep, they do not replace it. There are
 windows - there is no publish outbox, and chains parked on a disabled endpoint stay parked - so
 keep a periodic sweep that reads status for orders you believe are unpaid and settles the
 difference. Treat webhooks as the fast path and the sweep as the source of truth.
+
+### Manage endpoints with the API
+
+These three methods need a key with the `webhooks:manage` scope (see [Key scopes](#key-scopes)).
+
+```rust
+use dominaite::{event_type, IdempotencyKey, WebhookEndpointRequest};
+
+let endpoint = client.create_webhook_endpoint(&WebhookEndpointRequest::new(
+    "https://shop.example/webhooks/dominaite",
+    event_type::PAYMENT.iter().chain(&event_type::RECURRING).copied(),
+    IdempotencyKey::new("webhook-shop-2026-10")?,
+))?;
+// Only this answer carries the secret. Store it now.
+store_secret(&endpoint.id, endpoint.secret.as_deref());
+
+for endpoint in client.list_webhook_endpoints()? {
+    println!("{} {} {}", endpoint.id, endpoint.status, endpoint.url);
+}
+
+client.delete_webhook_endpoint(&old_endpoint_id)?;
+```
+
+`create_webhook_endpoint` needs an idempotency key. Only its first answer carries the signing
+secret (`whsec_` followed by 64 hex characters). A replay with the same key answers the same
+endpoint without the secret. Lost the secret? Delete the endpoint and create it again. The `Debug`
+output of `WebhookEndpoint` never shows the secret.
+
+After a timeout or a 503, send the create again with the SAME key. The retry replaces an
+endpoint that the lost attempt registered. A new key cannot do that. The url must be HTTPS on a
+public host, or the create fails with `Error::Api`, code `WEBHOOK_URL_REJECTED` (400). With 25
+active endpoints, it fails with `WEBHOOK_LIMIT_REACHED` (409).
+
+A key used again more than a day after its first use, while its endpoint still exists, fails
+with `WEBHOOK_ALREADY_REGISTERED` (409). The id of that endpoint is in the error's `raw`, under
+`error.params.webhookId`. Use a fresh key for a new endpoint.
+
+`list_webhook_endpoints` answers your endpoints, newest first: every active endpoint and your
+newest 1000 inactive ones. It never shows a secret. `delete_webhook_endpoint` removes an
+endpoint, and it stops receiving deliveries. An id that is unknown or already deleted fails
+with `WEBHOOK_NOT_FOUND` (404). After a lost answer, a retry therefore fails with 404: treat
+that as done.
 
 ## Status polling (fallback)
 
@@ -751,6 +949,58 @@ key and 120 per minute per IP; over that you get `Error::RateLimited`.
 Every response type also carries `raw` (a `serde_json::Value`) with the unparsed payload, for
 fields the structs do not model yet.
 
+## Transactions
+
+`list_transactions` lists your payments created in a window, oldest first. It needs a key with
+the `transactions:read` scope (see [Key scopes](#key-scopes)). The rows are checkout payments,
+charges on saved cards and verify-only sessions. A refund is not a row of its own: it shows on
+its payment, in `refunded_amount` and `status`. Fees are not part of this read.
+
+```rust
+use dominaite::{transaction_type, TransactionListParams};
+
+let mut params =
+    TransactionListParams::new("2026-10-01T00:00:00Z", "2026-10-08T00:00:00Z").limit(100);
+loop {
+    let page = client.list_transactions(&params)?;
+    for transaction in &page.items {
+        if transaction.transaction_type != transaction_type::VERIFICATION {
+            book(transaction);
+        }
+    }
+    match page.next_cursor {
+        Some(cursor) => params = params.cursor(cursor),
+        None => break,
+    }
+}
+```
+
+1. The window is `from` (inclusive) to `to` (exclusive), on the creation time of the payment.
+   Both are ISO 8601 UTC, at most 31 days apart.
+2. Send `next_cursor` back as the cursor, with the same `from`, `to` and `status`, until it is
+   `None`. Paging never repeats or skips a row.
+3. A page holds 1 to 100 rows (`limit`, 50 by default).
+4. `status` lists only the payments that are in that status now.
+
+Each row has the status at the time of the read. For a statement, end the window a few minutes
+in the past, so payments still being written are not missed. Read again later to pick up
+changes such as refunds. A key bound to a storefront lists the payments of that storefront
+only. The parameters travel in the query string, which is not part of the signature.
+
+## Integration contract
+
+`get_integration_contract` reads the machine-readable contract of the API: its routes, fields,
+vocabularies and error codes. Every key can read it. `IntegrationContract` types `version`,
+`statuses` and `webhook_event_catalog` (the `payment.*` event types). `raw` keeps the whole
+document, for example `recurring.consentTextVersions` and
+`recurring.subscriptionSessionOutcomes`. Check `version` in a startup or CI check to learn when
+the API moved on.
+
+```rust
+let contract = client.get_integration_contract()?;
+let consent_versions = &contract.raw["recurring"]["consentTextVersions"];
+```
+
 ## Errors
 
 Every call returns `Result<T, dominaite::Error>`. `Error` is an enum implementing
@@ -760,12 +1010,13 @@ string where there is one.
 | Variant | When | What to do |
 |---|---|---|
 | `Error::Refusal { code, .. }` | HTTP 200 with `success: false`. | Branch on `code`. Do not blind-retry. |
-| `Error::Auth { code, .. }` | 401/403. `code` is `INVALID_API_KEY`, `INVALID_SIGNATURE`, `TIMESTAMP_OUT_OF_RANGE`, or `IP_NOT_ALLOWED`. | Fix the key id, secret, server clock, or allowlist. Never retry-loop. |
+| `Error::Auth { code, .. }` | 401. `code` is `INVALID_API_KEY`, `INVALID_SIGNATURE`, `TIMESTAMP_OUT_OF_RANGE`, or `IP_NOT_ALLOWED`. | Fix the key id, secret, server clock, or allowlist. Never retry-loop. |
+| `Error::Forbidden { code, .. }` | 403. The request was signed correctly, but this key may not do this. `INSUFFICIENT_SCOPE`: the key does not hold the scope the route needs. `VERIFY_ONLY_NOT_ENABLED`: verify-only is not on for your account. | `INSUFFICIENT_SCOPE`: use a key that holds the scope; a key's scopes are fixed when it is issued. `VERIFY_ONLY_NOT_ENABLED`: we switch it on for your account. Never retry-loop. |
 | `Error::Transport { .. }` | Network failure, timeout, or a 5xx without a gateway code, including one whose body is an HTML error page from a proxy. The cause is reachable through `source()`. | Retry with the **same** idempotency key. `error.is_retryable()` is true only here. |
-| `Error::RateLimited { retry_after_seconds }` | 429. The platform allows 60 requests per minute per API key and 120 per minute per IP. | Wait `retry_after_seconds` (or back off yourself when it is `None`), then send the request again with the **same** idempotency key. Never auto-retried: `is_retryable()` is false. |
+| `Error::RateLimited { retry_after_seconds, code, .. }` | 429. The platform allows 60 requests per minute per API key and 120 per minute per IP (`code` `RATE_LIMIT_EXCEEDED`). The charge route has two limits of its own: `CHARGE_VELOCITY_EXCEEDED` and `CHARGE_DECLINE_RATE_EXCEEDED` (constants in `dominaite::rate_limit_error_code`). | Wait `retry_after_seconds` (or back off yourself when it is `None`), then send the request again with the **same** idempotency key. Never auto-retried: `is_retryable()` is false. |
 | `Error::Charge { status, code, charge, transaction_id, .. }` | `charge_payment_method` got an error code instead of a charge: 409, 422, 502 or 503. | Branch on `code` (see [Stored payment methods](#stored-payment-methods-recurring)). `CHARGE_OUTCOME_UNKNOWN` carries the `transaction_id` to poll; never retry it under a new key. |
 | `Error::Revoke { status, code, .. }` | `revoke_payment_method` was refused: 502 `UPSTREAM_CONTRACT_ERROR` or 503 `MERCHANT_API_UNAVAILABLE`. Nothing changed. | Retry later on 503; contact support on 502. |
-| `Error::Api { status, code, .. }` | Any other rejecting or unexpected response. `code` carries the API's machine-readable reason when it sent one, e.g. `IDEMPOTENCY_KEY_REQUIRED` on a 400, `STOREFRONT_NOT_WHITELISTED` on a 409, `PAYMENT_METHOD_NOT_FOUND` on a charge 404, and every refund code (see [Refunds](#refunds)). | Inspect `status` and `code`. A 404 from `get_status` is an unknown transaction id. |
+| `Error::Api { status, code, .. }` | Any other rejecting or unexpected response. `code` carries the API's machine-readable reason when it sent one, e.g. `IDEMPOTENCY_KEY_REQUIRED` on a 400, `STOREFRONT_NOT_WHITELISTED` on a 409, `PAYMENT_METHOD_NOT_FOUND` on a charge 404, and every refund code (see [Refunds](#refunds)). | Inspect `status` and `code`. `raw` keeps the whole envelope, with `error.validationErrors` and `error.params`. A 404 from `get_status` is an unknown transaction id. |
 | `Error::Validation { .. }` | Bad arguments (non-positive amount, missing field, malformed key id). | Fix the call; nothing was sent. |
 
 Refusal codes on `Error::Refusal`:
@@ -784,6 +1035,11 @@ Refusal codes on `Error::Refusal`:
 All five arrive as HTTP 200 with `success: false`, not as an HTTP error status.
 
 Every refusal code is a constant in `dominaite::session_error_code` (`REFUSALS` lists them).
+
+A subscription session (one with an `agreement_id`) has refusal codes of its own, for example
+`AGREEMENT_NOT_PENDING`, `AGREEMENT_SESSION_OPEN` or `SUBSCRIPTIONS_NOT_ENABLED`. They also
+arrive as `Error::Refusal`, and nothing was created. The integration contract lists them under
+`recurring.subscriptionSessionOutcomes`. They have no constants: compare the code as a string.
 
 ### Storefront errors
 

@@ -3,13 +3,17 @@
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::error::{session_error_code, Error, Result};
 use crate::signing::{sign_request, SignRequest};
 use crate::types::{
-    ChargeRequest, CheckoutSession, CheckoutSessionRequest, CheckoutStatus, PaymentMethodCharge,
-    Ping, Refund, RefundRequest,
+    Agreement, AgreementRequest, ChargeRequest, CheckoutSession, CheckoutSessionRequest,
+    CheckoutStatus, IntegrationContract, PaymentMethodCharge, Ping, Plan, PlanRequest, PlanUpdate,
+    Refund, RefundList, RefundRequest, TransactionListParams, TransactionPage, WebhookEndpoint,
+    WebhookEndpointRequest,
 };
 
 /// The production merchant API.
@@ -25,12 +29,33 @@ pub const SESSIONS_PATH: &str = "/merchant-api/checkout/sessions";
 pub const PAYMENT_METHODS_PATH: &str = "/merchant-api/payment-methods";
 
 /// The canonical path of payments. POST
-/// `PAYMENTS_PATH/{transaction_id}/refunds` refunds one; GET
+/// `PAYMENTS_PATH/{transaction_id}/refunds` refunds one, and GET on the same
+/// path lists its refunds; GET
 /// `PAYMENTS_PATH/{transaction_id}/refunds/{refund_id}` reads a refund back.
 pub const PAYMENTS_PATH: &str = "/merchant-api/payments";
 
 /// The credentials-and-clock smoke test. Creates nothing.
 pub const PING_PATH: &str = "/merchant-api/ping";
+
+/// The machine-readable integration contract. GET only.
+pub const INTEGRATION_CONTRACT_PATH: &str = "/merchant-api/integration/contract";
+
+/// The canonical path of subscription plans. POST creates one and GET lists
+/// them; GET, PATCH and DELETE `PLANS_PATH/{plan_id}` read, update and archive
+/// one.
+pub const PLANS_PATH: &str = "/merchant-api/plans";
+
+/// The canonical path of subscription agreements. POST creates one; GET and
+/// DELETE `AGREEMENTS_PATH/{agreement_id}` read and cancel one.
+pub const AGREEMENTS_PATH: &str = "/merchant-api/agreements";
+
+/// The canonical path of webhook endpoints. POST registers one and GET lists
+/// them; DELETE `WEBHOOKS_PATH/{id}` removes one.
+pub const WEBHOOKS_PATH: &str = "/merchant-api/webhooks";
+
+/// The canonical path of the transaction list. The signature covers this
+/// path only, never the query string.
+pub const TRANSACTIONS_PATH: &str = "/merchant-api/transactions";
 
 /// This SDK's version, reported in the User-Agent.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -255,12 +280,30 @@ impl Client {
         Ok(ping)
     }
 
+    /// Reads the machine-readable integration contract: the routes, fields,
+    /// vocabularies and error codes of this API version. Check
+    /// [`IntegrationContract::version`] in a startup or CI check to learn when
+    /// the API moved on.
+    ///
+    /// Every key can read it, whatever its scopes. The API does not check the
+    /// credentials on this route at all, so a successful read proves nothing
+    /// about them: use [`Client::ping`] for that.
+    pub fn get_integration_contract(&self) -> Result<IntegrationContract> {
+        let payload = self.request("GET", INTEGRATION_CONTRACT_PATH, "", "")?;
+        let mut contract: IntegrationContract = serde_json::from_value(payload.clone())
+            .map_err(|_| Error::api(200, "The API returned an unexpected integration contract"))?;
+        contract.raw = payload;
+        Ok(contract)
+    }
+
     /// Opens a hosted checkout session for one payment.
     ///
     /// The errors it returns:
     /// - [`Error::Validation`]: bad arguments; nothing was sent.
     /// - [`Error::Auth`]: wrong credentials, bad signature, clock off, IP not
     ///   allowlisted. Fix the config, do not retry.
+    /// - [`Error::Forbidden`]: the key does not hold the `payments` scope, or a
+    ///   verify-only session on an account where verify-only is not on.
     /// - [`Error::Refusal`]: the gateway refused the session; inspect `code`.
     /// - [`Error::RateLimited`]: HTTP 429. Wait, then send it again with the
     ///   same idempotency key. Not retried for you.
@@ -389,22 +432,28 @@ impl Client {
     ///
     /// Returns the charge on HTTP 201 (200 on a durable replay of the same key)
     /// and on HTTP 402 alike. A decline is not an error: the 402 charge has
-    /// `status` `failed` plus a `decline_class` telling you whether to give up on
-    /// the card (`hard`), wait (`soft_funds`, `soft_other`) or bring the customer
-    /// back for a hosted session (`soft_sca_required`). `pending` is not
-    /// terminal - poll [`Client::get_status`] with `charge.transaction_id`.
+    /// `status` `failed`, and its `decline_class`, when set, tells you whether to
+    /// give up on the card (`hard`), wait (`soft_funds`, `soft_other`) or bring
+    /// the customer back for a hosted session (`soft_sca_required`). It can be
+    /// `None`, for example when nobody declined the payment, and
+    /// [`Client::get_status`] carries the latest class. Never read `None` as
+    /// `hard`. `pending` is not terminal - poll [`Client::get_status`] with
+    /// `charge.transaction_id`.
     ///
     /// Errors it returns:
     /// - [`Error::Validation`]: bad arguments; nothing was sent.
     /// - [`Error::Auth`]: wrong credentials, bad signature, clock off, IP not
     ///   allowlisted.
+    /// - [`Error::Forbidden`]: the key does not hold the `payments` scope.
     /// - [`Error::Charge`]: the gateway answered with a code instead of a charge
     ///   (409, 422, 502, 503); branch on `code`. `CHARGE_OUTCOME_UNKNOWN` carries
     ///   the charge row to poll; never retry it under a new key.
     /// - [`Error::Api`]: 404 (`PAYMENT_METHOD_NOT_FOUND`) for an id that is not
     ///   yours, a 400 validation rejection, or an unexpected response.
     /// - [`Error::RateLimited`]: HTTP 429. Wait, then send it again with the
-    ///   same idempotency key.
+    ///   same idempotency key. The charge route's own limits arrive here too,
+    ///   with `code` `CHARGE_VELOCITY_EXCEEDED` or `CHARGE_DECLINE_RATE_EXCEEDED`
+    ///   (see [`rate_limit_error_code`](crate::rate_limit_error_code)).
     /// - [`Error::Transport`]: network failure, or a 5xx that carries no gateway
     ///   code. Safe to retry WITH the same idempotency key.
     pub fn charge_payment_method(
@@ -415,12 +464,12 @@ impl Client {
         let id = normalize_payment_method_id(payment_method_id)?;
         let (idempotency_key, body) = prepare_charge_request(request)?;
         let path = format!("{PAYMENT_METHODS_PATH}/{id}/charges");
-        let reply = self.send("POST", &path, &body, &idempotency_key)?;
+        let reply = self.send("POST", &path, "", &body, &idempotency_key)?;
 
         // 201 (200 on a durable replay): the charge was placed, whatever its
         // status. 402: the provider declined; the envelope says success=false
-        // but the charge is right there, status `failed` with its decline class,
-        // so it is a result, not an error.
+        // but the charge is right there, status `failed` (with its decline class
+        // when the gateway had one), so it is a result, not an error.
         let charge = reply.charge();
         if let Some(charge) = charge
             .as_ref()
@@ -475,7 +524,7 @@ impl Client {
         // DELETE signs an EMPTY idempotency key and an EMPTY body, like GET, and
         // sends no Idempotency-Key header.
         let path = format!("{PAYMENT_METHODS_PATH}/{id}");
-        let reply = self.send("DELETE", &path, "", "")?;
+        let reply = self.send("DELETE", &path, "", "", "")?;
         if reply.status < 400 {
             return Ok(());
         }
@@ -508,6 +557,7 @@ impl Client {
     /// - [`Error::Validation`]: bad arguments; nothing was sent.
     /// - [`Error::Auth`]: wrong credentials, bad signature, clock off, IP not
     ///   allowlisted.
+    /// - [`Error::Forbidden`]: the key does not hold the `payments` scope.
     /// - [`Error::Api`]: the gateway refused with one of the
     ///   [`refund_error_code`](crate::refund_error_code) constants, e.g. 422
     ///   `REFUND_AMOUNT_EXCEEDED` or 409 `DUPLICATE_REQUEST`; branch on
@@ -548,6 +598,382 @@ impl Client {
         parse_refund(payload, 200)
     }
 
+    /// Lists the refunds of one payment that you created through the API,
+    /// newest first, with the payment's refund totals:
+    /// [`RefundList::refunded_amount`] and [`RefundList::refundable_amount`].
+    ///
+    /// The totals count every refund of the payment, also the ones made in the
+    /// dashboard. Use `refundable_amount` to size the next refund.
+    ///
+    /// Errors it returns:
+    /// - [`Error::Validation`]: `transaction_id` is not a payment id; nothing
+    ///   was sent.
+    /// - [`Error::Auth`] and [`Error::Forbidden`]: as on
+    ///   [`Client::create_refund`].
+    /// - [`Error::Api`]: 404 with code
+    ///   [`PAYMENT_NOT_FOUND`](crate::refund_error_code::PAYMENT_NOT_FOUND), a
+    ///   payment that is not yours.
+    /// - [`Error::RateLimited`] and [`Error::Transport`]: wait, then read again.
+    pub fn list_refunds(&self, transaction_id: &str) -> Result<RefundList> {
+        let transaction_id = normalize_transaction_id(transaction_id)?;
+        let path = format!("{PAYMENTS_PATH}/{transaction_id}/refunds");
+        let payload = self.request("GET", &path, "", "")?;
+        let mut list: RefundList = serde_json::from_value(payload.clone())
+            .map_err(|_| Error::api(200, "The API returned an unexpected refund list"))?;
+        if let Some(items) = payload.get("refunds").and_then(Value::as_array) {
+            for (refund, raw) in list.refunds.iter_mut().zip(items) {
+                refund.raw = raw.clone();
+            }
+        }
+        list.raw = payload;
+        Ok(list)
+    }
+
+    /// Creates a subscription plan: a price and a billing interval you sell.
+    /// Nothing is charged. An agreement ([`Client::create_agreement`])
+    /// subscribes one customer to the plan, and the hosted subscription
+    /// session takes the first payment.
+    ///
+    /// The plan carries the request's required `Idempotency-Key`. The same key
+    /// with the same body answers the plan it created (HTTP 200 instead of
+    /// 201), also after a [`Client::update_plan`], so after a timeout send it
+    /// again WITH THE SAME KEY. The same key with another body is refused with
+    /// 422 `IDEMPOTENCY_KEY_REUSED`.
+    ///
+    /// Errors it returns:
+    /// - [`Error::Validation`]: a missing name, currency or interval unit, or
+    ///   an amount of 0 or less; nothing was sent.
+    /// - [`Error::Auth`]: wrong credentials, bad signature, clock off, IP not
+    ///   allowlisted.
+    /// - [`Error::Forbidden`]: the key does not hold the `payments` scope.
+    /// - [`Error::Api`]: HTTP 400 for a field the API refused (the details are
+    ///   in `raw`, under `error.validationErrors`) or `INVALID_CURRENCY`, and
+    ///   422 `IDEMPOTENCY_KEY_REUSED`.
+    /// - [`Error::RateLimited`]: HTTP 429. Wait, then send it again with the
+    ///   same idempotency key.
+    /// - [`Error::Transport`]: network failure or 5xx. Nothing was created on
+    ///   a 503; send it again WITH the same idempotency key.
+    pub fn create_plan(&self, request: &PlanRequest) -> Result<Plan> {
+        if request.name.trim().is_empty() {
+            return Err(Error::validation("Missing required parameter: name"));
+        }
+        if request.amount <= 0 {
+            return Err(Error::validation(
+                "amount must be a positive integer in MINOR units (e.g. 1990 for 19.90 EUR)",
+            ));
+        }
+        if request.currency.trim().is_empty() {
+            return Err(Error::validation("Missing required parameter: currency"));
+        }
+        if request.interval_unit.trim().is_empty() {
+            return Err(Error::validation(
+                "Missing required parameter: interval_unit",
+            ));
+        }
+        let body = json_body(request)?;
+        let (status, payload) =
+            self.request_with_status("POST", PLANS_PATH, &body, request.idempotency_key.as_str())?;
+        parse_object(payload, status, "plan")
+    }
+
+    /// Lists your plans: at most 200, active first, and the newest first
+    /// within a status. The route has no pages yet; read a plan by id with
+    /// [`Client::get_plan`] when you have more.
+    ///
+    /// Errors it returns: as [`Client::get_plan`], without the 404.
+    pub fn list_plans(&self) -> Result<Vec<Plan>> {
+        // GET signs an EMPTY idempotency key and an EMPTY body.
+        let payload = self.request("GET", PLANS_PATH, "", "")?;
+        parse_array(payload, "plan")
+    }
+
+    /// Reads one plan, archived ones too.
+    ///
+    /// Errors it returns:
+    /// - [`Error::Validation`]: `plan_id` cannot be a plan id; nothing was
+    ///   sent.
+    /// - [`Error::Auth`] and [`Error::Forbidden`]: as on
+    ///   [`Client::create_plan`].
+    /// - [`Error::Api`]: 404 `PLAN_NOT_FOUND`, a plan that is not yours, or
+    ///   400 `INVALID_FORMAT` for an id of the wrong form.
+    /// - [`Error::RateLimited`] and [`Error::Transport`]: wait, then read
+    ///   again.
+    pub fn get_plan(&self, plan_id: &str) -> Result<Plan> {
+        let path = plan_path(plan_id)?;
+        let payload = self.request("GET", &path, "", "")?;
+        parse_object(payload, 200, "plan")
+    }
+
+    /// Changes the name, the trial or the cancel page of a plan, and answers
+    /// the plan as it is now. A field you do not set keeps its value. A trial
+    /// change reaches only the agreements created afterwards; a cancel page
+    /// change shows on the next email.
+    ///
+    /// PATCH carries no `Idempotency-Key`: the API does not replay it, and the
+    /// same update twice gives the same plan, so a retry is safe.
+    ///
+    /// Errors it returns: as [`Client::get_plan`]. An update that sets no
+    /// field is refused with HTTP 400.
+    pub fn update_plan(&self, plan_id: &str, update: &PlanUpdate) -> Result<Plan> {
+        let path = plan_path(plan_id)?;
+        let body = json_body(update)?;
+        // PATCH signs an EMPTY idempotency key, like GET, but signs its body.
+        let payload = self.request("PATCH", &path, &body, "")?;
+        parse_object(payload, 200, "plan")
+    }
+
+    /// Archives a plan: it accepts no new agreements, and the agreements it
+    /// has continue on their own terms. An archived plan stays readable.
+    /// Archiving an archived plan succeeds again, so a retry after a timeout
+    /// is safe.
+    ///
+    /// Errors it returns: as [`Client::get_plan`].
+    pub fn delete_plan(&self, plan_id: &str) -> Result<()> {
+        let path = plan_path(plan_id)?;
+        // DELETE signs an EMPTY idempotency key and an EMPTY body; the answer
+        // is a 204 with no body.
+        self.request("DELETE", &path, "", "")?;
+        Ok(())
+    }
+
+    /// Subscribes one of your customers to a plan. The agreement is created
+    /// `pending` and nothing is charged. Then open the subscription session:
+    /// [`Client::create_checkout_session`] with
+    /// [`CheckoutSessionRequest::agreement_id`] takes the first payment, saves
+    /// the card and activates the agreement. After that the platform charges
+    /// each period and sends the `agreement.*` and `charge.*` webhooks.
+    ///
+    /// The agreement carries the request's required `Idempotency-Key`, with
+    /// the same replay rules as [`Client::create_plan`]: the same key and body
+    /// answer the agreement it created (HTTP 200 instead of 201).
+    ///
+    /// Errors it returns:
+    /// - [`Error::Validation`]: a missing plan id or customer reference;
+    ///   nothing was sent.
+    /// - [`Error::Auth`] and [`Error::Forbidden`]: as on
+    ///   [`Client::create_plan`].
+    /// - [`Error::Api`]: HTTP 400 for a field the API refused (the details
+    ///   are in `raw`, under `error.validationErrors`); 404 `PLAN_NOT_FOUND`
+    ///   or `PAYMENT_METHOD_NOT_FOUND`; 409 `PLAN_NOT_ACTIVE` or
+    ///   `PAYMENT_METHOD_NOT_ACTIVE`; 422 `MAX_AMOUNT_BELOW_PLAN_AMOUNT`,
+    ///   `PAYMENT_METHOD_CURRENCY_MISMATCH`, `PAYMENT_METHOD_CURRENCY_UNKNOWN`,
+    ///   `AGREEMENT_CONSENT_REQUIRED` or `IDEMPOTENCY_KEY_REUSED`.
+    /// - [`Error::RateLimited`] and [`Error::Transport`]: as on
+    ///   [`Client::create_plan`]; send it again WITH the same idempotency key.
+    pub fn create_agreement(&self, request: &AgreementRequest) -> Result<Agreement> {
+        if request.plan_id.trim().is_empty() {
+            return Err(Error::validation("Missing required parameter: plan_id"));
+        }
+        if request.customer_reference.trim().is_empty() {
+            return Err(Error::validation(
+                "Missing required parameter: customer_reference",
+            ));
+        }
+        let body = json_body(request)?;
+        let (status, payload) = self.request_with_status(
+            "POST",
+            AGREEMENTS_PATH,
+            &body,
+            request.idempotency_key.as_str(),
+        )?;
+        parse_object(payload, status, "agreement")
+    }
+
+    /// Reads one agreement: its status, its next charge, why it is past due,
+    /// and its `sequence` to order it against the `agreement.*` webhooks.
+    ///
+    /// Errors it returns:
+    /// - [`Error::Validation`]: `agreement_id` cannot be an agreement id;
+    ///   nothing was sent.
+    /// - [`Error::Auth`] and [`Error::Forbidden`]: as on
+    ///   [`Client::create_plan`].
+    /// - [`Error::Api`]: 404 `AGREEMENT_NOT_FOUND`, an agreement that is not
+    ///   yours, or 400 `INVALID_FORMAT` for an id of the wrong form.
+    /// - [`Error::RateLimited`] and [`Error::Transport`]: wait, then read
+    ///   again.
+    pub fn get_agreement(&self, agreement_id: &str) -> Result<Agreement> {
+        let path = agreement_path(agreement_id)?;
+        let payload = self.request("GET", &path, "", "")?;
+        parse_object(payload, 200, "agreement")
+    }
+
+    /// Cancels an agreement that is pending, active or past due. No further
+    /// charge is scheduled; a charge already placed is not reversed. The
+    /// `agreement.cancelled` webhook follows. Cancelling a cancelled agreement
+    /// succeeds again, so a retry after a timeout is safe.
+    ///
+    /// Errors it returns: as [`Client::get_agreement`], plus 409
+    /// `AGREEMENT_ENDED` for an agreement that completed or failed.
+    pub fn cancel_agreement(&self, agreement_id: &str) -> Result<()> {
+        let path = agreement_path(agreement_id)?;
+        // DELETE signs an EMPTY idempotency key and an EMPTY body; the answer
+        // is a 204 with no body.
+        self.request("DELETE", &path, "", "")?;
+        Ok(())
+    }
+
+    /// Registers a webhook endpoint: the platform POSTs the events you name
+    /// to `url`. Only this answer carries the endpoint's signing secret
+    /// ([`WebhookEndpoint::secret`]), so store it at once. You can have 25
+    /// active endpoints.
+    ///
+    /// Every webhook endpoint route needs a key with the `webhooks:manage`
+    /// scope. A key with the `payments` scope cannot hold it.
+    ///
+    /// The endpoint carries the request's required `Idempotency-Key`. The same
+    /// key with the same url and events answers the same endpoint without its
+    /// secret, and registers nothing new. After a timeout or a 503, send it
+    /// again WITH THE SAME KEY: the retry replaces an endpoint that the lost
+    /// attempt registered, and answers a new endpoint with a new secret.
+    ///
+    /// Errors it returns:
+    /// - [`Error::Validation`]: an empty url or no events; nothing was sent.
+    /// - [`Error::Auth`]: as on [`Client::create_plan`].
+    /// - [`Error::Forbidden`]: the key does not hold the `webhooks:manage`
+    ///   scope.
+    /// - [`Error::Api`]: HTTP 400 `WEBHOOK_URL_REJECTED` (the url is not HTTPS
+    ///   on a public host) or `VALIDATION_ERROR` (for example an unknown event
+    ///   type; the details are in `raw`, under `error.validationErrors`). 409
+    ///   `WEBHOOK_LIMIT_REACHED`, or `DUPLICATE_REQUEST`: the first request
+    ///   with this key still runs, so send it again with the same key after a
+    ///   second. 409 `WEBHOOK_ALREADY_REGISTERED`: this key registered an
+    ///   endpoint more than a day ago and that endpoint still exists. Its id is
+    ///   in `raw`, under `error.params.webhookId`; use a fresh key for a new
+    ///   endpoint. 422 `IDEMPOTENCY_KEY_REUSED`.
+    /// - [`Error::RateLimited`]: HTTP 429. Wait, then send it again with the
+    ///   same idempotency key.
+    /// - [`Error::Transport`]: network failure or 5xx. Send it again WITH the
+    ///   same idempotency key.
+    pub fn create_webhook_endpoint(
+        &self,
+        request: &WebhookEndpointRequest,
+    ) -> Result<WebhookEndpoint> {
+        if request.url.trim().is_empty() {
+            return Err(Error::validation("Missing required parameter: url"));
+        }
+        if request.events.is_empty() {
+            return Err(Error::validation(
+                "events must name at least one event type",
+            ));
+        }
+        let body = json_body(request)?;
+        let (status, payload) = self.request_with_status(
+            "POST",
+            WEBHOOKS_PATH,
+            &body,
+            request.idempotency_key.as_str(),
+        )?;
+        parse_object(payload, status, "webhook endpoint")
+    }
+
+    /// Lists your webhook endpoints, the newest first: every active endpoint
+    /// and your newest 1000 inactive ones. No item carries a secret. The route
+    /// has no pages.
+    ///
+    /// Errors it returns: as [`Client::delete_webhook_endpoint`], without the
+    /// 404.
+    pub fn list_webhook_endpoints(&self) -> Result<Vec<WebhookEndpoint>> {
+        // GET signs an EMPTY idempotency key and an EMPTY body.
+        let payload = self.request("GET", WEBHOOKS_PATH, "", "")?;
+        parse_array(payload, "webhook endpoint")
+    }
+
+    /// Deletes a webhook endpoint. It stops receiving deliveries.
+    ///
+    /// Errors it returns:
+    /// - [`Error::Validation`]: `webhook_id` is not a UUID; nothing was sent.
+    /// - [`Error::Auth`] and [`Error::Forbidden`]: as on
+    ///   [`Client::create_webhook_endpoint`].
+    /// - [`Error::Api`]: 404 `WEBHOOK_NOT_FOUND` for an id that is unknown,
+    ///   not yours or already deleted. A retry after a lost answer therefore
+    ///   answers 404: treat that as done.
+    /// - [`Error::RateLimited`] and [`Error::Transport`]: wait, then send it
+    ///   again.
+    pub fn delete_webhook_endpoint(&self, webhook_id: &str) -> Result<()> {
+        let path = webhook_endpoint_path(webhook_id)?;
+        // DELETE signs an EMPTY idempotency key and an EMPTY body; the answer
+        // is a 204 with no body.
+        self.request("DELETE", &path, "", "")?;
+        Ok(())
+    }
+
+    /// Lists one page of your payments created in a window, oldest first:
+    /// checkout payments, charges on saved cards (yours and the platform's
+    /// for an agreement) and verify-only sessions. A refund is not a row of
+    /// its own: it shows on its payment, in `refunded_amount` and `status`.
+    /// Fees are not part of this read.
+    ///
+    /// The key needs the `transactions:read` scope. A key with the `payments`
+    /// scope cannot hold it. A key bound to a storefront lists the payments
+    /// of that storefront only.
+    ///
+    /// To read a whole window, send [`TransactionPage::next_cursor`] back as
+    /// the cursor, with the same `from`, `to` and `status`, until it is
+    /// `None`. Paging never repeats or skips a row. The parameters travel in
+    /// the query string, which is not part of the signature.
+    ///
+    /// ```no_run
+    /// use dominaite::{Client, TransactionListParams};
+    ///
+    /// # fn main() -> Result<(), dominaite::Error> {
+    /// # let client = Client::new("dmk_0123456789abcdef0123456789abcdef", "dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")?;
+    /// let mut params =
+    ///     TransactionListParams::new("2026-10-01T00:00:00Z", "2026-10-08T00:00:00Z").limit(100);
+    /// loop {
+    ///     let page = client.list_transactions(&params)?;
+    ///     for transaction in &page.items {
+    ///         println!("{} {}", transaction.transaction_id, transaction.status);
+    ///     }
+    ///     match page.next_cursor {
+    ///         Some(cursor) => params = params.cursor(cursor),
+    ///         None => break,
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Errors it returns:
+    /// - [`Error::Validation`]: a missing `from` or `to`; nothing was sent.
+    /// - [`Error::Auth`]: as on [`Client::create_plan`].
+    /// - [`Error::Forbidden`]: the key does not hold the `transactions:read`
+    ///   scope.
+    /// - [`Error::Api`]: HTTP 400 for a parameter the API refused, for
+    ///   example a window longer than 31 days, or a cursor that is not a
+    ///   `next_cursor` (the details are in `raw`, under
+    ///   `error.validationErrors`).
+    /// - [`Error::RateLimited`] and [`Error::Transport`]: wait, then read the
+    ///   page again.
+    pub fn list_transactions(&self, params: &TransactionListParams) -> Result<TransactionPage> {
+        if params.from.trim().is_empty() {
+            return Err(Error::validation("Missing required parameter: from"));
+        }
+        if params.to.trim().is_empty() {
+            return Err(Error::validation("Missing required parameter: to"));
+        }
+        let mut query = format!(
+            "from={}&to={}",
+            encode_query_value(&params.from),
+            encode_query_value(&params.to)
+        );
+        if let Some(status) = &params.status {
+            query.push_str("&status=");
+            query.push_str(&encode_query_value(status));
+        }
+        if let Some(limit) = params.limit {
+            query.push_str("&limit=");
+            query.push_str(&limit.to_string());
+        }
+        if let Some(cursor) = &params.cursor {
+            query.push_str("&cursor=");
+            query.push_str(&encode_query_value(cursor));
+        }
+        // GET signs the path only, with an EMPTY idempotency key and an EMPTY
+        // body. The query string is not signed.
+        let (_, payload) = self.request_with_query("GET", TRANSACTIONS_PATH, &query, "", "")?;
+        parse_object(payload, 200, "transaction page")
+    }
+
     /// Signs and sends one call, and maps the response onto the error taxonomy:
     /// [`Client::send`] plus the generic rejection for any 4xx or 5xx. The
     /// unwrapped `data` comes back on success (an empty object for a 204).
@@ -559,11 +985,38 @@ impl Client {
         body: &str,
         idempotency_key: &str,
     ) -> Result<Value> {
-        let reply = self.send(method, path, body, idempotency_key)?;
+        self.request_with_status(method, path, body, idempotency_key)
+            .map(|(_, payload)| payload)
+    }
+
+    /// [`Client::request`], plus the HTTP status of the answer, for the routes
+    /// that answer a create and its replay with different statuses.
+    fn request_with_status(
+        &self,
+        method: &str,
+        path: &str,
+        body: &str,
+        idempotency_key: &str,
+    ) -> Result<(u16, Value)> {
+        self.request_with_query(method, path, "", body, idempotency_key)
+    }
+
+    /// [`Client::request_with_status`] with a query string. The query goes
+    /// into the URL and never into the signature. `query` is already
+    /// encoded, without the `?`.
+    fn request_with_query(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &str,
+        idempotency_key: &str,
+    ) -> Result<(u16, Value)> {
+        let reply = self.send(method, path, query, body, idempotency_key)?;
         if reply.status >= 400 {
             return Err(reply.rejection());
         }
-        Ok(reply.payload().clone())
+        Ok((reply.status, reply.payload().clone()))
     }
 
     /// Signs and sends one call, and parses whatever came back into a [`Reply`].
@@ -574,7 +1027,14 @@ impl Client {
     /// error). Every other status comes back as a reply, so the payment method
     /// routes can read a 402 decline or a coded 502 as the typed answers they
     /// are, while [`Client::request`] rejects them generically.
-    fn send(&self, method: &str, path: &str, body: &str, idempotency_key: &str) -> Result<Reply> {
+    fn send(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &str,
+        idempotency_key: &str,
+    ) -> Result<Reply> {
         let timestamp = unix_seconds().to_string();
         let signature = sign_request(SignRequest {
             secret: &self.secret,
@@ -587,7 +1047,13 @@ impl Client {
             body,
         });
 
-        let url = format!("{}{}", self.base_url, path);
+        // The query string travels in the URL only: the API signs the
+        // canonical path without it.
+        let url = if query.is_empty() {
+            format!("{}{}", self.base_url, path)
+        } else {
+            format!("{}{}?{}", self.base_url, path, query)
+        };
         let mut builder = ureq::http::Request::builder()
             .method(method)
             .uri(&url)
@@ -624,7 +1090,7 @@ impl Client {
             // agent - surfaces the status here instead of as a response. Same
             // taxonomy, minus the API's message.
             Err(ureq::Error::StatusCode(status)) => {
-                return Err(classify_status(status, None, None));
+                return Err(classify_status(status, None, None, Value::Null));
             }
             Err(error) => {
                 return Err(Error::transport(
@@ -642,10 +1108,25 @@ impl Client {
         }
 
         // Read Retry-After off the response, which means before the body is
-        // consumed. A limiter's body is whatever the edge felt like sending.
+        // consumed. The body is read leniently, only for the code that tells the
+        // platform's limits apart: a limiter in front of the API sends whatever
+        // it likes, and that is still a rate limit.
         if http_status == 429 {
+            let retry_after_seconds = retry_after_seconds(response.headers().get("retry-after"));
+            let raw = response
+                .body_mut()
+                .read_to_string()
+                .ok()
+                .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+                .filter(Value::is_object)
+                .unwrap_or(Value::Null);
+            let code = raw
+                .get("error")
+                .and_then(|error| string_field(error, "code"));
             return Err(Error::RateLimited {
-                retry_after_seconds: retry_after_seconds(response.headers().get("retry-after")),
+                retry_after_seconds,
+                code,
+                raw,
             });
         }
 
@@ -681,7 +1162,9 @@ impl Client {
         // method routes need its code.
         let envelope = match serde_json::from_str::<Value>(&raw) {
             Ok(envelope) if envelope.is_object() => envelope,
-            _ if http_status >= 500 => return Err(classify_status(http_status, None, None)),
+            _ if http_status >= 500 => {
+                return Err(classify_status(http_status, None, None, Value::Null))
+            }
             _ => {
                 return Err(Error::api(
                     http_status,
@@ -691,7 +1174,7 @@ impl Client {
         };
 
         let reply = Reply::new(http_status, envelope);
-        // Credentials are refused the same way on every route.
+        // Credentials and scopes are refused the same way on every route.
         if matches!(http_status, 401 | 403) {
             return Err(reply.rejection());
         }
@@ -723,10 +1206,13 @@ impl Reply {
         self.envelope.get("success").and_then(Value::as_bool) == Some(true)
     }
 
-    /// `data` when it is an object, else nothing: the gateway omits null fields
-    /// on the wire, so a bodiless error has no `data` at all.
+    /// `data` when it is an object, or an array on the list routes, else
+    /// nothing: the gateway omits null fields on the wire, so a bodiless error
+    /// has no `data` at all.
     fn data(&self) -> Option<&Value> {
-        self.envelope.get("data").filter(|data| data.is_object())
+        self.envelope
+            .get("data")
+            .filter(|data| data.is_object() || data.is_array())
     }
 
     /// The unwrapped `data`, or the envelope itself when there is none.
@@ -763,7 +1249,8 @@ impl Reply {
     /// The generic error for a 4xx or 5xx: a 5xx is a retryable transport
     /// failure, a 4xx an [`Error::Api`] that keeps the code.
     fn rejection(self) -> Error {
-        classify_status(self.status, self.error_code(), self.error_message())
+        let (code, message) = (self.error_code(), self.error_message());
+        classify_status(self.status, code, message, self.envelope)
     }
 }
 
@@ -845,7 +1332,12 @@ fn redirect_error(status: u16) -> Error {
     )
 }
 
-fn classify_status(status: u16, code: Option<String>, message: Option<String>) -> Error {
+fn classify_status(
+    status: u16,
+    code: Option<String>,
+    message: Option<String>,
+    raw: Value,
+) -> Error {
     // Defence in depth only. ureq does not surface a 3xx as a StatusCode error,
     // it follows it - what actually stops a redirect is the per-request
     // max_redirects(0) in `request`.
@@ -855,16 +1347,21 @@ fn classify_status(status: u16, code: Option<String>, message: Option<String>) -
     match status {
         // Reached from the StatusCode path only, where the response - and with
         // it Retry-After - is already gone. The normal path answers 429 in
-        // `request`, with the header.
+        // `send`, with the header and the body.
         429 => Error::RateLimited {
             retry_after_seconds: None,
+            code,
+            raw,
         },
-        401 | 403 => Error::auth(
+        // The clock hint is for 401 only. A 403 was signed correctly, so the
+        // key id, the secret and the clock are fine.
+        401 => Error::auth(
             code.unwrap_or_else(|| "UNAUTHORIZED".to_string()),
             message.unwrap_or_else(|| {
                 "Authentication failed - check your key id, secret, and server clock.".to_string()
             }),
         ),
+        403 => Error::forbidden(code, message),
         status if status >= 500 => Error::transport(
             format!(
                 "The Dominaite API is unavailable (HTTP {status}); retry with the same idempotency key."
@@ -878,6 +1375,7 @@ fn classify_status(status: u16, code: Option<String>, message: Option<String>) -
             status,
             code,
             message.unwrap_or_else(|| "Request rejected".to_string()),
+            raw,
         ),
     }
 }
@@ -888,7 +1386,17 @@ fn classify_status(status: u16, code: Option<String>, message: Option<String>) -
 /// second serialization would let key ordering or escaping drift between the
 /// signature and the wire.
 fn prepare_session_request(request: &CheckoutSessionRequest) -> Result<(String, String)> {
-    validate_money_params(request.amount, &request.currency, &request.order_reference)?;
+    if request.verify_only == Some(true) {
+        // The platform sets the verification amount, so the gateway takes 0 only.
+        if request.amount != 0 {
+            return Err(Error::validation(
+                "amount must be 0 with verify_only: the platform sets the verification amount",
+            ));
+        }
+        validate_order_params(&request.currency, &request.order_reference)?;
+    } else {
+        validate_money_params(request.amount, &request.currency, &request.order_reference)?;
+    }
     let idempotency_key = request.idempotency_key.as_str().to_string();
 
     let body = serde_json::to_string(request).map_err(|error| {
@@ -901,8 +1409,8 @@ fn prepare_session_request(request: &CheckoutSessionRequest) -> Result<(String, 
 }
 
 /// `prepare_session_request` for a charge: same money checks, same key
-/// handling, and the body is exactly the contract's fields in declaration
-/// order, which is what gets signed.
+/// handling, and the body is the contract's fields in declaration order, then
+/// the caller's extra fields, which is what gets signed.
 fn prepare_charge_request(request: &ChargeRequest) -> Result<(String, String)> {
     validate_money_params(request.amount, &request.currency, &request.order_reference)?;
     let idempotency_key = request.idempotency_key.as_str().to_string();
@@ -948,6 +1456,125 @@ fn parse_refund(payload: Value, http_status: u16) -> Result<Refund> {
     Ok(refund)
 }
 
+/// A response type that keeps the object it was parsed from in `raw`.
+trait KeepsRaw: DeserializeOwned {
+    fn keep_raw(&mut self, raw: Value);
+}
+
+impl KeepsRaw for Plan {
+    fn keep_raw(&mut self, raw: Value) {
+        self.raw = raw;
+    }
+}
+
+impl KeepsRaw for Agreement {
+    fn keep_raw(&mut self, raw: Value) {
+        self.raw = raw;
+    }
+}
+
+impl KeepsRaw for WebhookEndpoint {
+    fn keep_raw(&mut self, raw: Value) {
+        self.raw = raw;
+    }
+}
+
+impl KeepsRaw for TransactionPage {
+    /// The page keeps its own object, and each item keeps its own.
+    fn keep_raw(&mut self, raw: Value) {
+        if let Some(items) = raw.get("items").and_then(Value::as_array) {
+            for (item, item_raw) in self.items.iter_mut().zip(items) {
+                item.raw = item_raw.clone();
+            }
+        }
+        self.raw = raw;
+    }
+}
+
+/// One `T` from the unwrapped `data`, with `raw` filled in. `what` names the
+/// object in the error.
+fn parse_object<T: KeepsRaw>(payload: Value, http_status: u16, what: &str) -> Result<T> {
+    let mut parsed: T = serde_json::from_value(payload.clone()).map_err(|_| {
+        Error::api(
+            http_status,
+            format!("The API returned an unexpected {what} response"),
+        )
+    })?;
+    parsed.keep_raw(payload);
+    Ok(parsed)
+}
+
+/// Every `T` of a list route, whose `data` is a JSON array. Each item keeps
+/// its own object in `raw`.
+fn parse_array<T: KeepsRaw>(payload: Value, what: &str) -> Result<Vec<T>> {
+    let Value::Array(items) = payload else {
+        return Err(Error::api(
+            200,
+            format!("The API returned an unexpected {what} list"),
+        ));
+    };
+    items
+        .into_iter()
+        .map(|item| parse_object(item, 200, what))
+        .collect()
+}
+
+/// The JSON body of a request, the exact text that gets signed.
+fn json_body<T: Serialize>(request: &T) -> Result<String> {
+    serde_json::to_string(request).map_err(|error| {
+        Error::validation(format!(
+            "Request parameters are not JSON-encodable: {error}"
+        ))
+    })
+}
+
+/// The signed path of one plan. A plan id is opaque and case-sensitive, so it
+/// goes into the path exactly as given.
+fn plan_path(plan_id: &str) -> Result<String> {
+    let id = normalize_opaque_id(plan_id, "plan_id must be the id create_plan returned")?;
+    Ok(format!("{PLANS_PATH}/{id}"))
+}
+
+/// The signed path of one agreement. An agreement id is opaque and
+/// case-sensitive, like a plan id.
+fn agreement_path(agreement_id: &str) -> Result<String> {
+    let id = normalize_opaque_id(
+        agreement_id,
+        "agreement_id must be the id create_agreement returned",
+    )?;
+    Ok(format!("{AGREEMENTS_PATH}/{id}"))
+}
+
+/// Percent-encodes one query value: every byte except the unreserved
+/// characters of RFC 3986. A `+` goes out as `%2B`, so an offset such as
+/// `+02:00` is not read as a space.
+fn encode_query_value(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0F)]));
+        }
+    }
+    encoded
+}
+
+/// The signed path of one webhook endpoint, the id in lowercase hyphenated
+/// form as the API signs it.
+fn webhook_endpoint_path(webhook_id: &str) -> Result<String> {
+    let id = webhook_id.trim().to_lowercase();
+    if !is_uuid(&id) {
+        return Err(Error::validation(
+            "webhook_id must be the UUID create_webhook_endpoint returned",
+        ));
+    }
+    Ok(format!("{WEBHOOKS_PATH}/{id}"))
+}
+
 /// The checks shared by every request that moves money: amount, currency,
 /// order reference.
 fn validate_money_params(amount: i64, currency: &str, order_reference: &str) -> Result<()> {
@@ -956,6 +1583,12 @@ fn validate_money_params(amount: i64, currency: &str, order_reference: &str) -> 
             "amount must be a positive integer in MINOR units (e.g. 2500 for 25.00 EUR)",
         ));
     }
+    validate_order_params(currency, order_reference)
+}
+
+/// Currency and order reference: the part of [`validate_money_params`] that a
+/// verify-only session, which moves no money, still needs.
+fn validate_order_params(currency: &str, order_reference: &str) -> Result<()> {
     if currency.trim().is_empty() {
         return Err(Error::validation("Missing required parameter: currency"));
     }
