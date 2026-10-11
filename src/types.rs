@@ -624,7 +624,8 @@ pub mod charge_status {
     /// The card was charged.
     pub const SUCCEEDED: &str = "succeeded";
     /// The issuer declined (HTTP 402); see
-    /// [`PaymentMethodCharge::decline_class`](crate::PaymentMethodCharge::decline_class).
+    /// [`PaymentMethodCharge::decline_class`](crate::PaymentMethodCharge::decline_class),
+    /// which can be `None`.
     pub const FAILED: &str = "failed";
     /// Not terminal: poll [`Client::get_status`](crate::Client::get_status)
     /// with the charge's transaction id.
@@ -656,8 +657,8 @@ pub mod decline_class {
 
 /// What [`Client::charge_payment_method`](crate::Client::charge_payment_method)
 /// returns, for a placed charge (HTTP 201) and for a provider decline (HTTP 402,
-/// `status` `failed`) alike. A decline is a result, not an error: `decline_class`
-/// says what to do next. Also carried on [`Error::Charge`](crate::Error::Charge)
+/// `status` `failed`) alike. A decline is a result, not an error: `decline_class`,
+/// when set, says what to do next. Also carried on [`Error::Charge`](crate::Error::Charge)
 /// when the gateway attached the charge row to its answer.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -669,12 +670,16 @@ pub struct PaymentMethodCharge {
     /// [`PaymentMethodCharge::is_paid`] and [`PaymentMethodCharge::is_terminal`]
     /// rather than by hand.
     pub status: String,
-    /// One of the [`decline_class`] constants, set on a 402 decline; `None`
-    /// everywhere else (the SDK reads absent as `None`).
+    /// One of the [`decline_class`] constants, or a class this SDK does not
+    /// know yet. Never promised on a decline: a 402 carries it only when the
+    /// decline code alone decides it (`soft_sca_required`). Otherwise it is
+    /// `None`, and the class arrives a moment later on
+    /// [`Client::get_status`](crate::Client::get_status) and the decline
+    /// webhook. `None` on every status other than `failed`.
     #[serde(default)]
     pub decline_class: Option<String>,
-    /// The raw decline code, for your logs; branch on `decline_class` instead.
-    /// `None` when `decline_class` is.
+    /// The issuer's decline code, verbatim, for your logs; branch on
+    /// `decline_class` instead. Set on a failed charge when the issuer sent one.
     #[serde(default)]
     pub decline_code: Option<String>,
     /// The transaction the charge created; readable with

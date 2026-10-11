@@ -391,10 +391,13 @@ impl Client {
     ///
     /// Returns the charge on HTTP 201 (200 on a durable replay of the same key)
     /// and on HTTP 402 alike. A decline is not an error: the 402 charge has
-    /// `status` `failed` plus a `decline_class` telling you whether to give up on
-    /// the card (`hard`), wait (`soft_funds`, `soft_other`) or bring the customer
-    /// back for a hosted session (`soft_sca_required`). `pending` is not
-    /// terminal - poll [`Client::get_status`] with `charge.transaction_id`.
+    /// `status` `failed`, and its `decline_class`, when set, tells you whether to
+    /// give up on the card (`hard`), wait (`soft_funds`, `soft_other`) or bring
+    /// the customer back for a hosted session (`soft_sca_required`). It can be
+    /// `None`: the 402 carries it only when the decline code alone decides it.
+    /// Otherwise the class arrives a moment later on [`Client::get_status`] and
+    /// the decline webhook. `pending` is not terminal - poll
+    /// [`Client::get_status`] with `charge.transaction_id`.
     ///
     /// Errors it returns:
     /// - [`Error::Validation`]: bad arguments; nothing was sent.
@@ -424,8 +427,8 @@ impl Client {
 
         // 201 (200 on a durable replay): the charge was placed, whatever its
         // status. 402: the provider declined; the envelope says success=false
-        // but the charge is right there, status `failed` with its decline class,
-        // so it is a result, not an error.
+        // but the charge is right there, status `failed` (with its decline class
+        // when the gateway had one), so it is a result, not an error.
         let charge = reply.charge();
         if let Some(charge) = charge
             .as_ref()

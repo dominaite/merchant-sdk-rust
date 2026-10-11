@@ -403,7 +403,8 @@ match client.charge_payment_method(
             Some(decline_class::HARD) => stop_charging(&method_id),      // never retry
             Some(decline_class::SOFT_FUNDS) => retry_in_a_few_days(),
             Some(decline_class::SOFT_SCA_REQUIRED) => bring_the_payer_back(), // needs a session
-            _ => retry_later(),                                              // soft_other
+            Some(_) => retry_later(),                                        // soft_other
+            None => read_the_class_later(&charge.transaction_id), // get_status or the webhook
         },
     },
     Err(Error::Charge { code, transaction_id, .. }) => match code.as_str() {
@@ -422,8 +423,10 @@ match client.charge_payment_method(
 ```
 
 `charge_payment_method` returns `Ok` for HTTP 201 and for HTTP 402 alike. A decline is a result,
-not an error: the 402 charge has `status: "failed"` and a `decline_class` (`hard`, `soft_funds`,
-`soft_sca_required` or `soft_other`) plus the provider's `decline_code`. `is_paid()` and
+not an error: the 402 charge has `status: "failed"`, a `decline_class` (`hard`, `soft_funds`,
+`soft_sca_required` or `soft_other`) and the provider's `decline_code`. `decline_class` can be
+`None`: the 402 carries it only when the decline code alone decides it (`soft_sca_required`).
+Otherwise the class arrives a moment later, on `get_status` and the decline webhook. `is_paid()` and
 `is_terminal()` read the same way they do on a session status; `pending` is the one status
 that is not terminal.
 

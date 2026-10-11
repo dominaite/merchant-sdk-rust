@@ -332,6 +332,31 @@ fn a_402_decline_is_a_result_with_a_decline_class_not_an_error() {
     );
 }
 
+/// The 402 carries a decline class only when the decline code alone decides
+/// it. Without one, the decline is still a failed charge, never an error.
+#[test]
+fn a_402_without_a_decline_class_is_still_a_failed_charge() {
+    for data in [
+        r#"{"chargeId":"ch_33333333333343338333333333333334","status":"failed","declineClass":null,"declineCode":"05","transactionId":"33333333-3333-4333-8333-333333333334"}"#,
+        r#"{"chargeId":"ch_33333333333343338333333333333334","status":"failed","declineCode":"05","transactionId":"33333333-3333-4333-8333-333333333334"}"#,
+    ] {
+        let server = MockServer::start(vec![charge_envelope(
+            402,
+            Some(("CHARGE_DECLINED", "declined")),
+            Some(data),
+        )]);
+
+        let charge = client_for(&server)
+            .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
+            .expect("a decline is a result");
+
+        assert_eq!(charge.status, charge_status::FAILED, "{data}");
+        assert_eq!(charge.decline_class, None, "{data}");
+        assert_eq!(charge.decline_code.as_deref(), Some("05"), "{data}");
+        assert!(charge.is_terminal());
+    }
+}
+
 #[test]
 fn a_200_replay_is_returned_as_the_charge() {
     // A durable replay of the same key answers 200 with the original charge.
