@@ -1980,3 +1980,148 @@ pub mod event_type {
     /// the contract's `verification.webhookEvents`.
     pub const VERIFICATION: [&str; 2] = [VERIFICATION_SUCCEEDED, VERIFICATION_FAILED];
 }
+
+/// The parameters for [`Client::list_transactions`](crate::Client::list_transactions):
+/// one page of your payments created in a window.
+///
+/// `from` and `to` are required and come from [`TransactionListParams::new`];
+/// the rest are builder methods. A parameter you do not set is left out of
+/// the query string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionListParams {
+    /// The window start, inclusive, on the payment's creation time: ISO 8601
+    /// UTC, e.g. `2026-10-01T00:00:00Z`. A date alone is midnight UTC.
+    pub from: String,
+    /// The window end, exclusive: ISO 8601 UTC, later than `from` and at most
+    /// 31 days after it. For a statement, end the window a few minutes in the
+    /// past, so payments still being written are not missed.
+    pub to: String,
+    /// Only payments that are in this status now: one of the [`status`]
+    /// constants.
+    pub status: Option<String>,
+    /// Items per page, 1 to 100. The API's default is 50.
+    pub limit: Option<u32>,
+    /// The [`TransactionPage::next_cursor`] of the previous page, unchanged.
+    /// Leave it out for the first page.
+    pub cursor: Option<String>,
+}
+
+impl TransactionListParams {
+    /// The first page of the window from `from` (inclusive) to `to`
+    /// (exclusive).
+    pub fn new(from: impl Into<String>, to: impl Into<String>) -> Self {
+        TransactionListParams {
+            from: from.into(),
+            to: to.into(),
+            status: None,
+            limit: None,
+            cursor: None,
+        }
+    }
+
+    /// Lists only the payments in this status.
+    pub fn status(mut self, value: impl Into<String>) -> Self {
+        self.status = Some(value.into());
+        self
+    }
+
+    /// Sets the page size, 1 to 100.
+    pub fn limit(mut self, value: u32) -> Self {
+        self.limit = Some(value);
+        self
+    }
+
+    /// Asks for the page after the one that answered this cursor.
+    pub fn cursor(mut self, value: impl Into<String>) -> Self {
+        self.cursor = Some(value.into());
+        self
+    }
+}
+
+/// One page of [`Client::list_transactions`](crate::Client::list_transactions).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionPage {
+    /// The payments of this page, oldest first by `created_at`, then by
+    /// `transaction_id`. Empty when the window has none.
+    #[serde(default)]
+    pub items: Vec<Transaction>,
+    /// The cursor of the next page. `None` on the last page of the window.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+
+    /// The unwrapped page as the gateway sent it, for fields this struct does
+    /// not model yet.
+    #[serde(skip)]
+    pub raw: Value,
+}
+
+/// One payment in a [`TransactionPage`]. The fields and values agree with the
+/// status read ([`CheckoutStatus`]) of the same `transaction_id`, with the
+/// status at the time of the read.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Transaction {
+    /// The payment id, as the session or the charge returned it.
+    pub transaction_id: String,
+    /// Your own order id from the session create call. `None` when none was
+    /// sent.
+    #[serde(default)]
+    pub order_reference: Option<String>,
+    /// How the payment was taken: one of the [`transaction_type`] constants,
+    /// or a type this SDK does not know yet.
+    #[serde(default, rename = "type")]
+    pub transaction_type: String,
+    /// One of the [`status`] constants, or a status this SDK does not know
+    /// yet. The same value the status read answers.
+    #[serde(default)]
+    pub status: String,
+    /// The payment amount in MINOR units of `currency`.
+    #[serde(default)]
+    pub amount: i64,
+    /// ISO 4217 currency.
+    #[serde(default)]
+    pub currency: String,
+    /// ISO 8601 UTC, when the payment was created. The window and the order
+    /// use this time.
+    #[serde(default)]
+    pub created_at: String,
+    /// ISO 8601 UTC, when the payment first succeeded. `None` when it never
+    /// succeeded, and on older payments that succeeded before this time was
+    /// recorded.
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    /// On a `charge`: the `pm_` handle of the saved card that was charged.
+    /// `None` on a checkout payment, and on an old charge that did not record
+    /// its card.
+    #[serde(default)]
+    pub stored_payment_method_id: Option<String>,
+    /// The total refunded so far, in MINOR units. `None` when nothing was
+    /// refunded.
+    #[serde(default)]
+    pub refunded_amount: Option<i64>,
+
+    /// This item as the gateway sent it, for fields this struct does not
+    /// model yet.
+    #[serde(skip)]
+    pub raw: Value,
+}
+
+/// How a payment in the transaction list was taken, on
+/// [`Transaction::transaction_type`]. A value outside this list is a type
+/// added after this release.
+pub mod transaction_type {
+    /// The payer paid on the hosted checkout.
+    pub const PAYMENT: &str = "payment";
+    /// A saved card was charged: by your server through
+    /// [`Client::charge_payment_method`](crate::Client::charge_payment_method),
+    /// or by the platform for an agreement period.
+    pub const CHARGE: &str = "charge";
+    /// A verify-only session saved a card. Not a purchase: the verification
+    /// amount is released, or refunded when it was captured. Leave it out of
+    /// revenue.
+    pub const VERIFICATION: &str = "verification";
+
+    /// The whole vocabulary, in the order the contract lists it.
+    pub const ALL: [&str; 3] = [PAYMENT, CHARGE, VERIFICATION];
+}

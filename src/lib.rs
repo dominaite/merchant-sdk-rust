@@ -52,7 +52,7 @@ mod webhooks;
 pub use client::{
     Client, ClientBuilder, RetryOptions, AGREEMENTS_PATH, DEFAULT_BASE_URL,
     INTEGRATION_CONTRACT_PATH, PAYMENTS_PATH, PAYMENT_METHODS_PATH, PING_PATH, PLANS_PATH,
-    SESSIONS_PATH, VERSION, WEBHOOKS_PATH,
+    SESSIONS_PATH, TRANSACTIONS_PATH, VERSION, WEBHOOKS_PATH,
 };
 pub use error::{
     auth_error_code, charge_error_code, rate_limit_error_code, refund_error_code,
@@ -64,11 +64,12 @@ pub use signing::{sha256_hex, sign_request, SignRequest};
 pub use types::{
     agreement_status, charge_status, decline_class, event_type, interval_unit, past_due_reason,
     payment_method, plan_status, refund_failure_code, refund_status, retired_reason, status,
-    stored_payment_method_status, wallet_type, webhook_endpoint_status, Agreement,
-    AgreementRequest, AgreementSummary, ChargeRequest, CheckoutSession, CheckoutSessionRequest,
-    CheckoutStatus, Consent, ConsentRecord, Customer, Integration, IntegrationContract,
-    PaymentMethodCharge, Ping, Plan, PlanRequest, PlanUpdate, Refund, RefundList, RefundRequest,
-    StoredPaymentMethod, WebhookEndpoint, WebhookEndpointRequest,
+    stored_payment_method_status, transaction_type, wallet_type, webhook_endpoint_status,
+    Agreement, AgreementRequest, AgreementSummary, ChargeRequest, CheckoutSession,
+    CheckoutSessionRequest, CheckoutStatus, Consent, ConsentRecord, Customer, Integration,
+    IntegrationContract, PaymentMethodCharge, Ping, Plan, PlanRequest, PlanUpdate, Refund,
+    RefundList, RefundRequest, StoredPaymentMethod, Transaction, TransactionListParams,
+    TransactionPage, WebhookEndpoint, WebhookEndpointRequest,
 };
 pub use webhooks::{
     verify_webhook, PaymentEventData, WebhookError, WebhookEvent, DEFAULT_TOLERANCE_SECS,

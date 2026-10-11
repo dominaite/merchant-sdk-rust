@@ -12,7 +12,8 @@ use crate::signing::{sign_request, SignRequest};
 use crate::types::{
     Agreement, AgreementRequest, ChargeRequest, CheckoutSession, CheckoutSessionRequest,
     CheckoutStatus, IntegrationContract, PaymentMethodCharge, Ping, Plan, PlanRequest, PlanUpdate,
-    Refund, RefundList, RefundRequest, WebhookEndpoint, WebhookEndpointRequest,
+    Refund, RefundList, RefundRequest, TransactionListParams, TransactionPage, WebhookEndpoint,
+    WebhookEndpointRequest,
 };
 
 /// The production merchant API.
@@ -51,6 +52,10 @@ pub const AGREEMENTS_PATH: &str = "/merchant-api/agreements";
 /// The canonical path of webhook endpoints. POST registers one and GET lists
 /// them; DELETE `WEBHOOKS_PATH/{id}` removes one.
 pub const WEBHOOKS_PATH: &str = "/merchant-api/webhooks";
+
+/// The canonical path of the transaction list. The signature covers this
+/// path only, never the query string.
+pub const TRANSACTIONS_PATH: &str = "/merchant-api/transactions";
 
 /// This SDK's version, reported in the User-Agent.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -459,7 +464,7 @@ impl Client {
         let id = normalize_payment_method_id(payment_method_id)?;
         let (idempotency_key, body) = prepare_charge_request(request)?;
         let path = format!("{PAYMENT_METHODS_PATH}/{id}/charges");
-        let reply = self.send("POST", &path, &body, &idempotency_key)?;
+        let reply = self.send("POST", &path, "", &body, &idempotency_key)?;
 
         // 201 (200 on a durable replay): the charge was placed, whatever its
         // status. 402: the provider declined; the envelope says success=false
@@ -519,7 +524,7 @@ impl Client {
         // DELETE signs an EMPTY idempotency key and an EMPTY body, like GET, and
         // sends no Idempotency-Key header.
         let path = format!("{PAYMENT_METHODS_PATH}/{id}");
-        let reply = self.send("DELETE", &path, "", "")?;
+        let reply = self.send("DELETE", &path, "", "", "")?;
         if reply.status < 400 {
             return Ok(());
         }
@@ -892,6 +897,83 @@ impl Client {
         Ok(())
     }
 
+    /// Lists one page of your payments created in a window, oldest first:
+    /// checkout payments, charges on saved cards (yours and the platform's
+    /// for an agreement) and verify-only sessions. A refund is not a row of
+    /// its own: it shows on its payment, in `refunded_amount` and `status`.
+    /// Fees are not part of this read.
+    ///
+    /// The key needs the `transactions:read` scope. A key with the `payments`
+    /// scope cannot hold it. A key bound to a storefront lists the payments
+    /// of that storefront only.
+    ///
+    /// To read a whole window, send [`TransactionPage::next_cursor`] back as
+    /// the cursor, with the same `from`, `to` and `status`, until it is
+    /// `None`. Paging never repeats or skips a row. The parameters travel in
+    /// the query string, which is not part of the signature.
+    ///
+    /// ```no_run
+    /// use dominaite::{Client, TransactionListParams};
+    ///
+    /// # fn main() -> Result<(), dominaite::Error> {
+    /// # let client = Client::new("dmk_0123456789abcdef0123456789abcdef", "dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")?;
+    /// let mut params =
+    ///     TransactionListParams::new("2026-10-01T00:00:00Z", "2026-10-08T00:00:00Z").limit(100);
+    /// loop {
+    ///     let page = client.list_transactions(&params)?;
+    ///     for transaction in &page.items {
+    ///         println!("{} {}", transaction.transaction_id, transaction.status);
+    ///     }
+    ///     match page.next_cursor {
+    ///         Some(cursor) => params = params.cursor(cursor),
+    ///         None => break,
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Errors it returns:
+    /// - [`Error::Validation`]: a missing `from` or `to`; nothing was sent.
+    /// - [`Error::Auth`]: as on [`Client::create_plan`].
+    /// - [`Error::Forbidden`]: the key does not hold the `transactions:read`
+    ///   scope.
+    /// - [`Error::Api`]: HTTP 400 for a parameter the API refused, for
+    ///   example a window longer than 31 days, or a cursor that is not a
+    ///   `next_cursor` (the details are in `raw`, under
+    ///   `error.validationErrors`).
+    /// - [`Error::RateLimited`] and [`Error::Transport`]: wait, then read the
+    ///   page again.
+    pub fn list_transactions(&self, params: &TransactionListParams) -> Result<TransactionPage> {
+        if params.from.trim().is_empty() {
+            return Err(Error::validation("Missing required parameter: from"));
+        }
+        if params.to.trim().is_empty() {
+            return Err(Error::validation("Missing required parameter: to"));
+        }
+        let mut query = format!(
+            "from={}&to={}",
+            encode_query_value(&params.from),
+            encode_query_value(&params.to)
+        );
+        if let Some(status) = &params.status {
+            query.push_str("&status=");
+            query.push_str(&encode_query_value(status));
+        }
+        if let Some(limit) = params.limit {
+            query.push_str("&limit=");
+            query.push_str(&limit.to_string());
+        }
+        if let Some(cursor) = &params.cursor {
+            query.push_str("&cursor=");
+            query.push_str(&encode_query_value(cursor));
+        }
+        // GET signs the path only, with an EMPTY idempotency key and an EMPTY
+        // body. The query string is not signed.
+        let (_, payload) = self.request_with_query("GET", TRANSACTIONS_PATH, &query, "", "")?;
+        parse_object(payload, 200, "transaction page")
+    }
+
     /// Signs and sends one call, and maps the response onto the error taxonomy:
     /// [`Client::send`] plus the generic rejection for any 4xx or 5xx. The
     /// unwrapped `data` comes back on success (an empty object for a 204).
@@ -916,7 +998,21 @@ impl Client {
         body: &str,
         idempotency_key: &str,
     ) -> Result<(u16, Value)> {
-        let reply = self.send(method, path, body, idempotency_key)?;
+        self.request_with_query(method, path, "", body, idempotency_key)
+    }
+
+    /// [`Client::request_with_status`] with a query string. The query goes
+    /// into the URL and never into the signature. `query` is already
+    /// encoded, without the `?`.
+    fn request_with_query(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &str,
+        idempotency_key: &str,
+    ) -> Result<(u16, Value)> {
+        let reply = self.send(method, path, query, body, idempotency_key)?;
         if reply.status >= 400 {
             return Err(reply.rejection());
         }
@@ -931,7 +1027,14 @@ impl Client {
     /// error). Every other status comes back as a reply, so the payment method
     /// routes can read a 402 decline or a coded 502 as the typed answers they
     /// are, while [`Client::request`] rejects them generically.
-    fn send(&self, method: &str, path: &str, body: &str, idempotency_key: &str) -> Result<Reply> {
+    fn send(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &str,
+        idempotency_key: &str,
+    ) -> Result<Reply> {
         let timestamp = unix_seconds().to_string();
         let signature = sign_request(SignRequest {
             secret: &self.secret,
@@ -944,7 +1047,13 @@ impl Client {
             body,
         });
 
-        let url = format!("{}{}", self.base_url, path);
+        // The query string travels in the URL only: the API signs the
+        // canonical path without it.
+        let url = if query.is_empty() {
+            format!("{}{}", self.base_url, path)
+        } else {
+            format!("{}{}?{}", self.base_url, path, query)
+        };
         let mut builder = ureq::http::Request::builder()
             .method(method)
             .uri(&url)
@@ -1370,6 +1479,18 @@ impl KeepsRaw for WebhookEndpoint {
     }
 }
 
+impl KeepsRaw for TransactionPage {
+    /// The page keeps its own object, and each item keeps its own.
+    fn keep_raw(&mut self, raw: Value) {
+        if let Some(items) = raw.get("items").and_then(Value::as_array) {
+            for (item, item_raw) in self.items.iter_mut().zip(items) {
+                item.raw = item_raw.clone();
+            }
+        }
+        self.raw = raw;
+    }
+}
+
 /// One `T` from the unwrapped `data`, with `raw` filled in. `what` names the
 /// object in the error.
 fn parse_object<T: KeepsRaw>(payload: Value, http_status: u16, what: &str) -> Result<T> {
@@ -1422,6 +1543,24 @@ fn agreement_path(agreement_id: &str) -> Result<String> {
         "agreement_id must be the id create_agreement returned",
     )?;
     Ok(format!("{AGREEMENTS_PATH}/{id}"))
+}
+
+/// Percent-encodes one query value: every byte except the unreserved
+/// characters of RFC 3986. A `+` goes out as `%2B`, so an offset such as
+/// `+02:00` is not read as a space.
+fn encode_query_value(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0F)]));
+        }
+    }
+    encoded
 }
 
 /// The signed path of one webhook endpoint, the id in lowercase hyphenated
