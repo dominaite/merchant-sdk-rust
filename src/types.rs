@@ -1196,3 +1196,279 @@ pub struct RefundList {
     #[serde(skip)]
     pub raw: Value,
 }
+
+/// The parameters for [`Client::create_plan`](crate::Client::create_plan): a
+/// price and a billing interval you sell.
+///
+/// `name`, `amount`, `currency`, `interval_unit` and the idempotency key are
+/// required and come from [`PlanRequest::new`]; the rest are builder methods.
+/// The body is these fields in this order, then the `extra` fields. The
+/// amount, the currency and the interval never change once the plan exists:
+/// to change a price, create a new plan and archive the old one with
+/// [`Client::delete_plan`](crate::Client::delete_plan).
+///
+/// ```
+/// use dominaite::{interval_unit, IdempotencyKey, PlanRequest};
+///
+/// # fn main() -> Result<(), dominaite::Error> {
+/// let key = IdempotencyKey::new("plan-pro-monthly")?;
+/// // 1990 = 19.90 EUR every month, after a 14-day trial.
+/// let request = PlanRequest::new("Pro", 1990, "EUR", interval_unit::MONTH, key)
+///     .trial_days(14)
+///     .cancel_url("https://shop.example/account/cancel");
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanRequest {
+    /// The display name, 1 to 100 characters.
+    pub name: String,
+    /// The charge per period in MINOR units: `1990` is 19.90 EUR.
+    pub amount: i64,
+    /// ISO 4217 currency, three upper-case letters, e.g. `"EUR"`.
+    pub currency: String,
+    /// One of the [`interval_unit`] constants.
+    pub interval_unit: String,
+    /// How many units make one billing period: every 3 months is
+    /// [`interval_unit::MONTH`] with 3. The period is at most one year: 365
+    /// days, 52 weeks, 12 months or 1 year. `None` sends nothing, and the API
+    /// uses 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval_count: Option<u32>,
+    /// The number of periods after which an agreement completes on its own,
+    /// at least 1. `None` bills until the agreement is cancelled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period_count: Option<u32>,
+    /// The days between activation and the first charge, 0 to 365. `None` or
+    /// 0 is no trial.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trial_days: Option<u32>,
+    /// Your page where the customer cancels the subscription: an absolute
+    /// `https` URL, at most 2048 characters. The platform puts it as the
+    /// cancel link on every receipt and decline notice it emails to your
+    /// customer. Without it, those emails tell the customer to contact you.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancel_url: Option<String>,
+
+    /// Required. It travels in the header and in the signature, never in the
+    /// body. The same key with the same body answers the plan it created, so
+    /// a create whose answer you lost is safe to send again with the same
+    /// key. Derive it from your own plan record, never mint one per attempt.
+    #[serde(skip)]
+    pub idempotency_key: IdempotencyKey,
+
+    /// Any additional field the API accepts that this struct does not model yet.
+    /// These are merged into the JSON body, after the fields above.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl PlanRequest {
+    /// A plan that charges `amount` MINOR units of `currency` every
+    /// `interval_unit`. The key is required: derive it from your own plan
+    /// record.
+    pub fn new(
+        name: impl Into<String>,
+        amount: i64,
+        currency: impl Into<String>,
+        interval_unit: impl Into<String>,
+        idempotency_key: IdempotencyKey,
+    ) -> Self {
+        PlanRequest {
+            name: name.into(),
+            amount,
+            currency: currency.into(),
+            interval_unit: interval_unit.into(),
+            interval_count: None,
+            period_count: None,
+            trial_days: None,
+            cancel_url: None,
+            idempotency_key,
+            extra: Map::new(),
+        }
+    }
+
+    /// Sets how many units make one billing period.
+    pub fn interval_count(mut self, value: u32) -> Self {
+        self.interval_count = Some(value);
+        self
+    }
+
+    /// Sets the number of periods after which agreements complete.
+    pub fn period_count(mut self, value: u32) -> Self {
+        self.period_count = Some(value);
+        self
+    }
+
+    /// Sets the trial in days.
+    pub fn trial_days(mut self, value: u32) -> Self {
+        self.trial_days = Some(value);
+        self
+    }
+
+    /// Sets the page where the customer cancels.
+    pub fn cancel_url(mut self, value: impl Into<String>) -> Self {
+        self.cancel_url = Some(value.into());
+        self
+    }
+
+    /// Adds a body field this struct does not model yet.
+    pub fn extra(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.extra.insert(key.into(), value);
+        self
+    }
+}
+
+/// The parameters for [`Client::update_plan`](crate::Client::update_plan). A
+/// field you do not set keeps its value. The amount, the currency and the
+/// interval cannot change.
+///
+/// ```
+/// use dominaite::PlanUpdate;
+///
+/// // A new name, and no trial for the agreements created from now on.
+/// let update = PlanUpdate::new().name("Pro 2027").trial_days(0);
+/// ```
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanUpdate {
+    /// The new display name, 1 to 100 characters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The new trial in days, 0 to 365, for the agreements created from now
+    /// on. 0 removes the trial.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trial_days: Option<u32>,
+    /// The new cancel page, an absolute `https` URL, on the emails from now
+    /// on. An empty string removes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancel_url: Option<String>,
+
+    /// Any additional field the API accepts that this struct does not model yet.
+    /// These are merged into the JSON body, after the fields above.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl PlanUpdate {
+    /// An update that changes nothing yet. Set at least one field: the API
+    /// refuses an empty update.
+    pub fn new() -> Self {
+        PlanUpdate::default()
+    }
+
+    /// Sets the new display name.
+    pub fn name(mut self, value: impl Into<String>) -> Self {
+        self.name = Some(value.into());
+        self
+    }
+
+    /// Sets the new trial in days. 0 removes the trial.
+    pub fn trial_days(mut self, value: u32) -> Self {
+        self.trial_days = Some(value);
+        self
+    }
+
+    /// Sets the new cancel page. An empty string removes it.
+    pub fn cancel_url(mut self, value: impl Into<String>) -> Self {
+        self.cancel_url = Some(value.into());
+        self
+    }
+
+    /// Adds a body field this struct does not model yet.
+    pub fn extra(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.extra.insert(key.into(), value);
+        self
+    }
+}
+
+/// A subscription plan, as [`Client::create_plan`](crate::Client::create_plan),
+/// [`Client::get_plan`](crate::Client::get_plan) and the other plan methods
+/// return it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Plan {
+    /// `plan_` followed by 32 hex characters. It is case-sensitive: store it
+    /// and send it back exactly as it is.
+    pub id: String,
+    /// The display name.
+    #[serde(default)]
+    pub name: String,
+    /// The charge per period in MINOR units of `currency`.
+    #[serde(default)]
+    pub amount: i64,
+    /// ISO 4217 currency.
+    #[serde(default)]
+    pub currency: String,
+    /// One of the [`interval_unit`] constants, or a unit this SDK does not
+    /// know yet.
+    #[serde(default)]
+    pub interval_unit: String,
+    /// How many units make one billing period.
+    #[serde(default)]
+    pub interval_count: i64,
+    /// The number of periods after which agreements complete. `None` bills
+    /// until cancelled.
+    #[serde(default)]
+    pub period_count: Option<i64>,
+    /// The trial in days for the agreements created from now on. 0 is no
+    /// trial.
+    #[serde(default)]
+    pub trial_days: i64,
+    /// One of the [`plan_status`] constants, or a status this SDK does not
+    /// know yet. Compare with [`Plan::is_active`].
+    #[serde(default)]
+    pub status: String,
+    /// The page where the customer cancels. `None` when the plan has none.
+    #[serde(default)]
+    pub cancel_url: Option<String>,
+    /// ISO 8601 UTC creation time.
+    #[serde(default)]
+    pub created_at: String,
+    /// ISO 8601 UTC, when the plan was archived. `None` while it is active.
+    #[serde(default)]
+    pub archived_at: Option<String>,
+
+    /// The unwrapped plan object as the gateway sent it, for fields this
+    /// struct does not model yet.
+    #[serde(skip)]
+    pub raw: Value,
+}
+
+impl Plan {
+    /// True only for `active`: the plan accepts new agreements. An unknown
+    /// status reads as not active.
+    pub fn is_active(&self) -> bool {
+        self.status == plan_status::ACTIVE
+    }
+}
+
+/// Interval unit wire values, on [`PlanRequest::interval_unit`] and
+/// [`Plan::interval_unit`].
+pub mod interval_unit {
+    /// Days. At most 365 per period.
+    pub const DAY: &str = "day";
+    /// Weeks. At most 52 per period.
+    pub const WEEK: &str = "week";
+    /// Months. At most 12 per period.
+    pub const MONTH: &str = "month";
+    /// Years. At most 1 per period.
+    pub const YEAR: &str = "year";
+
+    /// The whole vocabulary, in the order the contract lists it.
+    pub const ALL: [&str; 4] = [DAY, WEEK, MONTH, YEAR];
+}
+
+/// Plan status wire values, on [`Plan::status`]. A value outside this list is
+/// a status added after this release; treat it as not active.
+pub mod plan_status {
+    /// The plan accepts new agreements.
+    pub const ACTIVE: &str = "active";
+    /// [`Client::delete_plan`](crate::Client::delete_plan) archived it: it
+    /// accepts no new agreements, and the agreements it has continue.
+    pub const ARCHIVED: &str = "archived";
+
+    /// The whole vocabulary, in the order the contract lists it.
+    pub const ALL: [&str; 2] = [ACTIVE, ARCHIVED];
+}

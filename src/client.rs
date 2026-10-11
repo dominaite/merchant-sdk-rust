@@ -3,13 +3,15 @@
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::error::{session_error_code, Error, Result};
 use crate::signing::{sign_request, SignRequest};
 use crate::types::{
     ChargeRequest, CheckoutSession, CheckoutSessionRequest, CheckoutStatus, IntegrationContract,
-    PaymentMethodCharge, Ping, Refund, RefundList, RefundRequest,
+    PaymentMethodCharge, Ping, Plan, PlanRequest, PlanUpdate, Refund, RefundList, RefundRequest,
 };
 
 /// The production merchant API.
@@ -35,6 +37,11 @@ pub const PING_PATH: &str = "/merchant-api/ping";
 
 /// The machine-readable integration contract. GET only.
 pub const INTEGRATION_CONTRACT_PATH: &str = "/merchant-api/integration/contract";
+
+/// The canonical path of subscription plans. POST creates one and GET lists
+/// them; GET, PATCH and DELETE `PLANS_PATH/{plan_id}` read, update and archive
+/// one.
+pub const PLANS_PATH: &str = "/merchant-api/plans";
 
 /// This SDK's version, reported in the User-Agent.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -608,6 +615,112 @@ impl Client {
         Ok(list)
     }
 
+    /// Creates a subscription plan: a price and a billing interval you sell.
+    /// Nothing is charged. An agreement subscribes one customer to the plan,
+    /// and the hosted subscription session takes the first payment.
+    ///
+    /// The plan carries the request's required `Idempotency-Key`. The same key
+    /// with the same body answers the plan it created (HTTP 200 instead of
+    /// 201), also after a [`Client::update_plan`], so after a timeout send it
+    /// again WITH THE SAME KEY. The same key with another body is refused with
+    /// 422 `IDEMPOTENCY_KEY_REUSED`.
+    ///
+    /// Errors it returns:
+    /// - [`Error::Validation`]: a missing name, currency or interval unit, or
+    ///   an amount of 0 or less; nothing was sent.
+    /// - [`Error::Auth`]: wrong credentials, bad signature, clock off, IP not
+    ///   allowlisted.
+    /// - [`Error::Forbidden`]: the key does not hold the `payments` scope.
+    /// - [`Error::Api`]: HTTP 400 for a field the API refused (the details are
+    ///   in `raw`, under `error.validationErrors`) or `INVALID_CURRENCY`, and
+    ///   422 `IDEMPOTENCY_KEY_REUSED`.
+    /// - [`Error::RateLimited`]: HTTP 429. Wait, then send it again with the
+    ///   same idempotency key.
+    /// - [`Error::Transport`]: network failure or 5xx. Nothing was created on
+    ///   a 503; send it again WITH the same idempotency key.
+    pub fn create_plan(&self, request: &PlanRequest) -> Result<Plan> {
+        if request.name.trim().is_empty() {
+            return Err(Error::validation("Missing required parameter: name"));
+        }
+        if request.amount <= 0 {
+            return Err(Error::validation(
+                "amount must be a positive integer in MINOR units (e.g. 1990 for 19.90 EUR)",
+            ));
+        }
+        if request.currency.trim().is_empty() {
+            return Err(Error::validation("Missing required parameter: currency"));
+        }
+        if request.interval_unit.trim().is_empty() {
+            return Err(Error::validation(
+                "Missing required parameter: interval_unit",
+            ));
+        }
+        let body = json_body(request)?;
+        let (status, payload) =
+            self.request_with_status("POST", PLANS_PATH, &body, request.idempotency_key.as_str())?;
+        parse_object(payload, status, "plan")
+    }
+
+    /// Lists your plans: at most 200, active first, and the newest first
+    /// within a status. The route has no pages yet; read a plan by id with
+    /// [`Client::get_plan`] when you have more.
+    ///
+    /// Errors it returns: as [`Client::get_plan`], without the 404.
+    pub fn list_plans(&self) -> Result<Vec<Plan>> {
+        // GET signs an EMPTY idempotency key and an EMPTY body.
+        let payload = self.request("GET", PLANS_PATH, "", "")?;
+        parse_array(payload, "plan")
+    }
+
+    /// Reads one plan, archived ones too.
+    ///
+    /// Errors it returns:
+    /// - [`Error::Validation`]: `plan_id` cannot be a plan id; nothing was
+    ///   sent.
+    /// - [`Error::Auth`] and [`Error::Forbidden`]: as on
+    ///   [`Client::create_plan`].
+    /// - [`Error::Api`]: 404 `PLAN_NOT_FOUND`, a plan that is not yours, or
+    ///   400 `INVALID_FORMAT` for an id of the wrong form.
+    /// - [`Error::RateLimited`] and [`Error::Transport`]: wait, then read
+    ///   again.
+    pub fn get_plan(&self, plan_id: &str) -> Result<Plan> {
+        let path = plan_path(plan_id)?;
+        let payload = self.request("GET", &path, "", "")?;
+        parse_object(payload, 200, "plan")
+    }
+
+    /// Changes the name, the trial or the cancel page of a plan, and answers
+    /// the plan as it is now. A field you do not set keeps its value. A trial
+    /// change reaches only the agreements created afterwards; a cancel page
+    /// change shows on the next email.
+    ///
+    /// PATCH carries no `Idempotency-Key`: the API does not replay it, and the
+    /// same update twice gives the same plan, so a retry is safe.
+    ///
+    /// Errors it returns: as [`Client::get_plan`]. An update that sets no
+    /// field is refused with HTTP 400.
+    pub fn update_plan(&self, plan_id: &str, update: &PlanUpdate) -> Result<Plan> {
+        let path = plan_path(plan_id)?;
+        let body = json_body(update)?;
+        // PATCH signs an EMPTY idempotency key, like GET, but signs its body.
+        let payload = self.request("PATCH", &path, &body, "")?;
+        parse_object(payload, 200, "plan")
+    }
+
+    /// Archives a plan: it accepts no new agreements, and the agreements it
+    /// has continue on their own terms. An archived plan stays readable.
+    /// Archiving an archived plan succeeds again, so a retry after a timeout
+    /// is safe.
+    ///
+    /// Errors it returns: as [`Client::get_plan`].
+    pub fn delete_plan(&self, plan_id: &str) -> Result<()> {
+        let path = plan_path(plan_id)?;
+        // DELETE signs an EMPTY idempotency key and an EMPTY body; the answer
+        // is a 204 with no body.
+        self.request("DELETE", &path, "", "")?;
+        Ok(())
+    }
+
     /// Signs and sends one call, and maps the response onto the error taxonomy:
     /// [`Client::send`] plus the generic rejection for any 4xx or 5xx. The
     /// unwrapped `data` comes back on success (an empty object for a 204).
@@ -619,11 +732,24 @@ impl Client {
         body: &str,
         idempotency_key: &str,
     ) -> Result<Value> {
+        self.request_with_status(method, path, body, idempotency_key)
+            .map(|(_, payload)| payload)
+    }
+
+    /// [`Client::request`], plus the HTTP status of the answer, for the routes
+    /// that answer a create and its replay with different statuses.
+    fn request_with_status(
+        &self,
+        method: &str,
+        path: &str,
+        body: &str,
+        idempotency_key: &str,
+    ) -> Result<(u16, Value)> {
         let reply = self.send(method, path, body, idempotency_key)?;
         if reply.status >= 400 {
             return Err(reply.rejection());
         }
-        Ok(reply.payload().clone())
+        Ok((reply.status, reply.payload().clone()))
     }
 
     /// Signs and sends one call, and parses whatever came back into a [`Reply`].
@@ -800,10 +926,13 @@ impl Reply {
         self.envelope.get("success").and_then(Value::as_bool) == Some(true)
     }
 
-    /// `data` when it is an object, else nothing: the gateway omits null fields
-    /// on the wire, so a bodiless error has no `data` at all.
+    /// `data` when it is an object, or an array on the list routes, else
+    /// nothing: the gateway omits null fields on the wire, so a bodiless error
+    /// has no `data` at all.
     fn data(&self) -> Option<&Value> {
-        self.envelope.get("data").filter(|data| data.is_object())
+        self.envelope
+            .get("data")
+            .filter(|data| data.is_object() || data.is_array())
     }
 
     /// The unwrapped `data`, or the envelope itself when there is none.
@@ -1045,6 +1174,61 @@ fn parse_refund(payload: Value, http_status: u16) -> Result<Refund> {
     })?;
     refund.raw = payload;
     Ok(refund)
+}
+
+/// A response type that keeps the object it was parsed from in `raw`.
+trait KeepsRaw: DeserializeOwned {
+    fn keep_raw(&mut self, raw: Value);
+}
+
+impl KeepsRaw for Plan {
+    fn keep_raw(&mut self, raw: Value) {
+        self.raw = raw;
+    }
+}
+
+/// One `T` from the unwrapped `data`, with `raw` filled in. `what` names the
+/// object in the error.
+fn parse_object<T: KeepsRaw>(payload: Value, http_status: u16, what: &str) -> Result<T> {
+    let mut parsed: T = serde_json::from_value(payload.clone()).map_err(|_| {
+        Error::api(
+            http_status,
+            format!("The API returned an unexpected {what} response"),
+        )
+    })?;
+    parsed.keep_raw(payload);
+    Ok(parsed)
+}
+
+/// Every `T` of a list route, whose `data` is a JSON array. Each item keeps
+/// its own object in `raw`.
+fn parse_array<T: KeepsRaw>(payload: Value, what: &str) -> Result<Vec<T>> {
+    let Value::Array(items) = payload else {
+        return Err(Error::api(
+            200,
+            format!("The API returned an unexpected {what} list"),
+        ));
+    };
+    items
+        .into_iter()
+        .map(|item| parse_object(item, 200, what))
+        .collect()
+}
+
+/// The JSON body of a request, the exact text that gets signed.
+fn json_body<T: Serialize>(request: &T) -> Result<String> {
+    serde_json::to_string(request).map_err(|error| {
+        Error::validation(format!(
+            "Request parameters are not JSON-encodable: {error}"
+        ))
+    })
+}
+
+/// The signed path of one plan. A plan id is opaque and case-sensitive, so it
+/// goes into the path exactly as given.
+fn plan_path(plan_id: &str) -> Result<String> {
+    let id = normalize_opaque_id(plan_id, "plan_id must be the id create_plan returned")?;
+    Ok(format!("{PLANS_PATH}/{id}"))
 }
 
 /// The checks shared by every request that moves money: amount, currency,
