@@ -1,9 +1,52 @@
 # Changelog
 
-## Unreleased
+## 0.5.0
 
 ### Added
 
+- Verify-only sessions: `CheckoutSessionRequest::verify_only(true)` saves the payer's card with
+  no payment. Send an amount of 0; any other amount fails with `Error::Validation` before
+  anything is sent. The API refuses the session with 403 `VERIFY_ONLY_NOT_ENABLED` until we
+  switch it on for your account. The session sends `verification.succeeded` or
+  `verification.failed`, never a `payment.*` event.
+- Subscription sessions: `CheckoutSessionRequest` models `agreement_id` and `consent`
+  (`Consent`), and also `location_id`.
+- Subscriptions: `create_plan`, `list_plans`, `get_plan`, `update_plan` (PATCH) and
+  `delete_plan`, and `create_agreement`, `get_agreement` and `cancel_agreement`. `create_plan`
+  and `create_agreement` need an idempotency key. `update_plan` sends none, because the API does
+  not replay a plan update. New types: `Plan`, `PlanRequest`, `PlanUpdate`, `Agreement`,
+  `AgreementRequest` and `ConsentRecord`, and the `plan_status`, `interval_unit`,
+  `agreement_status` and `past_due_reason` constants.
+- `list_refunds(transaction_id)`: the refunds of one payment that you created through the API,
+  and the `refunded_amount` and `refundable_amount` totals (`RefundList`).
+- Webhook endpoints from your code, with a `webhooks:manage` key: `create_webhook_endpoint`,
+  `list_webhook_endpoints` and `delete_webhook_endpoint`. The create answers the `whsec_` secret
+  one time only; a repeat with the same key answers `secret: None`. The `Debug` output of
+  `WebhookEndpoint` never shows the secret. New: `WebhookEndpointRequest`, and the
+  `webhook_endpoint_status` and `event_type` constants (`event_type::PAYMENT`, `RECURRING` and
+  `VERIFICATION`).
+- `list_transactions(&TransactionListParams)`, with a `transactions:read` key: one page of your
+  payments, oldest first, and the `next_cursor` of the next page. The SDK signs the path without
+  the query. New: `Transaction`, `TransactionPage`, `TransactionListParams` and the
+  `transaction_type` constants.
+- `get_integration_contract`: the contract that the API publishes about itself.
+  `IntegrationContract` models `version`, `statuses` and `webhook_event_catalog`; `raw` keeps
+  the other fields as sent.
+- Response fields: `verify_only`, `decline_class`, `is_recurring`, `agreement`
+  (`AgreementSummary`) and `sequence` on `CheckoutStatus`; `verify_only` and `agreement_id` on
+  `CheckoutSession`; `agreement_id` on `PaymentMethodCharge`; `verify_only` and `decline_class`
+  on `PaymentEventData`. `WebhookEvent::payment_data` also types the `verification.*` events.
+  Every status, class, reason and event type stays a plain `String`, so a value the SDK does not
+  know never fails a call or a parse.
+- `agreement_id` on `ChargeRequest`, and `extra` on `ChargeRequest` and `RefundRequest`: the SDK
+  sends every field you give, after the fields that it models, so a new API field needs no SDK
+  release.
+- Errors: `Error::Forbidden` for a 403 (see Changed). `Error::RateLimited` gains `code` and
+  `raw`. `Error::Api` gains `raw`: the whole JSON answer, for example `error.params.webhookId` on
+  409 `WEBHOOK_ALREADY_REGISTERED`.
+- New constants: `auth_error_code` (the 401 and 403 codes, pinned against the wire contract) and
+  `rate_limit_error_code` (`RATE_LIMIT_EXCEEDED`, `CHARGE_VELOCITY_EXCEEDED` and
+  `CHARGE_DECLINE_RATE_EXCEEDED`).
 - Wallet reporting: `CheckoutStatus::payment_method` and `CheckoutStatus::wallet_type`, both
   `Option<String>`. `None` while the payment is open and on older transactions; `wallet_type` is
   `None` for non-wallet payments and keeps a wallet value it does not know. Reporting data only,
@@ -12,6 +55,23 @@
   `samsung_pay`), with `wallet_type::ALL` pinned against the gateway contract.
 - Contract fixtures: `paymentMethod` and `walletType` in the status read fields and examples,
   and the `wallets` section in the wire contract.
+- Wire contract fixture: regenerated from production, with the authorization error group.
+
+### Changed
+
+- A 403 is now `Error::Forbidden` instead of `Error::Auth`. It no longer tells you to check your
+  key id, secret and server clock: that hint is for 401 only. 403 `INSUFFICIENT_SCOPE` repeats
+  the API message that names the missing scope, and 403 `VERIFY_ONLY_NOT_ENABLED` says that
+  verify-only is not on for your account. `Error::http_status()` answers 401 for `Auth` and 403
+  for `Forbidden`.
+- Breaking for struct literals and exhaustive patterns: `Error::Api` and `Error::RateLimited`
+  have new fields, and so have the request and response structs listed above. Add the fields, or
+  use `..` in a pattern.
+- `PaymentMethodCharge::decline_class` can be `None` on a declined charge. The charge answer
+  classifies only SCA declines at once; `get_status` carries the class later. The docs no longer
+  promise a class on every decline.
+- The README installs tag `v0.5.0` and documents key scopes, verify-only sessions,
+  subscriptions, the refund list, webhook endpoints, transactions and the integration contract.
 
 ## 0.4.0
 
