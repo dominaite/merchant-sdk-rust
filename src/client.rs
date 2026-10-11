@@ -10,8 +10,9 @@ use serde_json::Value;
 use crate::error::{session_error_code, Error, Result};
 use crate::signing::{sign_request, SignRequest};
 use crate::types::{
-    ChargeRequest, CheckoutSession, CheckoutSessionRequest, CheckoutStatus, IntegrationContract,
-    PaymentMethodCharge, Ping, Plan, PlanRequest, PlanUpdate, Refund, RefundList, RefundRequest,
+    Agreement, AgreementRequest, ChargeRequest, CheckoutSession, CheckoutSessionRequest,
+    CheckoutStatus, IntegrationContract, PaymentMethodCharge, Ping, Plan, PlanRequest, PlanUpdate,
+    Refund, RefundList, RefundRequest,
 };
 
 /// The production merchant API.
@@ -42,6 +43,10 @@ pub const INTEGRATION_CONTRACT_PATH: &str = "/merchant-api/integration/contract"
 /// them; GET, PATCH and DELETE `PLANS_PATH/{plan_id}` read, update and archive
 /// one.
 pub const PLANS_PATH: &str = "/merchant-api/plans";
+
+/// The canonical path of subscription agreements. POST creates one; GET and
+/// DELETE `AGREEMENTS_PATH/{agreement_id}` read and cancel one.
+pub const AGREEMENTS_PATH: &str = "/merchant-api/agreements";
 
 /// This SDK's version, reported in the User-Agent.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -616,8 +621,9 @@ impl Client {
     }
 
     /// Creates a subscription plan: a price and a billing interval you sell.
-    /// Nothing is charged. An agreement subscribes one customer to the plan,
-    /// and the hosted subscription session takes the first payment.
+    /// Nothing is charged. An agreement ([`Client::create_agreement`])
+    /// subscribes one customer to the plan, and the hosted subscription
+    /// session takes the first payment.
     ///
     /// The plan carries the request's required `Idempotency-Key`. The same key
     /// with the same body answers the plan it created (HTTP 200 instead of
@@ -715,6 +721,82 @@ impl Client {
     /// Errors it returns: as [`Client::get_plan`].
     pub fn delete_plan(&self, plan_id: &str) -> Result<()> {
         let path = plan_path(plan_id)?;
+        // DELETE signs an EMPTY idempotency key and an EMPTY body; the answer
+        // is a 204 with no body.
+        self.request("DELETE", &path, "", "")?;
+        Ok(())
+    }
+
+    /// Subscribes one of your customers to a plan. The agreement is created
+    /// `pending` and nothing is charged. Then open the subscription session:
+    /// [`Client::create_checkout_session`] with
+    /// [`CheckoutSessionRequest::agreement_id`] takes the first payment, saves
+    /// the card and activates the agreement. After that the platform charges
+    /// each period and sends the `agreement.*` and `charge.*` webhooks.
+    ///
+    /// The agreement carries the request's required `Idempotency-Key`, with
+    /// the same replay rules as [`Client::create_plan`]: the same key and body
+    /// answer the agreement it created (HTTP 200 instead of 201).
+    ///
+    /// Errors it returns:
+    /// - [`Error::Validation`]: a missing plan id or customer reference;
+    ///   nothing was sent.
+    /// - [`Error::Auth`] and [`Error::Forbidden`]: as on
+    ///   [`Client::create_plan`].
+    /// - [`Error::Api`]: HTTP 400 for a field the API refused (the details
+    ///   are in `raw`, under `error.validationErrors`); 404 `PLAN_NOT_FOUND`
+    ///   or `PAYMENT_METHOD_NOT_FOUND`; 409 `PLAN_NOT_ACTIVE` or
+    ///   `PAYMENT_METHOD_NOT_ACTIVE`; 422 `MAX_AMOUNT_BELOW_PLAN_AMOUNT`,
+    ///   `PAYMENT_METHOD_CURRENCY_MISMATCH`, `PAYMENT_METHOD_CURRENCY_UNKNOWN`,
+    ///   `AGREEMENT_CONSENT_REQUIRED` or `IDEMPOTENCY_KEY_REUSED`.
+    /// - [`Error::RateLimited`] and [`Error::Transport`]: as on
+    ///   [`Client::create_plan`]; send it again WITH the same idempotency key.
+    pub fn create_agreement(&self, request: &AgreementRequest) -> Result<Agreement> {
+        if request.plan_id.trim().is_empty() {
+            return Err(Error::validation("Missing required parameter: plan_id"));
+        }
+        if request.customer_reference.trim().is_empty() {
+            return Err(Error::validation(
+                "Missing required parameter: customer_reference",
+            ));
+        }
+        let body = json_body(request)?;
+        let (status, payload) = self.request_with_status(
+            "POST",
+            AGREEMENTS_PATH,
+            &body,
+            request.idempotency_key.as_str(),
+        )?;
+        parse_object(payload, status, "agreement")
+    }
+
+    /// Reads one agreement: its status, its next charge, why it is past due,
+    /// and its `sequence` to order it against the `agreement.*` webhooks.
+    ///
+    /// Errors it returns:
+    /// - [`Error::Validation`]: `agreement_id` cannot be an agreement id;
+    ///   nothing was sent.
+    /// - [`Error::Auth`] and [`Error::Forbidden`]: as on
+    ///   [`Client::create_plan`].
+    /// - [`Error::Api`]: 404 `AGREEMENT_NOT_FOUND`, an agreement that is not
+    ///   yours, or 400 `INVALID_FORMAT` for an id of the wrong form.
+    /// - [`Error::RateLimited`] and [`Error::Transport`]: wait, then read
+    ///   again.
+    pub fn get_agreement(&self, agreement_id: &str) -> Result<Agreement> {
+        let path = agreement_path(agreement_id)?;
+        let payload = self.request("GET", &path, "", "")?;
+        parse_object(payload, 200, "agreement")
+    }
+
+    /// Cancels an agreement that is pending, active or past due. No further
+    /// charge is scheduled; a charge already placed is not reversed. The
+    /// `agreement.cancelled` webhook follows. Cancelling a cancelled agreement
+    /// succeeds again, so a retry after a timeout is safe.
+    ///
+    /// Errors it returns: as [`Client::get_agreement`], plus 409
+    /// `AGREEMENT_ENDED` for an agreement that completed or failed.
+    pub fn cancel_agreement(&self, agreement_id: &str) -> Result<()> {
+        let path = agreement_path(agreement_id)?;
         // DELETE signs an EMPTY idempotency key and an EMPTY body; the answer
         // is a 204 with no body.
         self.request("DELETE", &path, "", "")?;
@@ -1187,6 +1269,12 @@ impl KeepsRaw for Plan {
     }
 }
 
+impl KeepsRaw for Agreement {
+    fn keep_raw(&mut self, raw: Value) {
+        self.raw = raw;
+    }
+}
+
 /// One `T` from the unwrapped `data`, with `raw` filled in. `what` names the
 /// object in the error.
 fn parse_object<T: KeepsRaw>(payload: Value, http_status: u16, what: &str) -> Result<T> {
@@ -1229,6 +1317,16 @@ fn json_body<T: Serialize>(request: &T) -> Result<String> {
 fn plan_path(plan_id: &str) -> Result<String> {
     let id = normalize_opaque_id(plan_id, "plan_id must be the id create_plan returned")?;
     Ok(format!("{PLANS_PATH}/{id}"))
+}
+
+/// The signed path of one agreement. An agreement id is opaque and
+/// case-sensitive, like a plan id.
+fn agreement_path(agreement_id: &str) -> Result<String> {
+    let id = normalize_opaque_id(
+        agreement_id,
+        "agreement_id must be the id create_agreement returned",
+    )?;
+    Ok(format!("{AGREEMENTS_PATH}/{id}"))
 }
 
 /// The checks shared by every request that moves money: amount, currency,

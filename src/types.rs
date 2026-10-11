@@ -61,18 +61,26 @@ impl Customer {
     }
 }
 
-/// A customer's acceptance of the platform consent text for recurring
-/// charges, sent with a subscription session or an agreement.
+/// A customer's acceptance of the terms for recurring charges, sent with a
+/// subscription session or an agreement.
 ///
-/// All three fields are required together. `text_version` names a version of
-/// the PLATFORM consent text, never your own wording: the contract lists the
-/// published versions in `recurring.consentTextVersions` (today
-/// `recurring-2026-09`).
+/// All three fields are required together. What `text_version` names depends
+/// on where you send it:
+///
+/// - On a subscription session ([`CheckoutSessionRequest::consent`]): a
+///   version of the PLATFORM consent text, never your own wording. The
+///   contract lists the published versions in `recurring.consentTextVersions`
+///   (today `recurring-2026-09`).
+/// - On an agreement ([`AgreementRequest::consent`]): your own label for the
+///   wording the customer accepted, 1 to 50 characters, e.g. `terms-2026-09`.
+///   The subscription session uses the agreement's consent only when this
+///   label is one of the platform versions; otherwise send consent on the
+///   session too.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Consent {
-    /// The version of the platform consent text your page showed the
-    /// customer, e.g. `recurring-2026-09`.
+    /// The version of the consent text the customer accepted; the type docs
+    /// say which versions each route takes.
     pub text_version: String,
     /// When the customer accepted, ISO 8601 UTC, e.g. `2026-10-11T09:30:00Z`.
     /// Not in the future.
@@ -176,10 +184,17 @@ pub struct CheckoutSessionRequest {
     /// above 0, so build the key with [`IdempotencyKey::new`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify_only: Option<bool>,
-    /// The `agr_` handle of a PENDING agreement. It makes this the subscription
-    /// session that takes the agreement's first payment, saves the card and
-    /// activates the agreement. Amount and currency must be the agreement's
-    /// own (on a plan with a trial only the currency is held).
+    /// The `agr_` handle of a PENDING agreement from
+    /// [`Client::create_agreement`](crate::Client::create_agreement). It makes
+    /// this the subscription session that takes the agreement's first payment,
+    /// saves the card and activates the agreement. Amount and currency must be
+    /// the agreement's own (on a plan with a trial only the currency is held).
+    ///
+    /// A subscription session the API cannot open is refused with
+    /// [`Error::Refusal`](crate::Error::Refusal) and nothing is created, for
+    /// example code `AGREEMENT_NOT_PENDING`, `AGREEMENT_SESSION_OPEN` or
+    /// `SUBSCRIPTIONS_NOT_ENABLED`. The contract lists every code under
+    /// `recurring.subscriptionSessionOutcomes`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agreement_id: Option<String>,
     /// Only with `agreement_id`: the customer's acceptance of the platform
@@ -567,47 +582,6 @@ pub struct CheckoutStatus {
     /// The unparsed payload, for fields this struct does not model yet.
     #[serde(skip)]
     pub raw: Value,
-}
-
-/// The agreement on a status read: enough to know whether the subscription
-/// started.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgreementSummary {
-    /// The `agr_` handle.
-    #[serde(default)]
-    pub id: String,
-    /// One of the [`agreement_status`] constants, or a status this SDK does
-    /// not know yet.
-    #[serde(default)]
-    pub status: String,
-    /// ISO 8601 UTC of the next scheduled charge. `None` while pending and once
-    /// the agreement has ended.
-    #[serde(default)]
-    pub next_charge_at: Option<String>,
-}
-
-/// Agreement status wire values, on [`AgreementSummary::status`]. A value
-/// outside this list is a status added after this release; treat it as not
-/// active.
-pub mod agreement_status {
-    /// Created, nothing charged yet. The subscription session activates it.
-    pub const PENDING: &str = "pending";
-    /// The first payment succeeded and the card is saved; charges follow the
-    /// plan.
-    pub const ACTIVE: &str = "active";
-    /// A charge failed and the platform is retrying; see the agreement's
-    /// `past_due_reason`.
-    pub const PAST_DUE: &str = "past_due";
-    /// Cancelled: no further charge is scheduled.
-    pub const CANCELLED: &str = "cancelled";
-    /// Every period of the plan was charged.
-    pub const COMPLETED: &str = "completed";
-    /// The agreement ended because charging it failed for good.
-    pub const FAILED: &str = "failed";
-
-    /// The whole vocabulary, in the order the contract lists it.
-    pub const ALL: [&str; 6] = [PENDING, ACTIVE, PAST_DUE, CANCELLED, COMPLETED, FAILED];
 }
 
 impl CheckoutStatus {
@@ -1471,4 +1445,315 @@ pub mod plan_status {
 
     /// The whole vocabulary, in the order the contract lists it.
     pub const ALL: [&str; 2] = [ACTIVE, ARCHIVED];
+}
+
+/// The parameters for [`Client::create_agreement`](crate::Client::create_agreement):
+/// subscribe one of your customers to a plan.
+///
+/// `plan_id`, `customer_reference` and the idempotency key are required and
+/// come from [`AgreementRequest::new`]; the rest are builder methods. The body
+/// is these fields in this order, then the `extra` fields. The agreement is
+/// created `pending` and nothing is charged: the subscription session
+/// ([`CheckoutSessionRequest::agreement_id`]) takes the first payment, saves
+/// the card and activates it.
+///
+/// ```
+/// use dominaite::{AgreementRequest, IdempotencyKey};
+///
+/// # fn main() -> Result<(), dominaite::Error> {
+/// let key = IdempotencyKey::new("subscription-8817")?;
+/// let request = AgreementRequest::new(
+///     "plan_0123456789abcdef0123456789abcdef",
+///     "customer-77",
+///     key,
+/// );
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgreementRequest {
+    /// The `plan_` handle of one of your active plans.
+    pub plan_id: String,
+    /// Your own id for the customer, 1 to 100 characters, the same on every
+    /// agreement of this customer.
+    pub customer_reference: String,
+    /// The `pm_` handle of an active card this customer already saved through
+    /// checkout, to bill instead of saving a new card in the subscription
+    /// session. The card must come from a payment in the plan's currency.
+    /// Requires `consent`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_payment_method_id: Option<String>,
+    /// The customer's acceptance, when your own page captured it. Required
+    /// with `stored_payment_method_id` and with `max_amount_per_period`.
+    /// Without them you can leave it out, and the subscription session
+    /// captures it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consent: Option<Consent>,
+    /// Only for a variable amount (a seat price plus usage): the most one
+    /// charge under the agreement may be, in MINOR units of the plan's
+    /// currency, at least the plan's amount. One charge per period is
+    /// allowed, so this is also the cap per period. Requires `consent`. Leave
+    /// it out for a fixed agreement: every charge is then exactly the plan's
+    /// amount.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_amount_per_period: Option<i64>,
+
+    /// Required. It travels in the header and in the signature, never in the
+    /// body. The same key with the same body answers the agreement it
+    /// created, so a create whose answer you lost is safe to send again with
+    /// the same key. Derive it from your own subscription record.
+    #[serde(skip)]
+    pub idempotency_key: IdempotencyKey,
+
+    /// Any additional field the API accepts that this struct does not model yet.
+    /// These are merged into the JSON body, after the fields above.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl AgreementRequest {
+    /// An agreement that subscribes `customer_reference` to `plan_id`. The key
+    /// is required: derive it from your own subscription record.
+    pub fn new(
+        plan_id: impl Into<String>,
+        customer_reference: impl Into<String>,
+        idempotency_key: IdempotencyKey,
+    ) -> Self {
+        AgreementRequest {
+            plan_id: plan_id.into(),
+            customer_reference: customer_reference.into(),
+            stored_payment_method_id: None,
+            consent: None,
+            max_amount_per_period: None,
+            idempotency_key,
+            extra: Map::new(),
+        }
+    }
+
+    /// Bills this saved card. Requires [`AgreementRequest::consent`].
+    pub fn stored_payment_method_id(mut self, value: impl Into<String>) -> Self {
+        self.stored_payment_method_id = Some(value.into());
+        self
+    }
+
+    /// Sets the consent your own page captured.
+    pub fn consent(mut self, value: Consent) -> Self {
+        self.consent = Some(value);
+        self
+    }
+
+    /// Makes this a variable agreement with this cap per charge. Requires
+    /// [`AgreementRequest::consent`].
+    pub fn max_amount_per_period(mut self, value: i64) -> Self {
+        self.max_amount_per_period = Some(value);
+        self
+    }
+
+    /// Adds a body field this struct does not model yet.
+    pub fn extra(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.extra.insert(key.into(), value);
+        self
+    }
+}
+
+/// A subscription agreement, as
+/// [`Client::create_agreement`](crate::Client::create_agreement) and
+/// [`Client::get_agreement`](crate::Client::get_agreement) return it.
+///
+/// It keeps its own copy of the plan's price and interval from the time it was
+/// created, so it does not change when the plan changes.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Agreement {
+    /// `agr_` followed by 32 hex characters. It is case-sensitive: store it
+    /// and send it back exactly as it is.
+    pub id: String,
+    /// The `plan_` handle the agreement was created from.
+    #[serde(default)]
+    pub plan_id: String,
+    /// Your own id for the customer, as sent.
+    #[serde(default)]
+    pub customer_reference: String,
+    /// The `pm_` handle of the card on file. `None` until a card is saved.
+    #[serde(default)]
+    pub stored_payment_method_id: Option<String>,
+    /// One of the [`agreement_status`] constants, or a status this SDK does
+    /// not know yet. Compare with [`Agreement::is_active`].
+    #[serde(default)]
+    pub status: String,
+    /// The charge per period in MINOR units of `currency`.
+    #[serde(default)]
+    pub amount: i64,
+    /// On a variable agreement, the most one charge may be, in MINOR units.
+    /// `None` on a fixed agreement: every charge is exactly `amount`.
+    #[serde(default)]
+    pub max_amount_per_period: Option<i64>,
+    /// ISO 4217 currency. One currency per agreement.
+    #[serde(default)]
+    pub currency: String,
+    /// One of the [`interval_unit`] constants, or a unit this SDK does not
+    /// know yet.
+    #[serde(default)]
+    pub interval_unit: String,
+    /// How many units make one billing period.
+    #[serde(default)]
+    pub interval_count: i64,
+    /// The number of periods. `None` bills until cancelled.
+    #[serde(default)]
+    pub period_count: Option<i64>,
+    /// The trial in days.
+    #[serde(default)]
+    pub trial_days: i64,
+    /// ISO 8601 UTC of the next scheduled charge. `None` while pending and
+    /// once the agreement has ended.
+    #[serde(default)]
+    pub next_charge_at: Option<String>,
+    /// Why the agreement is `past_due`: one of the [`past_due_reason`]
+    /// constants, or a reason this SDK does not know yet. `None` in every
+    /// other status.
+    #[serde(default)]
+    pub past_due_reason: Option<String>,
+    /// ISO 8601 UTC, when the agreement went past due. `None` in every other
+    /// status.
+    #[serde(default)]
+    pub past_due_at: Option<String>,
+    /// The recorded consent and the platform's receipt of it. `None` until
+    /// consent is captured.
+    #[serde(default)]
+    pub consent: Option<ConsentRecord>,
+    /// Starts at 1. It goes up when the price changes for a future period.
+    #[serde(default)]
+    pub version: i64,
+    /// The agreement's transition counter as of this read: the
+    /// `data.sequence` of the latest `agreement.*` webhook about it, 0 before
+    /// its first transition. Compare it with the highest sequence you
+    /// processed, as you do for an event
+    /// ([`WebhookEvent::sequence`](crate::WebhookEvent::sequence)).
+    #[serde(default)]
+    pub sequence: i64,
+    /// ISO 8601 UTC creation time.
+    #[serde(default)]
+    pub created_at: String,
+    /// ISO 8601 UTC, when the agreement went active. `None` while pending.
+    #[serde(default)]
+    pub activated_at: Option<String>,
+    /// ISO 8601 UTC, when you cancelled it. `None` unless cancelled.
+    #[serde(default)]
+    pub cancelled_at: Option<String>,
+
+    /// The unwrapped agreement object as the gateway sent it, for fields this
+    /// struct does not model yet.
+    #[serde(skip)]
+    pub raw: Value,
+}
+
+impl Agreement {
+    /// True only for `active`: the customer paid the first period and the
+    /// platform charges each period. An unknown status reads as not active.
+    pub fn is_active(&self) -> bool {
+        self.status == agreement_status::ACTIVE
+    }
+}
+
+/// The consent recorded on an [`Agreement`]: the three fields exactly as they
+/// were sent (on the agreement or on the subscription session), plus the
+/// platform's own receipt, which no request can set.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsentRecord {
+    /// The consent text version, as sent.
+    #[serde(default)]
+    pub text_version: String,
+    /// When the customer accepted, ISO 8601 UTC, as sent.
+    #[serde(default)]
+    pub accepted_at: Option<String>,
+    /// The customer's IP address at acceptance, as sent.
+    #[serde(default)]
+    pub ip: String,
+    /// When the consent reached the platform, ISO 8601 UTC, by the server
+    /// clock.
+    #[serde(default)]
+    pub received_at: Option<String>,
+    /// The address of the server that sent the consent to the platform, not
+    /// the customer's. `None` unless the platform's own network edge recorded
+    /// it.
+    #[serde(default)]
+    pub received_from_ip: Option<String>,
+}
+
+/// The agreement on a status read: enough to know whether the subscription
+/// started. Read the whole agreement with
+/// [`Client::get_agreement`](crate::Client::get_agreement).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgreementSummary {
+    /// The `agr_` handle.
+    #[serde(default)]
+    pub id: String,
+    /// One of the [`agreement_status`] constants, or a status this SDK does
+    /// not know yet.
+    #[serde(default)]
+    pub status: String,
+    /// ISO 8601 UTC of the next scheduled charge. `None` while pending and once
+    /// the agreement has ended.
+    #[serde(default)]
+    pub next_charge_at: Option<String>,
+}
+
+/// Agreement status wire values, on [`Agreement::status`] and
+/// [`AgreementSummary::status`]. A value outside this list is a status added
+/// after this release; treat it as not active.
+pub mod agreement_status {
+    /// Created, nothing charged yet. The subscription session activates it.
+    pub const PENDING: &str = "pending";
+    /// The customer paid the first period and the card is on file; the
+    /// platform charges each period.
+    pub const ACTIVE: &str = "active";
+    /// The platform gave up on the current period on this card, and makes no
+    /// further attempt on it; `past_due_reason` says why. It stays past due
+    /// until the period is paid on another card, which makes it active again,
+    /// or until you cancel it. A soft decline that is still retried leaves
+    /// the agreement active.
+    pub const PAST_DUE: &str = "past_due";
+    /// You cancelled it. No further charge, ever. The platform never cancels
+    /// an agreement on its own.
+    pub const CANCELLED: &str = "cancelled";
+    /// Every period of the plan was charged.
+    pub const COMPLETED: &str = "completed";
+    /// A terminal failure. Reserved: the platform does not set it today. An
+    /// agreement whose period cannot be collected is `past_due` instead.
+    pub const FAILED: &str = "failed";
+
+    /// The whole vocabulary, in the order the contract lists it.
+    pub const ALL: [&str; 6] = [PENDING, ACTIVE, PAST_DUE, CANCELLED, COMPLETED, FAILED];
+}
+
+/// Why an agreement is past due, on [`Agreement::past_due_reason`]. A value
+/// outside this list is a reason added after this release.
+pub mod past_due_reason {
+    /// The card's expiry month is over. Ask the customer for a new card.
+    pub const CARD_EXPIRED: &str = "card_expired";
+    /// The card on file is no longer active, or the agreement has no card.
+    /// Ask the customer for a new card.
+    pub const CARD_REVOKED: &str = "card_revoked";
+    /// The issuer declined, and a retry on the same card does not help.
+    pub const HARD_DECLINE: &str = "hard_decline";
+    /// The soft declines used up all the retries.
+    pub const DUNNING_EXHAUSTED: &str = "dunning_exhausted";
+    /// The issuer wants strong customer authentication. The card is good, but
+    /// the next payment needs the customer present for a challenge.
+    pub const SCA_REQUIRED: &str = "sca_required";
+    /// The charge was refused for a reason that no retry fixes.
+    pub const UNPROCESSABLE: &str = "unprocessable";
+
+    /// The whole vocabulary, in the gateway's order.
+    pub const ALL: [&str; 6] = [
+        CARD_EXPIRED,
+        CARD_REVOKED,
+        HARD_DECLINE,
+        DUNNING_EXHAUSTED,
+        SCA_REQUIRED,
+        UNPROCESSABLE,
+    ];
 }
