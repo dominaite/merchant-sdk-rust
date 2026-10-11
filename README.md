@@ -53,13 +53,33 @@ Each key holds one or more scopes. A route answers only a key that holds its sco
 | `webhooks:manage` | `create_webhook_endpoint`, `list_webhook_endpoints` and `delete_webhook_endpoint`. |
 
 A key holds `payments` alone, or one or both of the other two scopes. A key with
-`transactions:read` or `webhooks:manage` is a reporting key, and it is not bound to one
-storefront. A key issued without scopes holds `payments`. The scopes of a key are fixed when it
-is issued: to change them, issue a new key. Every key can call `ping` and
-`get_integration_contract`.
+`transactions:read` or `webhooks:manage` is a reporting key: a second key, next to your payments
+key. A reporting key is for the whole account, and it cannot be bound to a storefront. A key
+issued without scopes holds `payments`. The scopes of a key are fixed when it is issued. Every
+key can call `ping` and `get_integration_contract`.
+
+The dashboard cannot issue a reporting key: ask us (Dominaite support). You do not need one to
+receive webhooks. An endpoint that you set on the dashboard's **Webhooks** tab needs no key.
 
 A call with a key that does not hold the scope fails with `Error::Forbidden`, code
 `INSUFFICIENT_SCOPE` (HTTP 403). Nothing was created. Use a key that holds the scope.
+
+## What we switch on for your account
+
+Every merchant with a payments key can use checkout sessions, `save_card`, the status read,
+`ping`, refunds, plans, agreements and `revoke_payment_method`. The four items below work only
+after we switch them on for your account. The dashboard has no switch for them: ask us
+(Dominaite support).
+
+- [Saved-card charges](#stored-payment-methods-recurring): we switch `charge_payment_method` on.
+  Without it, the API answers HTTP 503 with code `PAYMENT_METHOD_CHARGES_DISABLED`.
+- [Subscription sessions and scheduled charges](#subscriptions): we switch each of them on.
+  Without the first, a session with an `agreement_id` answers code `SUBSCRIPTIONS_NOT_ENABLED`.
+  Without the second, the platform does not charge the saved card each period.
+- [Card verification](#save-a-card-without-a-payment): we switch verify-only sessions on.
+  Without it, the API answers HTTP 403 with code `VERIFY_ONLY_NOT_ENABLED`.
+- [A reporting key](#key-scopes): we issue this second key for the webhook endpoint methods and
+  `list_transactions`. A payments key gets HTTP 403 with code `INSUFFICIENT_SCOPE`.
 
 ## Quickstart (zero to a signed session against dev)
 
@@ -406,6 +426,12 @@ same amount, currency and order reference as a session, and an idempotency key t
 and signed exactly like `create_checkout_session`. Derive it from what you are billing (the
 subscription and its period), so a retried charge carries the same one.
 
+Saved-card charges work only after we switch them on for your account: ask us (Dominaite
+support). Until then, the call fails with `Error::Charge`, code
+`PAYMENT_METHOD_CHARGES_DISABLED` (HTTP 503). Nothing was charged, and a retry does not help
+until we switch it on. We also answer this code when we pause charges for a short time. After a
+pause, a retry with the same key works.
+
 ```rust
 use dominaite::{charge_error_code, charge_status, decline_class, ChargeRequest, Error, IdempotencyKey};
 
@@ -432,8 +458,9 @@ match client.charge_payment_method(
         charge_error_code::PAYMENT_METHOD_NOT_ACTIVE => ask_for_another_card(),
         // Nothing was charged; retry later with the SAME key.
         charge_error_code::DUPLICATE_REQUEST
-        | charge_error_code::PAYMENT_METHOD_CHARGES_DISABLED
         | charge_error_code::PAYMENT_PROCESSING_UNAVAILABLE => retry_later(),
+        // Nothing was charged. Charges are off for your account, or paused for a short time.
+        charge_error_code::PAYMENT_METHOD_CHARGES_DISABLED => charges_are_off(),
         _ => give_up(), // CHARGE_FAILED, IDEMPOTENCY_KEY_REUSED
     },
     Err(other) => return Err(other.into()),
@@ -521,15 +548,21 @@ your account. Until then, the call fails with `Error::Forbidden`, code `VERIFY_O
 ## Subscriptions
 
 A plan is a recurring price that you sell. An agreement subscribes one of your customers to a
-plan. The platform then charges the saved card each period.
+plan. The platform charges the saved card each period after we switch scheduled charges on.
 
 1. Create a plan once for each price with `create_plan`.
 2. Create an agreement for the customer with `create_agreement`. It starts `pending` and
    charges nothing.
 3. Create a subscription session: `create_checkout_session` with the `agreement_id` and the
    customer's `consent`. The checkout takes the first payment and saves the card.
-4. When that payment is approved, the agreement goes `active`. The platform then charges each
-   period and sends the `agreement.*` and `charge.*` webhooks.
+4. When that payment is approved, the agreement goes `active`. With scheduled charges on, the
+   platform then charges each period and sends the `agreement.*` and `charge.*` webhooks.
+
+Steps 3 and 4 work only after we switch them on for your account: ask us (Dominaite support).
+Until we switch subscription sessions on, step 3 fails with `Error::Refusal`, code
+`SUBSCRIPTIONS_NOT_ENABLED`. You can create plans and agreements, but the agreement stays
+`pending`. Until we switch scheduled charges on, the platform places no period charge and no
+retry.
 
 ```rust
 use dominaite::{
@@ -601,6 +634,10 @@ answer is in its `raw`.
 idempotency key is required and signed exactly like a charge. Derive the key from YOUR refund
 (the return or credit-note id), never per attempt: the same key answers the same refund and
 never refunds twice, so after a timeout or a 500 you resend it as is.
+
+The API refunds online (card-not-present) payments only, up to the paid amount. A payment made
+on a terminal fails with `Error::Api`, code `PAYMENT_NOT_FOUND` (404). Whoever holds your
+payments key can refund, so keep that key on your server.
 
 ```rust
 use dominaite::{refund_error_code, refund_status, to_minor_units, Error, IdempotencyKey, RefundRequest};
@@ -871,7 +908,10 @@ difference. Treat webhooks as the fast path and the sweep as the source of truth
 
 ### Manage endpoints with the API
 
-These three methods need a key with the `webhooks:manage` scope (see [Key scopes](#key-scopes)).
+These three methods need a reporting key with the `webhooks:manage` scope: ask us for it (see
+[Key scopes](#key-scopes)). A payments key fails with `Error::Forbidden`, code
+`INSUFFICIENT_SCOPE` (HTTP 403). An endpoint that you set on the dashboard's **Webhooks** tab
+needs no key.
 
 ```rust
 use dominaite::{event_type, IdempotencyKey, WebhookEndpointRequest};
@@ -951,10 +991,11 @@ fields the structs do not model yet.
 
 ## Transactions
 
-`list_transactions` lists your payments created in a window, oldest first. It needs a key with
-the `transactions:read` scope (see [Key scopes](#key-scopes)). The rows are checkout payments,
-charges on saved cards and verify-only sessions. A refund is not a row of its own: it shows on
-its payment, in `refunded_amount` and `status`. Fees are not part of this read.
+`list_transactions` lists your payments created in a window, oldest first. It needs a reporting
+key with the `transactions:read` scope: ask us for it (see [Key scopes](#key-scopes)). A
+payments key fails with `Error::Forbidden`, code `INSUFFICIENT_SCOPE` (HTTP 403). The rows are
+checkout payments, charges on saved cards and verify-only sessions. A refund is not a row of its
+own: it shows on its payment, in `refunded_amount` and `status`. Fees are not part of this read.
 
 ```rust
 use dominaite::{transaction_type, TransactionListParams};
@@ -984,8 +1025,8 @@ loop {
 
 Each row has the status at the time of the read. For a statement, end the window a few minutes
 in the past, so payments still being written are not missed. Read again later to pick up
-changes such as refunds. A key bound to a storefront lists the payments of that storefront
-only. The parameters travel in the query string, which is not part of the signature.
+changes such as refunds. The reporting key is for the whole account: it cannot be bound to a
+storefront. The parameters travel in the query string, which is not part of the signature.
 
 ## Integration contract
 
