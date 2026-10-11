@@ -60,7 +60,8 @@
 
 ### Changed
 
-- A 403 is now `Error::Forbidden` instead of `Error::Auth`. It no longer tells you to check your
+- Breaking: a 403 is now `Error::Forbidden` instead of `Error::Auth`. Code that matched
+  `Error::Auth` for a 403 must match `Error::Forbidden`. A 403 no longer tells you to check your
   key id, secret and server clock: that hint is for 401 only. 403 `INSUFFICIENT_SCOPE` repeats
   the API message that names the missing scope, and 403 `VERIFY_ONLY_NOT_ENABLED` says that
   verify-only is not on for your account. `Error::http_status()` answers 401 for `Auth` and 403
