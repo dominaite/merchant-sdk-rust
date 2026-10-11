@@ -316,6 +316,39 @@ fn the_clock_hint_is_for_401_only() {
     }
 }
 
+/// The envelope travels with the error, so what the typed fields do not carry
+/// (the per-field validation errors, a code's params) is still readable.
+#[test]
+fn an_api_error_keeps_the_whole_envelope() {
+    let body = r#"{"success":false,"error":{"code":"VALIDATION_ERROR","message":"invalid","statusCode":400,"validationErrors":[{"field":"amount","message":"too small","code":"MIN_VALUE"}],"params":{"min":1}}}"#;
+    let server = MockServer::start(vec![Reply::Json(400, body.to_string())]);
+    let error = client_for(&server)
+        .create_checkout_session(&request())
+        .expect_err("rejected");
+
+    match &error {
+        Error::Api {
+            status, code, raw, ..
+        } => {
+            assert_eq!(*status, 400);
+            assert_eq!(code.as_deref(), Some("VALIDATION_ERROR"));
+            assert_eq!(raw["error"]["validationErrors"][0]["code"], "MIN_VALUE");
+            assert_eq!(raw["error"]["params"]["min"], 1);
+        }
+        other => panic!("expected an API error, got {other:?}"),
+    }
+
+    // A body that is not JSON has no envelope to keep.
+    let server = MockServer::start(vec![Reply::Html(400, "<html>no</html>".to_string())]);
+    let error = client_for(&server)
+        .create_checkout_session(&request())
+        .expect_err("rejected");
+    assert!(
+        matches!(&error, Error::Api { raw, .. } if raw.is_null()),
+        "{error:?}"
+    );
+}
+
 #[test]
 fn a_422_replay_with_a_different_body_is_an_api_error() {
     let server = MockServer::start(vec![Reply::error_envelope(

@@ -374,6 +374,13 @@ pub enum Error {
         code: Option<String>,
         /// The human-readable reason.
         message: String,
+        /// The whole envelope as the API sent it, for what the fields above do
+        /// not carry: `error.validationErrors` on a 400, and `error.params`,
+        /// e.g. the `webhookId` that a 409 `WEBHOOK_ALREADY_REGISTERED` names.
+        ///
+        /// `Value::Null` when the body was not JSON, and for the errors this
+        /// crate raises itself.
+        raw: Value,
     },
 
     /// The gateway answered a charge with an error code instead of a charge
@@ -579,6 +586,7 @@ impl Error {
             status,
             code: None,
             message: message.into(),
+            raw: Value::Null,
         }
     }
 
@@ -586,11 +594,13 @@ impl Error {
         status: u16,
         code: Option<String>,
         message: impl Into<String>,
+        raw: Value,
     ) -> Error {
         Error::Api {
             status,
             code,
             message: message.into(),
+            raw,
         }
     }
 
@@ -656,6 +666,7 @@ impl fmt::Display for Error {
                 status,
                 code: Some(code),
                 message,
+                ..
             } => write!(f, "API error (HTTP {status}, {code}): {message}"),
             Error::Api {
                 status, message, ..

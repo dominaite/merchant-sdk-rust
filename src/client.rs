@@ -630,7 +630,7 @@ impl Client {
             // agent - surfaces the status here instead of as a response. Same
             // taxonomy, minus the API's message.
             Err(ureq::Error::StatusCode(status)) => {
-                return Err(classify_status(status, None, None));
+                return Err(classify_status(status, None, None, Value::Null));
             }
             Err(error) => {
                 return Err(Error::transport(
@@ -702,7 +702,9 @@ impl Client {
         // method routes need its code.
         let envelope = match serde_json::from_str::<Value>(&raw) {
             Ok(envelope) if envelope.is_object() => envelope,
-            _ if http_status >= 500 => return Err(classify_status(http_status, None, None)),
+            _ if http_status >= 500 => {
+                return Err(classify_status(http_status, None, None, Value::Null))
+            }
             _ => {
                 return Err(Error::api(
                     http_status,
@@ -784,7 +786,8 @@ impl Reply {
     /// The generic error for a 4xx or 5xx: a 5xx is a retryable transport
     /// failure, a 4xx an [`Error::Api`] that keeps the code.
     fn rejection(self) -> Error {
-        classify_status(self.status, self.error_code(), self.error_message())
+        let (code, message) = (self.error_code(), self.error_message());
+        classify_status(self.status, code, message, self.envelope)
     }
 }
 
@@ -866,7 +869,12 @@ fn redirect_error(status: u16) -> Error {
     )
 }
 
-fn classify_status(status: u16, code: Option<String>, message: Option<String>) -> Error {
+fn classify_status(
+    status: u16,
+    code: Option<String>,
+    message: Option<String>,
+    raw: Value,
+) -> Error {
     // Defence in depth only. ureq does not surface a 3xx as a StatusCode error,
     // it follows it - what actually stops a redirect is the per-request
     // max_redirects(0) in `request`.
@@ -880,7 +888,7 @@ fn classify_status(status: u16, code: Option<String>, message: Option<String>) -
         429 => Error::RateLimited {
             retry_after_seconds: None,
             code,
-            raw: Value::Null,
+            raw,
         },
         // The clock hint is for 401 only. A 403 was signed correctly, so the
         // key id, the secret and the clock are fine.
@@ -904,6 +912,7 @@ fn classify_status(status: u16, code: Option<String>, message: Option<String>) -
             status,
             code,
             message.unwrap_or_else(|| "Request rejected".to_string()),
+            raw,
         ),
     }
 }
