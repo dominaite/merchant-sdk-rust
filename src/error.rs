@@ -208,6 +208,66 @@ pub mod refund_error_code {
     }
 }
 
+/// The codes the API answers with when it refuses the key itself, on any
+/// route.
+///
+/// HTTP 401 is a credential problem and arrives as [`Error::Auth`]: fix the key
+/// id, the secret, the server clock or the IP allowlist. HTTP 403 means the
+/// request was signed correctly but this key may not do this, and arrives as
+/// [`Error::Forbidden`]. Neither changes on a retry.
+pub mod auth_error_code {
+    /// HTTP 401: wrong or revoked key id.
+    pub const INVALID_API_KEY: &str = "INVALID_API_KEY";
+    /// HTTP 401: the signature does not match. Run the test vector again.
+    pub const INVALID_SIGNATURE: &str = "INVALID_SIGNATURE";
+    /// HTTP 401: your server clock is off by more than 5 minutes. Fix NTP.
+    pub const TIMESTAMP_OUT_OF_RANGE: &str = "TIMESTAMP_OUT_OF_RANGE";
+    /// HTTP 401: the key is IP-locked and this address is not on its
+    /// allowlist.
+    pub const IP_NOT_ALLOWED: &str = "IP_NOT_ALLOWED";
+    /// HTTP 403: the key does not hold the scope the route needs (`payments`,
+    /// `webhooks:manage` or `transactions:read`). A key's scopes are fixed when
+    /// it is issued, so use a key that holds the scope.
+    pub const INSUFFICIENT_SCOPE: &str = "INSUFFICIENT_SCOPE";
+    /// HTTP 403, verify-only sessions only: verify-only is not on for your
+    /// account. Nothing was created and the idempotency key is not burnt. We
+    /// switch it on for your account.
+    pub const VERIFY_ONLY_NOT_ENABLED: &str = "VERIFY_ONLY_NOT_ENABLED";
+
+    /// The HTTP 401 codes, in the order the contract lists them. Each arrives
+    /// as [`Error::Auth`](crate::Error::Auth).
+    pub const AUTHENTICATION: [&str; 4] = [
+        INVALID_API_KEY,
+        INVALID_SIGNATURE,
+        TIMESTAMP_OUT_OF_RANGE,
+        IP_NOT_ALLOWED,
+    ];
+
+    /// The contract's authorization group (HTTP 403). Each arrives as
+    /// [`Error::Forbidden`](crate::Error::Forbidden), and so does
+    /// [`VERIFY_ONLY_NOT_ENABLED`], which the contract lists with verify-only
+    /// sessions instead.
+    pub const AUTHORIZATION: [&str; 1] = [INSUFFICIENT_SCOPE];
+}
+
+/// The codes an HTTP 429 carries, on [`Error::RateLimited`]. Wait for
+/// `retry_after_seconds`, then send the same request again with the SAME
+/// idempotency key.
+pub mod rate_limit_error_code {
+    /// Your key or your IP sent more requests than it is allowed to.
+    pub const RATE_LIMIT_EXCEEDED: &str = "RATE_LIMIT_EXCEEDED";
+    /// Charges only: a volume limit refused the charge before anything was
+    /// placed. `error.params.window` in the raw body is the limit's window in
+    /// seconds and `error.params.limit` the limit. A charge that keeps hitting
+    /// this is a pattern to look into, not to retry around.
+    pub const CHARGE_VELOCITY_EXCEEDED: &str = "CHARGE_VELOCITY_EXCEEDED";
+    /// Charges only: this key collected too many declined charges in a short
+    /// window, so its charge route is locked for a while. Nothing was charged
+    /// and the key is not burnt; your other routes keep working. If this is a
+    /// genuine billing run with many declines, contact support.
+    pub const CHARGE_DECLINE_RATE_EXCEEDED: &str = "CHARGE_DECLINE_RATE_EXCEEDED";
+}
+
 /// Everything that can go wrong, split by what you should do about it.
 ///
 /// Match on the variant rather than on the message. Every variant that carries a
@@ -264,14 +324,33 @@ pub enum Error {
         transaction_id: Option<String>,
     },
 
-    /// The API rejected your credentials or signature (HTTP 401/403). Not
+    /// The API rejected your credentials or signature (HTTP 401). Not
     /// retryable: fix the key id, the secret, the server clock, or the caller
     /// allowlist.
     Auth {
-        /// One of `INVALID_API_KEY`, `INVALID_SIGNATURE`,
-        /// `TIMESTAMP_OUT_OF_RANGE`, `IP_NOT_ALLOWED`.
+        /// One of the [`auth_error_code::AUTHENTICATION`] codes:
+        /// `INVALID_API_KEY`, `INVALID_SIGNATURE`, `TIMESTAMP_OUT_OF_RANGE`,
+        /// `IP_NOT_ALLOWED`.
         code: String,
         /// The human-readable reason.
+        message: String,
+    },
+
+    /// The request was signed correctly, but this key may not do this (HTTP
+    /// 403). Not retryable, and not a credential problem: the key id, the
+    /// secret and the clock are fine.
+    ///
+    /// - `INSUFFICIENT_SCOPE`: the key does not hold the scope the route needs.
+    ///   A key's scopes are fixed when it is issued, so use a key that holds
+    ///   the scope.
+    /// - `VERIFY_ONLY_NOT_ENABLED`: a verify-only session, and verify-only is
+    ///   not on for your account. Nothing was created. We switch it on for
+    ///   your account.
+    Forbidden {
+        /// One of the [`auth_error_code`] 403 codes, or a code this SDK does
+        /// not know yet.
+        code: String,
+        /// The reason, with what to do about it.
         message: String,
     },
 
@@ -364,7 +443,8 @@ pub enum Error {
     ///
     /// The platform allows 60 requests per minute per API key and 120 per minute
     /// per IP. Polling `get_status` in a tight loop is the usual way to hit
-    /// this.
+    /// this. The charge route has two limits of its own; `code` tells them
+    /// apart (see [`rate_limit_error_code`]).
     ///
     /// NOT retried automatically, and [`Error::is_retryable`] is false: another
     /// request into a limiter is what got you here. Wait
@@ -377,6 +457,15 @@ pub enum Error {
         /// `None` when the header was absent, or in the HTTP-date form this SDK
         /// does not interpret.
         retry_after_seconds: Option<u64>,
+        /// The machine-readable reason, e.g. `RATE_LIMIT_EXCEEDED`. See
+        /// [`rate_limit_error_code`]. Also on [`Error::code`].
+        ///
+        /// `None` when the body carried no code, e.g. a limiter in front of the
+        /// API answered.
+        code: Option<String>,
+        /// The whole envelope, for fields not modelled above (a charge limit's
+        /// `error.params`). `Value::Null` when the body was not JSON.
+        raw: Value,
     },
 
     /// A network-level failure, a timeout, or a 5xx. The request may or may not
@@ -393,15 +482,17 @@ pub enum Error {
 impl Error {
     /// The machine-readable code, for the variants that carry one.
     ///
-    /// `Refusal`, `Auth`, `Charge` and `Revoke` always have one, `Api` has one
-    /// when the API sent it; the rest return `None`.
+    /// `Refusal`, `Auth`, `Forbidden`, `Charge` and `Revoke` always have one,
+    /// `Api` and `RateLimited` have one when the API sent it; the rest return
+    /// `None`.
     pub fn code(&self) -> Option<&str> {
         match self {
             Error::Refusal { code, .. }
             | Error::Auth { code, .. }
+            | Error::Forbidden { code, .. }
             | Error::Charge { code, .. }
             | Error::Revoke { code, .. } => Some(code),
-            Error::Api { code, .. } => code.as_deref(),
+            Error::Api { code, .. } | Error::RateLimited { code, .. } => code.as_deref(),
             _ => None,
         }
     }
@@ -412,6 +503,8 @@ impl Error {
             Error::Api { status, .. }
             | Error::Charge { status, .. }
             | Error::Revoke { status, .. } => Some(*status),
+            Error::Auth { .. } => Some(401),
+            Error::Forbidden { .. } => Some(403),
             Error::RateLimited { .. } => Some(429),
             _ => None,
         }
@@ -451,6 +544,32 @@ impl Error {
             code: code.into(),
             message: message.into(),
         }
+    }
+
+    /// A 403. The message says what to do for the codes this SDK knows; the
+    /// API's own message is kept where it is the useful part (it names the
+    /// scope the route needs).
+    pub(crate) fn forbidden(code: Option<String>, api_message: Option<String>) -> Error {
+        let code = code.unwrap_or_else(|| "FORBIDDEN".to_string());
+        let api_message = api_message.filter(|message| !message.trim().is_empty());
+        let message = match code.as_str() {
+            auth_error_code::INSUFFICIENT_SCOPE => format!(
+                "{}. A key's scopes are fixed when it is issued: use a key that holds this scope.",
+                api_message
+                    .as_deref()
+                    .unwrap_or("This API key does not have the scope this route requires")
+                    .trim_end_matches('.')
+            ),
+            auth_error_code::VERIFY_ONLY_NOT_ENABLED => {
+                "Verify-only sessions are not enabled for your account. Nothing was created. \
+                 We switch it on for your account: contact Dominaite support."
+                    .to_string()
+            }
+            _ => api_message.unwrap_or_else(|| {
+                "Access denied: this API key may not call this route.".to_string()
+            }),
+        };
+        Error::Forbidden { code, message }
     }
 
     /// An API error with no machine-readable code: the responses this crate
@@ -530,6 +649,9 @@ impl fmt::Display for Error {
             Error::Auth { code, message } => {
                 write!(f, "authentication failed ({code}): {message}")
             }
+            Error::Forbidden { code, message } => {
+                write!(f, "access denied (HTTP 403, {code}): {message}")
+            }
             Error::Api {
                 status,
                 code: Some(code),
@@ -553,10 +675,18 @@ impl fmt::Display for Error {
                 ..
             } => write!(f, "revoke error (HTTP {status}, {code}): {message}"),
             Error::RateLimited {
-                retry_after_seconds: Some(seconds),
-            } => write!(f, "rate limited (HTTP 429): retry after {seconds}s"),
-            Error::RateLimited { .. } => {
-                write!(f, "rate limited (HTTP 429): back off and retry")
+                retry_after_seconds,
+                code,
+                ..
+            } => {
+                match code {
+                    Some(code) => write!(f, "rate limited (HTTP 429, {code}): ")?,
+                    None => write!(f, "rate limited (HTTP 429): ")?,
+                }
+                match retry_after_seconds {
+                    Some(seconds) => write!(f, "retry after {seconds}s"),
+                    None => write!(f, "back off and retry"),
+                }
             }
             Error::Transport { message, .. } => write!(f, "transport error: {message}"),
         }

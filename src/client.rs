@@ -261,6 +261,8 @@ impl Client {
     /// - [`Error::Validation`]: bad arguments; nothing was sent.
     /// - [`Error::Auth`]: wrong credentials, bad signature, clock off, IP not
     ///   allowlisted. Fix the config, do not retry.
+    /// - [`Error::Forbidden`]: the key does not hold the `payments` scope, or a
+    ///   verify-only session on an account where verify-only is not on.
     /// - [`Error::Refusal`]: the gateway refused the session; inspect `code`.
     /// - [`Error::RateLimited`]: HTTP 429. Wait, then send it again with the
     ///   same idempotency key. Not retried for you.
@@ -398,13 +400,16 @@ impl Client {
     /// - [`Error::Validation`]: bad arguments; nothing was sent.
     /// - [`Error::Auth`]: wrong credentials, bad signature, clock off, IP not
     ///   allowlisted.
+    /// - [`Error::Forbidden`]: the key does not hold the `payments` scope.
     /// - [`Error::Charge`]: the gateway answered with a code instead of a charge
     ///   (409, 422, 502, 503); branch on `code`. `CHARGE_OUTCOME_UNKNOWN` carries
     ///   the charge row to poll; never retry it under a new key.
     /// - [`Error::Api`]: 404 (`PAYMENT_METHOD_NOT_FOUND`) for an id that is not
     ///   yours, a 400 validation rejection, or an unexpected response.
     /// - [`Error::RateLimited`]: HTTP 429. Wait, then send it again with the
-    ///   same idempotency key.
+    ///   same idempotency key. The charge route's own limits arrive here too,
+    ///   with `code` `CHARGE_VELOCITY_EXCEEDED` or `CHARGE_DECLINE_RATE_EXCEEDED`
+    ///   (see [`rate_limit_error_code`](crate::rate_limit_error_code)).
     /// - [`Error::Transport`]: network failure, or a 5xx that carries no gateway
     ///   code. Safe to retry WITH the same idempotency key.
     pub fn charge_payment_method(
@@ -508,6 +513,7 @@ impl Client {
     /// - [`Error::Validation`]: bad arguments; nothing was sent.
     /// - [`Error::Auth`]: wrong credentials, bad signature, clock off, IP not
     ///   allowlisted.
+    /// - [`Error::Forbidden`]: the key does not hold the `payments` scope.
     /// - [`Error::Api`]: the gateway refused with one of the
     ///   [`refund_error_code`](crate::refund_error_code) constants, e.g. 422
     ///   `REFUND_AMOUNT_EXCEEDED` or 409 `DUPLICATE_REQUEST`; branch on
@@ -642,10 +648,25 @@ impl Client {
         }
 
         // Read Retry-After off the response, which means before the body is
-        // consumed. A limiter's body is whatever the edge felt like sending.
+        // consumed. The body is read leniently, only for the code that tells the
+        // platform's limits apart: a limiter in front of the API sends whatever
+        // it likes, and that is still a rate limit.
         if http_status == 429 {
+            let retry_after_seconds = retry_after_seconds(response.headers().get("retry-after"));
+            let raw = response
+                .body_mut()
+                .read_to_string()
+                .ok()
+                .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+                .filter(Value::is_object)
+                .unwrap_or(Value::Null);
+            let code = raw
+                .get("error")
+                .and_then(|error| string_field(error, "code"));
             return Err(Error::RateLimited {
-                retry_after_seconds: retry_after_seconds(response.headers().get("retry-after")),
+                retry_after_seconds,
+                code,
+                raw,
             });
         }
 
@@ -691,7 +712,7 @@ impl Client {
         };
 
         let reply = Reply::new(http_status, envelope);
-        // Credentials are refused the same way on every route.
+        // Credentials and scopes are refused the same way on every route.
         if matches!(http_status, 401 | 403) {
             return Err(reply.rejection());
         }
@@ -855,16 +876,21 @@ fn classify_status(status: u16, code: Option<String>, message: Option<String>) -
     match status {
         // Reached from the StatusCode path only, where the response - and with
         // it Retry-After - is already gone. The normal path answers 429 in
-        // `request`, with the header.
+        // `send`, with the header and the body.
         429 => Error::RateLimited {
             retry_after_seconds: None,
+            code,
+            raw: Value::Null,
         },
-        401 | 403 => Error::auth(
+        // The clock hint is for 401 only. A 403 was signed correctly, so the
+        // key id, the secret and the clock are fine.
+        401 => Error::auth(
             code.unwrap_or_else(|| "UNAUTHORIZED".to_string()),
             message.unwrap_or_else(|| {
                 "Authentication failed - check your key id, secret, and server clock.".to_string()
             }),
         ),
+        403 => Error::forbidden(code, message),
         status if status >= 500 => Error::transport(
             format!(
                 "The Dominaite API is unavailable (HTTP {status}); retry with the same idempotency key."
