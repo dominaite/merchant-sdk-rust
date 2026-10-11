@@ -1657,8 +1657,9 @@ pub struct Agreement {
 }
 
 impl Agreement {
-    /// True only for `active`: the customer paid the first period and the
-    /// platform charges each period. An unknown status reads as not active.
+    /// True only for `active`: the customer paid the first period. With
+    /// scheduled charges on, the platform charges each period. An unknown
+    /// status reads as not active.
     pub fn is_active(&self) -> bool {
         self.status == agreement_status::ACTIVE
     }
@@ -1715,8 +1716,8 @@ pub struct AgreementSummary {
 pub mod agreement_status {
     /// Created, nothing charged yet. The subscription session activates it.
     pub const PENDING: &str = "pending";
-    /// The customer paid the first period and the card is on file; the
-    /// platform charges each period.
+    /// The customer paid the first period and the card is on file. With
+    /// scheduled charges on, the platform charges each period.
     pub const ACTIVE: &str = "active";
     /// The platform gave up on the current period on this card, and makes no
     /// further attempt on it; `past_due_reason` says why. It stays past due
