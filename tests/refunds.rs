@@ -132,6 +132,30 @@ fn a_full_refund_sends_no_amount_key_at_all() {
     assert_eq!(refund.status, refund_status::PENDING);
 }
 
+/// A refund field this SDK does not model yet still reaches the gateway, after
+/// the modelled ones, and is signed with them.
+#[test]
+fn a_refund_sends_the_extra_fields_in_the_signed_body() {
+    let server = MockServer::start(vec![refund_reply(202, &pending(Some(500), "EUR"))]);
+
+    client_for(&server)
+        .create_refund(
+            TRANSACTION_ID,
+            &RefundRequest::new(key(REFUND_KEY))
+                .amount(500)
+                .reason("Returned one item")
+                .extra("futureField", serde_json::json!("kept")),
+        )
+        .expect("a 202 is a refund");
+
+    let recorded = server.only_request();
+    assert_eq!(
+        recorded.body,
+        r#"{"amount":500,"reason":"Returned one item","futureField":"kept"}"#
+    );
+    assert_signature_matches(&recorded, &refunds_path(), REFUND_KEY);
+}
+
 #[test]
 fn the_transaction_id_is_signed_in_lowercase() {
     let server = MockServer::start(vec![refund_reply(202, &pending(None, "EUR"))]);

@@ -665,7 +665,8 @@ impl StoredPaymentMethod {
 ///
 /// `amount`, `currency`, `order_reference` and the idempotency key are required
 /// and come from [`ChargeRequest::new`]; the rest are builder methods. The body
-/// is exactly these fields, in this order - it is what gets signed.
+/// is these fields in this order, then the `extra` fields - it is what gets
+/// signed.
 ///
 /// ```
 /// use dominaite::{ChargeRequest, IdempotencyKey};
@@ -686,9 +687,16 @@ pub struct ChargeRequest {
     pub currency: String,
     /// Your own order id, at most 100 characters. It shows up in your dashboard.
     pub order_reference: String,
-    /// Free-text description.
+    /// Free text stored on the transaction, at most 500 characters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// The `agr_` handle of the agreement this charge is made under. Without
+    /// it, the charge is yours to back with the customer's agreement, and only
+    /// the per-charge cap and the volume limits apply. With it, the agreement
+    /// must be yours, linked to this payment method and carrying consent, and
+    /// the amount must fit the agreement; the charge records it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agreement_id: Option<String>,
 
     /// Required. It travels in the header and in the signature, never in the
     /// body. Retrying with the same key never charges the card twice, so on a
@@ -696,6 +704,11 @@ pub struct ChargeRequest {
     /// never mint one per attempt.
     #[serde(skip)]
     pub idempotency_key: IdempotencyKey,
+
+    /// Any additional field the API accepts that this struct does not model yet.
+    /// These are merged into the JSON body, after the fields above.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 impl ChargeRequest {
@@ -713,13 +726,28 @@ impl ChargeRequest {
             currency: currency.into(),
             order_reference: order_reference.into(),
             description: None,
+            agreement_id: None,
             idempotency_key,
+            extra: Map::new(),
         }
     }
 
     /// Sets the description.
     pub fn description(mut self, value: impl Into<String>) -> Self {
         self.description = Some(value.into());
+        self
+    }
+
+    /// Makes the charge under this agreement. See
+    /// [`ChargeRequest::agreement_id`].
+    pub fn agreement_id(mut self, value: impl Into<String>) -> Self {
+        self.agreement_id = Some(value.into());
+        self
+    }
+
+    /// Adds a body field this struct does not model yet.
+    pub fn extra(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.extra.insert(key.into(), value);
         self
     }
 }
@@ -826,8 +854,8 @@ impl PaymentMethodCharge {
 /// The idempotency key is required and comes from [`RefundRequest::new`]; the
 /// amount and reason are builder methods. Leave the amount out to refund
 /// everything still refundable: the body then carries no `amount` at all, not a
-/// null. The body is exactly these fields, in this order - it is what gets
-/// signed.
+/// null. The body is these fields in this order, then the `extra` fields - it
+/// is what gets signed.
 ///
 /// ```
 /// use dominaite::{to_minor_units, IdempotencyKey, RefundRequest};
@@ -860,6 +888,11 @@ pub struct RefundRequest {
     /// it as is: the same key answers the same refund and never refunds twice.
     #[serde(skip)]
     pub idempotency_key: IdempotencyKey,
+
+    /// Any additional field the API accepts that this struct does not model yet.
+    /// These are merged into the JSON body, after the fields above.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 impl RefundRequest {
@@ -870,6 +903,7 @@ impl RefundRequest {
             amount: None,
             reason: None,
             idempotency_key,
+            extra: Map::new(),
         }
     }
 
@@ -883,6 +917,12 @@ impl RefundRequest {
     /// Sets the reason stored with the refund.
     pub fn reason(mut self, value: impl Into<String>) -> Self {
         self.reason = Some(value.into());
+        self
+    }
+
+    /// Adds a body field this struct does not model yet.
+    pub fn extra(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.extra.insert(key.into(), value);
         self
     }
 }

@@ -949,8 +949,8 @@ fn prepare_session_request(request: &CheckoutSessionRequest) -> Result<(String, 
 }
 
 /// `prepare_session_request` for a charge: same money checks, same key
-/// handling, and the body is exactly the contract's fields in declaration
-/// order, which is what gets signed.
+/// handling, and the body is the contract's fields in declaration order, then
+/// the caller's extra fields, which is what gets signed.
 fn prepare_charge_request(request: &ChargeRequest) -> Result<(String, String)> {
     validate_money_params(request.amount, &request.currency, &request.order_reference)?;
     let idempotency_key = request.idempotency_key.as_str().to_string();

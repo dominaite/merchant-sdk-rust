@@ -298,6 +298,33 @@ fn charge_payment_method_sends_the_callers_key_and_the_description_last() {
     assert_signature_matches(&recorded, &charge_path(), "sub-8817-2026-10");
 }
 
+/// A charge under an agreement names it in the signed body, and a field this
+/// SDK does not model yet still reaches the gateway, after the modelled ones.
+#[test]
+fn a_charge_sends_the_agreement_and_the_extra_fields_in_the_signed_body() {
+    let server = MockServer::start(vec![charge_ok()]);
+    client_for(&server)
+        .charge_payment_method(
+            PAYMENT_METHOD_ID,
+            &ChargeRequest::new(1990, "EUR", "sub-8817-2026-10", key("sub-8817-2026-10"))
+                .description("Monthly plan")
+                .agreement_id("agr_0123456789abcdef0123456789abcdef")
+                .extra("futureField", serde_json::json!({"nested": true})),
+        )
+        .expect("charged");
+
+    let recorded = server.only_request();
+    assert_eq!(
+        recorded.body,
+        concat!(
+            r#"{"amount":1990,"currency":"EUR","orderReference":"sub-8817-2026-10","#,
+            r#""description":"Monthly plan","agreementId":"agr_0123456789abcdef0123456789abcdef","#,
+            r#""futureField":{"nested":true}}"#
+        )
+    );
+    assert_signature_matches(&recorded, &charge_path(), "sub-8817-2026-10");
+}
+
 #[test]
 fn a_402_decline_is_a_result_with_a_decline_class_not_an_error() {
     // The envelope says success=false and names CHARGE_DECLINED, but the charge
