@@ -1,4 +1,4 @@
-//! Refunds against the loopback mock: `create_refund` on
+//! Refunds against the loopback mock: `create_refund` and `list_refunds` on
 //! `/merchant-api/payments/{id}/refunds` and `get_refund` on
 //! `/merchant-api/payments/{id}/refunds/{refund_id}`. No network, no
 //! credentials.
@@ -378,4 +378,83 @@ fn a_202_without_a_refund_body_is_an_api_error() {
         .expect_err("no refund in the body");
 
     assert!(matches!(error, Error::Api { status: 202, .. }), "{error:?}");
+}
+
+#[test]
+fn list_refunds_is_a_signed_get_and_reads_the_totals_and_every_refund() {
+    let succeeded = format!(
+        r#"{{"refundId":"re_00000000000000000000000000000001","transactionId":"{TRANSACTION_ID}","status":"succeeded","amount":500,"currency":"EUR","completedAt":"2026-10-11T09:05:00Z"}}"#
+    );
+    let server = MockServer::start(vec![refund_reply(
+        200,
+        &format!(
+            r#"{{"transactionId":"{TRANSACTION_ID}","currency":"EUR","refundedAmount":700,"refundableAmount":1300,"refunds":[{},{succeeded}]}}"#,
+            pending(Some(300), "EUR")
+        ),
+    )]);
+
+    // Upper case on the way in, lower case on the wire and in the signature.
+    let list = client_for(&server)
+        .list_refunds(&TRANSACTION_ID.to_uppercase())
+        .expect("the refund list");
+
+    assert_eq!(list.transaction_id, TRANSACTION_ID);
+    assert_eq!(list.currency, "EUR");
+    // The dashboard refund of 200 counts in the totals but is not listed.
+    assert_eq!(list.refunded_amount, 700);
+    assert_eq!(list.refundable_amount, 1300);
+    assert_eq!(list.refunds.len(), 2);
+    assert_eq!(list.refunds[0].refund_id, REFUND_ID);
+    assert_eq!(list.refunds[0].status, refund_status::PENDING);
+    assert!(list.refunds[1].is_succeeded());
+    assert_eq!(list.refunds[1].amount, Some(500));
+    // Each refund keeps its own raw object, the list keeps the whole payload.
+    assert_eq!(list.refunds[1].raw["completedAt"], "2026-10-11T09:05:00Z");
+    assert_eq!(list.raw["refunds"][0]["refundId"], REFUND_ID);
+
+    let recorded = server.only_request();
+    assert_eq!(recorded.method, "GET");
+    assert_eq!(recorded.path, format!("/api{}", refunds_path()));
+    assert_eq!(recorded.header("Idempotency-Key"), None);
+    assert_eq!(recorded.body, "");
+    assert_signature_matches(&recorded, &refunds_path(), "");
+}
+
+#[test]
+fn a_payment_without_refunds_lists_none() {
+    let server = MockServer::start(vec![refund_reply(
+        200,
+        &format!(
+            r#"{{"transactionId":"{TRANSACTION_ID}","currency":"EUR","refundedAmount":0,"refundableAmount":2000,"refunds":[]}}"#
+        ),
+    )]);
+    let list = client_for(&server)
+        .list_refunds(TRANSACTION_ID)
+        .expect("the refund list");
+    assert!(list.refunds.is_empty());
+    assert_eq!(list.refundable_amount, 2000);
+}
+
+#[test]
+fn list_refunds_of_a_payment_that_is_not_yours_is_payment_not_found() {
+    let server = MockServer::start(vec![Reply::error_envelope(
+        404,
+        refund_error_code::PAYMENT_NOT_FOUND,
+        "Payment not found",
+    )]);
+    let error = client_for(&server)
+        .list_refunds(TRANSACTION_ID)
+        .expect_err("not found");
+    assert!(matches!(error, Error::Api { status: 404, .. }), "{error:?}");
+    assert_eq!(error.code(), Some(refund_error_code::PAYMENT_NOT_FOUND));
+}
+
+#[test]
+fn list_refunds_refuses_an_id_that_is_not_a_payment_id_before_sending() {
+    let server = MockServer::start(vec![refund_reply(200, "{}")]);
+    for id in ["", "not-a-uuid", "re_7c1e9a2b4d6f48a0b3c5d7e9f1a2b3c4"] {
+        let error = client_for(&server).list_refunds(id).expect_err("refused");
+        assert!(matches!(error, Error::Validation { .. }), "{id}: {error:?}");
+    }
+    assert!(server.requests().is_empty());
 }

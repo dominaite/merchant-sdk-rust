@@ -9,7 +9,7 @@ use crate::error::{session_error_code, Error, Result};
 use crate::signing::{sign_request, SignRequest};
 use crate::types::{
     ChargeRequest, CheckoutSession, CheckoutSessionRequest, CheckoutStatus, IntegrationContract,
-    PaymentMethodCharge, Ping, Refund, RefundRequest,
+    PaymentMethodCharge, Ping, Refund, RefundList, RefundRequest,
 };
 
 /// The production merchant API.
@@ -25,7 +25,8 @@ pub const SESSIONS_PATH: &str = "/merchant-api/checkout/sessions";
 pub const PAYMENT_METHODS_PATH: &str = "/merchant-api/payment-methods";
 
 /// The canonical path of payments. POST
-/// `PAYMENTS_PATH/{transaction_id}/refunds` refunds one; GET
+/// `PAYMENTS_PATH/{transaction_id}/refunds` refunds one, and GET on the same
+/// path lists its refunds; GET
 /// `PAYMENTS_PATH/{transaction_id}/refunds/{refund_id}` reads a refund back.
 pub const PAYMENTS_PATH: &str = "/merchant-api/payments";
 
@@ -574,6 +575,37 @@ impl Client {
         let path = format!("{PAYMENTS_PATH}/{transaction_id}/refunds/{refund_id}");
         let payload = self.request("GET", &path, "", "")?;
         parse_refund(payload, 200)
+    }
+
+    /// Lists the refunds of one payment that you created through the API,
+    /// newest first, with the payment's refund totals:
+    /// [`RefundList::refunded_amount`] and [`RefundList::refundable_amount`].
+    ///
+    /// The totals count every refund of the payment, also the ones made in the
+    /// dashboard. Use `refundable_amount` to size the next refund.
+    ///
+    /// Errors it returns:
+    /// - [`Error::Validation`]: `transaction_id` is not a payment id; nothing
+    ///   was sent.
+    /// - [`Error::Auth`] and [`Error::Forbidden`]: as on
+    ///   [`Client::create_refund`].
+    /// - [`Error::Api`]: 404 with code
+    ///   [`PAYMENT_NOT_FOUND`](crate::refund_error_code::PAYMENT_NOT_FOUND), a
+    ///   payment that is not yours.
+    /// - [`Error::RateLimited`] and [`Error::Transport`]: wait, then read again.
+    pub fn list_refunds(&self, transaction_id: &str) -> Result<RefundList> {
+        let transaction_id = normalize_transaction_id(transaction_id)?;
+        let path = format!("{PAYMENTS_PATH}/{transaction_id}/refunds");
+        let payload = self.request("GET", &path, "", "")?;
+        let mut list: RefundList = serde_json::from_value(payload.clone())
+            .map_err(|_| Error::api(200, "The API returned an unexpected refund list"))?;
+        if let Some(items) = payload.get("refunds").and_then(Value::as_array) {
+            for (refund, raw) in list.refunds.iter_mut().zip(items) {
+                refund.raw = raw.clone();
+            }
+        }
+        list.raw = payload;
+        Ok(list)
     }
 
     /// Signs and sends one call, and maps the response onto the error taxonomy:

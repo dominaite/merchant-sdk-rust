@@ -65,7 +65,7 @@ pub use types::{
     refund_status, retired_reason, status, stored_payment_method_status, wallet_type,
     AgreementSummary, ChargeRequest, CheckoutSession, CheckoutSessionRequest, CheckoutStatus,
     Consent, Customer, Integration, IntegrationContract, PaymentMethodCharge, Ping, Refund,
-    RefundRequest, StoredPaymentMethod,
+    RefundList, RefundRequest, StoredPaymentMethod,
 };
 pub use webhooks::{
     verify_webhook, PaymentEventData, WebhookError, WebhookEvent, DEFAULT_TOLERANCE_SECS,

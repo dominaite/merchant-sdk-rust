@@ -1164,3 +1164,35 @@ impl Refund {
         )
     }
 }
+
+/// What [`Client::list_refunds`](crate::Client::list_refunds) returns: the
+/// refunds of one payment and its refund totals.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefundList {
+    /// The payment whose refunds these are.
+    #[serde(default)]
+    pub transaction_id: String,
+    /// ISO 4217 code of the payment and of every amount here.
+    #[serde(default)]
+    pub currency: String,
+    /// MINOR units refunded so far, from every source: the API, the dashboard
+    /// and the payment processor.
+    #[serde(default)]
+    pub refunded_amount: i64,
+    /// MINOR units a new refund can take now: what is not refunded yet, minus
+    /// the refunds still in progress. 0 when the payment cannot be refunded.
+    #[serde(default)]
+    pub refundable_amount: i64,
+    /// The refunds you created through the API, newest first, each in the
+    /// shape [`Client::get_refund`](crate::Client::get_refund) answers. A
+    /// refund made in the dashboard is not in this list, but the two totals
+    /// count it.
+    #[serde(default)]
+    pub refunds: Vec<Refund>,
+
+    /// The unwrapped list as the gateway sent it, for fields this struct does
+    /// not model yet.
+    #[serde(skip)]
+    pub raw: Value,
+}
