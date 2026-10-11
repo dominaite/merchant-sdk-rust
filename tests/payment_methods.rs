@@ -326,6 +326,36 @@ fn a_charge_sends_the_agreement_and_the_extra_fields_in_the_signed_body() {
 }
 
 #[test]
+fn a_charge_under_an_agreement_reads_the_agreement_and_the_sequence_back() {
+    let server = MockServer::start(vec![charge_envelope(
+        201,
+        None,
+        Some(
+            r#"{"chargeId":"ch_33333333333343338333333333333333","status":"succeeded","transactionId":"33333333-3333-4333-8333-333333333333","agreementId":"agr_0123456789abcdef0123456789abcdef","sequence":2}"#,
+        ),
+    )]);
+    let charge = client_for(&server)
+        .charge_payment_method(
+            PAYMENT_METHOD_ID,
+            &charge_request().agreement_id("agr_0123456789abcdef0123456789abcdef"),
+        )
+        .expect("charged");
+
+    assert_eq!(
+        charge.agreement_id.as_deref(),
+        Some("agr_0123456789abcdef0123456789abcdef")
+    );
+    assert_eq!(charge.sequence, Some(2));
+
+    // A one-off charge names no agreement.
+    let server = MockServer::start(vec![charge_ok()]);
+    let charge = client_for(&server)
+        .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
+        .expect("charged");
+    assert_eq!(charge.agreement_id, None);
+}
+
+#[test]
 fn a_402_decline_is_a_result_with_a_decline_class_not_an_error() {
     // The envelope says success=false and names CHARGE_DECLINED, but the charge
     // row is right there: a decline is a result, not an error.

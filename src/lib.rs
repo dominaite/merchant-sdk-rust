@@ -61,10 +61,11 @@ pub use idempotency::IdempotencyKey;
 pub use money::{currency_exponent, to_minor_units};
 pub use signing::{sha256_hex, sign_request, SignRequest};
 pub use types::{
-    charge_status, decline_class, payment_method, refund_failure_code, refund_status,
-    retired_reason, status, stored_payment_method_status, wallet_type, ChargeRequest,
-    CheckoutSession, CheckoutSessionRequest, CheckoutStatus, Consent, Customer, Integration,
-    PaymentMethodCharge, Ping, Refund, RefundRequest, StoredPaymentMethod,
+    agreement_status, charge_status, decline_class, payment_method, refund_failure_code,
+    refund_status, retired_reason, status, stored_payment_method_status, wallet_type,
+    AgreementSummary, ChargeRequest, CheckoutSession, CheckoutSessionRequest, CheckoutStatus,
+    Consent, Customer, Integration, PaymentMethodCharge, Ping, Refund, RefundRequest,
+    StoredPaymentMethod,
 };
 pub use webhooks::{
     verify_webhook, PaymentEventData, WebhookError, WebhookEvent, DEFAULT_TOLERANCE_SECS,

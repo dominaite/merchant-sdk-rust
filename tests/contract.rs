@@ -139,6 +139,24 @@ impl<'de> Deserializer<'de> for FieldSpy<'_> {
     }
 }
 
+/// The fixture's field list plus the fields this crate models ahead of it.
+///
+/// The canonical fixture is byte-identical in every Dominaite SDK, so a field
+/// the gateway added after its last refresh is modelled here first. Each
+/// allowance fails once the fixture lists the field, so the refresh that adds
+/// it must also delete the allowance.
+fn with_fields_ahead_of_fixture(fixture_fields: Vec<String>, ahead: &[&str]) -> Vec<String> {
+    let mut modelled = fixture_fields;
+    for field in ahead {
+        assert!(
+            !modelled.iter().any(|f| f == field),
+            "the fixture now lists {field}; remove it from the allowance"
+        );
+        modelled.push(field.to_string());
+    }
+    modelled
+}
+
 fn assert_fields<T: DeserializeOwned>(type_name: &str, expected: &[String]) {
     let mut actual = serde_fields::<T>();
     let mut expected = expected.to_vec();
@@ -259,7 +277,14 @@ fn ping_matches_the_contract() {
 #[test]
 fn the_checkout_object_matches_the_contract() {
     let create = endpoint("createCheckoutSession");
-    assert_fields::<CheckoutSession>("CheckoutSession", &strings(&create["checkoutFields"]));
+    // The verify-only and subscription fields are on prd, not in the fixture yet.
+    assert_fields::<CheckoutSession>(
+        "CheckoutSession",
+        &with_fields_ahead_of_fixture(
+            strings(&create["checkoutFields"]),
+            &["agreementId", "verifyOnly"],
+        ),
+    );
 
     let checkout = create["successExample"]["checkout"].clone();
     let parsed: CheckoutSession = serde_json::from_value(checkout.clone()).expect("deserializes");
@@ -282,7 +307,21 @@ fn the_checkout_object_matches_the_contract() {
 #[test]
 fn get_status_matches_the_contract() {
     let get_status = endpoint("getStatus");
-    assert_fields::<CheckoutStatus>("CheckoutStatus", &strings(&get_status["fields"]));
+    // The decline, recurring, verify-only and ordering fields are on prd, not in
+    // the fixture yet.
+    assert_fields::<CheckoutStatus>(
+        "CheckoutStatus",
+        &with_fields_ahead_of_fixture(
+            strings(&get_status["fields"]),
+            &[
+                "declineClass",
+                "isRecurring",
+                "verifyOnly",
+                "agreement",
+                "sequence",
+            ],
+        ),
+    );
 
     let example = get_status["example"].clone();
     let parsed: CheckoutStatus = serde_json::from_value(example).expect("deserializes");
@@ -738,20 +777,12 @@ fn charge_payment_method_matches_the_contract() {
     assert_eq!(charge["httpStatus"], 201);
     assert_eq!(charge["declinedHttpStatus"], 402);
 
-    // `sequence` is modelled ahead of the fixture: the gateway adds it to the
-    // charge answer in a follow-up, and the SDK reads it as optional so it works
-    // against servers that do not send it yet. Once the refreshed fixture lists
-    // it, this allowance fails and must be deleted.
-    const AHEAD_OF_FIXTURE: [&str; 1] = ["sequence"];
-    let mut modelled = strings(&charge["fields"]);
-    for field in AHEAD_OF_FIXTURE {
-        assert!(
-            !modelled.iter().any(|f| f == field),
-            "the fixture now lists {field}; remove it from AHEAD_OF_FIXTURE"
-        );
-        modelled.push(field.to_string());
-    }
-    assert_fields::<PaymentMethodCharge>("PaymentMethodCharge", &modelled);
+    // `sequence` and `agreementId` are modelled ahead of the fixture, and read
+    // as optional, so the SDK works against servers that do not send them.
+    assert_fields::<PaymentMethodCharge>(
+        "PaymentMethodCharge",
+        &with_fields_ahead_of_fixture(strings(&charge["fields"]), &["sequence", "agreementId"]),
+    );
 
     // Both examples are envelopes whose data carries exactly the declared
     // fields, nulls included.

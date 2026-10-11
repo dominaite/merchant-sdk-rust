@@ -1,9 +1,15 @@
 //! Request and response shapes.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
 use crate::idempotency::IdempotencyKey;
+
+/// Reads a JSON boolean, and null or absent as false. The gateway omits a flag
+/// that is not set, and a null must never fail the whole response.
+fn false_when_null<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    Ok(Option::<bool>::deserialize(deserializer)?.unwrap_or(false))
+}
 
 /// Optional payer details. Prefilled fields are hidden from the payer in the
 /// widget, so the checkout form stays short.
@@ -346,6 +352,14 @@ pub struct CheckoutSession {
     /// the other session values; never log it or keep it past the session.
     #[serde(default)]
     pub client_secret: Option<String>,
+    /// The `agr_` handle of the agreement this session takes the first payment
+    /// for. `None` on a one-off checkout.
+    #[serde(default)]
+    pub agreement_id: Option<String>,
+    /// True for a verify-only session: `amount` is the platform's verification
+    /// hold, released once the card is saved. False on a payment session.
+    #[serde(default, deserialize_with = "false_when_null")]
+    pub verify_only: bool,
 
     /// The unparsed payload, for fields this struct does not model yet.
     #[serde(skip)]
@@ -520,10 +534,80 @@ pub struct CheckoutStatus {
     /// category of how the payer paid (`card`, `wallet`, ...).
     #[serde(default)]
     pub stored_payment_method: Option<StoredPaymentMethod>,
+    /// What to do with a `failed` payment, one of the [`decline_class`]
+    /// constants, or a class this SDK does not know yet. `None` while the
+    /// payment is open, on every status other than `failed`, and on a failure
+    /// that is not classified yet.
+    #[serde(default)]
+    pub decline_class: Option<String>,
+    /// True when this is a merchant-initiated charge on a stored card (a
+    /// recurring charge), false for a hosted-checkout session.
+    #[serde(default, deserialize_with = "false_when_null")]
+    pub is_recurring: bool,
+    /// True for a verify-only session: a card check, not a payment. `status`
+    /// stays the raw status (`requires_capture`, then `cancelled` once the hold
+    /// is released); a non-null `stored_payment_method` is what says the card
+    /// is verified. False on every other session.
+    #[serde(default, deserialize_with = "false_when_null")]
+    pub verify_only: bool,
+    /// The agreement this session took the first payment for, or the
+    /// agreement a recurring charge was placed under. `None` on a one-off
+    /// checkout or charge. Still `pending` after a declined or abandoned
+    /// subscription session: that is how you learn the subscription did not
+    /// start.
+    #[serde(default)]
+    pub agreement: Option<AgreementSummary>,
+    /// The `data.sequence` of the latest `charge.*` webhook about this
+    /// transaction, so you can order this read against those events. 0 on a
+    /// checkout payment and before the first `charge.*` event. `None` when the
+    /// server does not send it.
+    #[serde(default)]
+    pub sequence: Option<i64>,
 
     /// The unparsed payload, for fields this struct does not model yet.
     #[serde(skip)]
     pub raw: Value,
+}
+
+/// The agreement on a status read: enough to know whether the subscription
+/// started.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgreementSummary {
+    /// The `agr_` handle.
+    #[serde(default)]
+    pub id: String,
+    /// One of the [`agreement_status`] constants, or a status this SDK does
+    /// not know yet.
+    #[serde(default)]
+    pub status: String,
+    /// ISO 8601 UTC of the next scheduled charge. `None` while pending and once
+    /// the agreement has ended.
+    #[serde(default)]
+    pub next_charge_at: Option<String>,
+}
+
+/// Agreement status wire values, on [`AgreementSummary::status`]. A value
+/// outside this list is a status added after this release; treat it as not
+/// active.
+pub mod agreement_status {
+    /// Created, nothing charged yet. The subscription session activates it.
+    pub const PENDING: &str = "pending";
+    /// The first payment succeeded and the card is saved; charges follow the
+    /// plan.
+    pub const ACTIVE: &str = "active";
+    /// A charge failed and the platform is retrying; see the agreement's
+    /// `past_due_reason`.
+    pub const PAST_DUE: &str = "past_due";
+    /// Cancelled: no further charge is scheduled.
+    pub const CANCELLED: &str = "cancelled";
+    /// Every period of the plan was charged.
+    pub const COMPLETED: &str = "completed";
+    /// The agreement ended because charging it failed for good.
+    pub const FAILED: &str = "failed";
+
+    /// The whole vocabulary, in the order the contract lists it.
+    pub const ALL: [&str; 6] = [PENDING, ACTIVE, PAST_DUE, CANCELLED, COMPLETED, FAILED];
 }
 
 impl CheckoutStatus {
@@ -771,8 +855,10 @@ pub mod charge_status {
     pub const ALL: [&str; 4] = [SUCCEEDED, FAILED, PENDING, CANCELLED];
 }
 
-/// Decline class wire values, on [`PaymentMethodCharge::decline_class`](crate::PaymentMethodCharge::decline_class). Coarse
-/// enough to act on without reading the issuer's code.
+/// Decline class wire values, on [`PaymentMethodCharge::decline_class`](crate::PaymentMethodCharge::decline_class)
+/// and [`CheckoutStatus::decline_class`]. Coarse enough to act on without
+/// reading the issuer's code. A value outside this list is a class added after
+/// this release.
 pub mod decline_class {
     /// Do not retry this card; ask the customer for another one.
     pub const HARD: &str = "hard";
@@ -819,9 +905,15 @@ pub struct PaymentMethodCharge {
     /// [`Client::get_status`](crate::Client::get_status).
     #[serde(default)]
     pub transaction_id: String,
+    /// The `agr_` handle of the agreement the charge was made under, when the
+    /// request named one.
+    #[serde(default)]
+    pub agreement_id: Option<String>,
     /// The charge's current sequence, the counter that orders the `charge.*`
     /// webhooks ([`WebhookEvent::sequence`](crate::WebhookEvent::sequence)).
-    /// `None` when the server does not send it yet.
+    /// 0 while pending. A replay returns the first answer as it was, so it can
+    /// be lower than a later webhook's; the status read carries the live
+    /// value. `None` when the server does not send it.
     #[serde(default)]
     pub sequence: Option<i64>,
 

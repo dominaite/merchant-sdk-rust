@@ -1,6 +1,7 @@
-//! The session request fields added for verify-only and subscription sessions:
-//! `verifyOnly`, `agreementId`, `consent` and `locationId`, and the amount rule
-//! that changes with `verifyOnly`.
+//! The session fields added for verify-only and subscription sessions: on the
+//! request `verifyOnly`, `agreementId`, `consent` and `locationId`, and the
+//! amount rule that changes with `verifyOnly`; on the checkout and the status
+//! read the fields that answer them.
 
 // Only part of the mock server is needed here; the client tests use the rest.
 #[allow(dead_code)]
@@ -19,6 +20,7 @@ const KEY_ID: &str = "dmk_0123456789abcdef0123456789abcdef";
 const SECRET: &str = "dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const KEY: &str = "verify-customer-77";
 const AGREEMENT_ID: &str = "agr_0123456789abcdef0123456789abcdef";
+const TRANSACTION_ID: &str = "11111111-1111-4111-8111-111111111111";
 
 const CHECKOUT: &str = r#"{"transactionId":"11111111-1111-4111-8111-111111111111","orderId":"dom_42","cashierKey":"ck_live","cashierToken":"ct_live","amount":100,"currency":"EUR","expiresAt":"2026-10-11T12:00:00Z","integration":"widget","verifyOnly":true}"#;
 
@@ -210,4 +212,81 @@ fn every_session_field_the_gateway_accepts_has_a_wire_name() {
         body["customer"],
         json!({"firstName":"Ana","lastName":"Petrova","email":"ana@example.com","phone":"+359888123456"})
     );
+}
+
+#[test]
+fn the_checkout_carries_verify_only_and_the_agreement() {
+    let server = MockServer::start(vec![create_ok()]);
+    let request = CheckoutSessionRequest::new(0, "EUR", "customer-77", key()).verify_only(true);
+    let session = client_for(&server)
+        .create_checkout_session(&request)
+        .expect("a verify-only session");
+    assert!(session.verify_only);
+    // The platform's verification hold, not the 0 that was sent.
+    assert_eq!(session.amount, 100);
+    assert_eq!(session.agreement_id, None);
+
+    let server = MockServer::start(vec![Reply::enveloped(&format!(
+        r#"{{"success":true,"checkout":{{"transactionId":"11111111-1111-4111-8111-111111111111","amount":1990,"currency":"EUR","agreementId":"{AGREEMENT_ID}","verifyOnly":null}}}}"#
+    ))]);
+    let session = client_for(&server)
+        .create_checkout_session(&CheckoutSessionRequest::new(1990, "EUR", "sub-8817", key()))
+        .expect("a subscription session");
+    assert_eq!(session.agreement_id.as_deref(), Some(AGREEMENT_ID));
+    assert!(!session.verify_only);
+}
+
+#[test]
+fn the_status_read_carries_the_decline_recurring_verify_only_and_agreement_fields() {
+    let server = MockServer::start(vec![Reply::enveloped(&format!(
+        r#"{{"transactionId":"{TRANSACTION_ID}","orderId":"dom_42","status":"failed","amount":1990,"currency":"EUR","declineClass":"soft_funds","isRecurring":true,"agreement":{{"id":"{AGREEMENT_ID}","status":"past_due","nextChargeAt":"2026-10-14T09:00:00Z"}},"sequence":3,"createdAt":"2026-10-11T09:00:00Z"}}"#
+    ))]);
+    let status = client_for(&server)
+        .get_status(TRANSACTION_ID)
+        .expect("a status read");
+
+    assert_eq!(
+        status.decline_class.as_deref(),
+        Some(dominaite::decline_class::SOFT_FUNDS)
+    );
+    assert!(status.is_recurring);
+    assert!(!status.verify_only);
+    let agreement = status.agreement.as_ref().expect("an agreement");
+    assert_eq!(agreement.id, AGREEMENT_ID);
+    assert_eq!(agreement.status, dominaite::agreement_status::PAST_DUE);
+    assert_eq!(
+        agreement.next_charge_at.as_deref(),
+        Some("2026-10-14T09:00:00Z")
+    );
+    assert_eq!(status.sequence, Some(3));
+    assert_eq!(status.raw["agreement"]["status"], "past_due");
+}
+
+/// A verify-only session's read: the raw status, verifyOnly true, and the saved
+/// card is what says the card is verified. Absent flags read as false.
+#[test]
+fn a_verify_only_status_read_and_an_older_one_both_parse() {
+    let server = MockServer::start(vec![Reply::enveloped(&format!(
+        r#"{{"transactionId":"{TRANSACTION_ID}","status":"requires_capture","amount":100,"currency":"EUR","verifyOnly":true,"isRecurring":false,"sequence":0,"storedPaymentMethod":{{"id":"pm_0123456789abcdef0123456789abcdef","status":"active"}}}}"#
+    ))]);
+    let status = client_for(&server)
+        .get_status(TRANSACTION_ID)
+        .expect("a status read");
+    assert!(status.verify_only);
+    assert!(status.stored_payment_method.is_some());
+    assert_eq!(status.sequence, Some(0));
+
+    // A 0.4.0-era answer: none of the new fields, and nulls where a server
+    // writes them.
+    let server = MockServer::start(vec![Reply::enveloped(&format!(
+        r#"{{"transactionId":"{TRANSACTION_ID}","status":"succeeded","amount":2500,"currency":"EUR","declineClass":null,"isRecurring":null,"verifyOnly":null,"agreement":null}}"#
+    ))]);
+    let status = client_for(&server)
+        .get_status(TRANSACTION_ID)
+        .expect("a status read");
+    assert_eq!(status.decline_class, None);
+    assert!(!status.is_recurring);
+    assert!(!status.verify_only);
+    assert_eq!(status.agreement, None);
+    assert_eq!(status.sequence, None);
 }
