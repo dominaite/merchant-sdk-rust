@@ -389,8 +389,8 @@ fn a_402_decline_is_a_result_with_a_decline_class_not_an_error() {
     );
 }
 
-/// The 402 carries a decline class only when the decline code alone decides
-/// it. Without one, the decline is still a failed charge, never an error.
+/// A 402 whose decline class is null or missing is still a failed charge,
+/// never an error.
 #[test]
 fn a_402_without_a_decline_class_is_still_a_failed_charge() {
     for data in [

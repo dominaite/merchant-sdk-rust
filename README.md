@@ -422,8 +422,7 @@ match client.charge_payment_method(
             Some(decline_class::HARD) => stop_charging(&method_id),      // never retry
             Some(decline_class::SOFT_FUNDS) => retry_in_a_few_days(),
             Some(decline_class::SOFT_SCA_REQUIRED) => bring_the_payer_back(), // needs a session
-            Some(_) => retry_later(),                                        // soft_other
-            None => read_the_class_later(&charge.transaction_id), // get_status or the webhook
+            _ => retry_later(), // soft_other, a class added later, or no class
         },
     },
     Err(Error::Charge { code, transaction_id, .. }) => match code.as_str() {
@@ -444,10 +443,9 @@ match client.charge_payment_method(
 `charge_payment_method` returns `Ok` for HTTP 201 and for HTTP 402 alike. A decline is a result,
 not an error: the 402 charge has `status: "failed"`, a `decline_class` (`hard`, `soft_funds`,
 `soft_sca_required` or `soft_other`) and the provider's `decline_code`. `decline_class` can be
-`None`: the 402 carries it only when the decline code alone decides it (`soft_sca_required`).
-Otherwise the class arrives a moment later, on `get_status` and the decline webhook. `is_paid()` and
-`is_terminal()` read the same way they do on a session status; `pending` is the one status
-that is not terminal.
+`None`, for example when nobody declined the payment. `get_status` carries the latest class.
+Never read `None` as `hard`. `is_paid()` and `is_terminal()` read the same way they do on a
+session status; `pending` is the one status that is not terminal.
 
 `Error::Charge` is the gateway answering with an error code instead of a charge: HTTP 409
 (`PAYMENT_METHOD_NOT_ACTIVE`, `DUPLICATE_REQUEST`), 422 (`IDEMPOTENCY_KEY_REUSED`), 502
@@ -512,8 +510,8 @@ about 15 minutes, and nobody is charged. On the status read, `verify_only` is tr
 `stored_payment_method` that is not `None` tells you that the card is verified.
 
 A verify-only session sends `verification.succeeded` or `verification.failed`, never a
-`payment.*` event. On `verification.failed`, `decline_class` tells you why. It is `None` when
-the payer abandoned the checkout. In `list_transactions` the session is a row of type
+`payment.*` event. On `verification.failed`, `decline_class` tells you why. It can be `None`,
+for example when nobody declined the card. In `list_transactions` the session is a row of type
 `verification`, and it is not revenue.
 
 Verify-only sessions work only on an account where they are switched on. We switch it on for

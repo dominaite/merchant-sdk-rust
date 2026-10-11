@@ -349,10 +349,10 @@ pub struct PaymentEventData {
     /// predate the field.
     #[serde(default, deserialize_with = "crate::types::false_when_null")]
     pub verify_only: bool,
-    /// On `verification.failed`: why the issuer declined, one of the
-    /// [`decline_class`](crate::decline_class) constants, or a class this SDK
-    /// does not know yet. `None` for an abandoned checkout and on every
-    /// `payment.*` event.
+    /// On `payment.failed` and `verification.failed`: the class of the
+    /// decline, one of the [`decline_class`](crate::decline_class) constants,
+    /// or a class this SDK does not know yet. It can be `None`, for example
+    /// when nobody declined the payment.
     #[serde(default)]
     pub decline_class: Option<String>,
 }

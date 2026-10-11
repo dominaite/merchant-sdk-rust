@@ -67,9 +67,8 @@
 - Breaking for struct literals and exhaustive patterns: `Error::Api` and `Error::RateLimited`
   have new fields, and so have the request and response structs listed above. Add the fields, or
   use `..` in a pattern.
-- `PaymentMethodCharge::decline_class` can be `None` on a declined charge. The charge answer
-  classifies only SCA declines at once; `get_status` carries the class later. The docs no longer
-  promise a class on every decline.
+- `decline_class` can be `None`, for example when nobody declined the payment. The docs no
+  longer promise a class on every decline, and `get_status` carries the latest class.
 - The README installs tag `v0.5.0` and documents key scopes, verify-only sessions,
   subscriptions, the refund list, webhook endpoints, transactions and the integration contract.
 

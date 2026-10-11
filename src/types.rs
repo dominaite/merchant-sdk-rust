@@ -554,9 +554,10 @@ pub struct CheckoutStatus {
     #[serde(default)]
     pub stored_payment_method: Option<StoredPaymentMethod>,
     /// What to do with a `failed` payment, one of the [`decline_class`]
-    /// constants, or a class this SDK does not know yet. `None` while the
-    /// payment is open, on every status other than `failed`, and on a failure
-    /// that is not classified yet.
+    /// constants, or a class this SDK does not know yet. It can be `None`, for
+    /// example when nobody declined the payment. Never read `None` as `hard`;
+    /// if you retry, retry as you would for `soft_other`. It is `None` on every
+    /// status other than `failed`.
     #[serde(default)]
     pub decline_class: Option<String>,
     /// True when this is a merchant-initiated charge on a stored card (a
@@ -897,11 +898,10 @@ pub struct PaymentMethodCharge {
     /// rather than by hand.
     pub status: String,
     /// One of the [`decline_class`] constants, or a class this SDK does not
-    /// know yet. Never promised on a decline: a 402 carries it only when the
-    /// decline code alone decides it (`soft_sca_required`). Otherwise it is
-    /// `None`, and the class arrives a moment later on
-    /// [`Client::get_status`](crate::Client::get_status) and the decline
-    /// webhook. `None` on every status other than `failed`.
+    /// know yet. It can be `None`, for example when nobody declined the
+    /// payment. [`Client::get_status`](crate::Client::get_status) carries the
+    /// latest class. Never read `None` as `hard`. It is `None` on every status
+    /// other than `failed`.
     #[serde(default)]
     pub decline_class: Option<String>,
     /// The issuer's decline code, verbatim, for your logs; branch on

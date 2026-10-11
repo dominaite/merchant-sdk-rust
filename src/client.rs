@@ -435,10 +435,10 @@ impl Client {
     /// `status` `failed`, and its `decline_class`, when set, tells you whether to
     /// give up on the card (`hard`), wait (`soft_funds`, `soft_other`) or bring
     /// the customer back for a hosted session (`soft_sca_required`). It can be
-    /// `None`: the 402 carries it only when the decline code alone decides it.
-    /// Otherwise the class arrives a moment later on [`Client::get_status`] and
-    /// the decline webhook. `pending` is not terminal - poll
-    /// [`Client::get_status`] with `charge.transaction_id`.
+    /// `None`, for example when nobody declined the payment, and
+    /// [`Client::get_status`] carries the latest class. Never read `None` as
+    /// `hard`. `pending` is not terminal - poll [`Client::get_status`] with
+    /// `charge.transaction_id`.
     ///
     /// Errors it returns:
     /// - [`Error::Validation`]: bad arguments; nothing was sent.
