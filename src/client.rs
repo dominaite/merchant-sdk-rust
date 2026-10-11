@@ -12,7 +12,7 @@ use crate::signing::{sign_request, SignRequest};
 use crate::types::{
     Agreement, AgreementRequest, ChargeRequest, CheckoutSession, CheckoutSessionRequest,
     CheckoutStatus, IntegrationContract, PaymentMethodCharge, Ping, Plan, PlanRequest, PlanUpdate,
-    Refund, RefundList, RefundRequest,
+    Refund, RefundList, RefundRequest, WebhookEndpoint, WebhookEndpointRequest,
 };
 
 /// The production merchant API.
@@ -47,6 +47,10 @@ pub const PLANS_PATH: &str = "/merchant-api/plans";
 /// The canonical path of subscription agreements. POST creates one; GET and
 /// DELETE `AGREEMENTS_PATH/{agreement_id}` read and cancel one.
 pub const AGREEMENTS_PATH: &str = "/merchant-api/agreements";
+
+/// The canonical path of webhook endpoints. POST registers one and GET lists
+/// them; DELETE `WEBHOOKS_PATH/{id}` removes one.
+pub const WEBHOOKS_PATH: &str = "/merchant-api/webhooks";
 
 /// This SDK's version, reported in the User-Agent.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -803,6 +807,91 @@ impl Client {
         Ok(())
     }
 
+    /// Registers a webhook endpoint: the platform POSTs the events you name
+    /// to `url`. Only this answer carries the endpoint's signing secret
+    /// ([`WebhookEndpoint::secret`]), so store it at once. You can have 25
+    /// active endpoints.
+    ///
+    /// Every webhook endpoint route needs a key with the `webhooks:manage`
+    /// scope. A key with the `payments` scope cannot hold it.
+    ///
+    /// The endpoint carries the request's required `Idempotency-Key`. The same
+    /// key with the same url and events answers the same endpoint without its
+    /// secret, and registers nothing new. After a timeout or a 503, send it
+    /// again WITH THE SAME KEY: the retry replaces an endpoint that the lost
+    /// attempt registered, and answers a new endpoint with a new secret.
+    ///
+    /// Errors it returns:
+    /// - [`Error::Validation`]: an empty url or no events; nothing was sent.
+    /// - [`Error::Auth`]: as on [`Client::create_plan`].
+    /// - [`Error::Forbidden`]: the key does not hold the `webhooks:manage`
+    ///   scope.
+    /// - [`Error::Api`]: HTTP 400 `WEBHOOK_URL_REJECTED` (the url is not HTTPS
+    ///   on a public host) or `VALIDATION_ERROR` (for example an unknown event
+    ///   type; the details are in `raw`, under `error.validationErrors`). 409
+    ///   `WEBHOOK_LIMIT_REACHED`, or `DUPLICATE_REQUEST`: the first request
+    ///   with this key still runs, so send it again with the same key after a
+    ///   second. 409 `WEBHOOK_ALREADY_REGISTERED`: this key registered an
+    ///   endpoint more than a day ago and that endpoint still exists. Its id is
+    ///   in `raw`, under `error.params.webhookId`; use a fresh key for a new
+    ///   endpoint. 422 `IDEMPOTENCY_KEY_REUSED`.
+    /// - [`Error::RateLimited`]: HTTP 429. Wait, then send it again with the
+    ///   same idempotency key.
+    /// - [`Error::Transport`]: network failure or 5xx. Send it again WITH the
+    ///   same idempotency key.
+    pub fn create_webhook_endpoint(
+        &self,
+        request: &WebhookEndpointRequest,
+    ) -> Result<WebhookEndpoint> {
+        if request.url.trim().is_empty() {
+            return Err(Error::validation("Missing required parameter: url"));
+        }
+        if request.events.is_empty() {
+            return Err(Error::validation(
+                "events must name at least one event type",
+            ));
+        }
+        let body = json_body(request)?;
+        let (status, payload) = self.request_with_status(
+            "POST",
+            WEBHOOKS_PATH,
+            &body,
+            request.idempotency_key.as_str(),
+        )?;
+        parse_object(payload, status, "webhook endpoint")
+    }
+
+    /// Lists your webhook endpoints, the newest first: every active endpoint
+    /// and your newest 1000 inactive ones. No item carries a secret. The route
+    /// has no pages.
+    ///
+    /// Errors it returns: as [`Client::delete_webhook_endpoint`], without the
+    /// 404.
+    pub fn list_webhook_endpoints(&self) -> Result<Vec<WebhookEndpoint>> {
+        // GET signs an EMPTY idempotency key and an EMPTY body.
+        let payload = self.request("GET", WEBHOOKS_PATH, "", "")?;
+        parse_array(payload, "webhook endpoint")
+    }
+
+    /// Deletes a webhook endpoint. It stops receiving deliveries.
+    ///
+    /// Errors it returns:
+    /// - [`Error::Validation`]: `webhook_id` is not a UUID; nothing was sent.
+    /// - [`Error::Auth`] and [`Error::Forbidden`]: as on
+    ///   [`Client::create_webhook_endpoint`].
+    /// - [`Error::Api`]: 404 `WEBHOOK_NOT_FOUND` for an id that is unknown,
+    ///   not yours or already deleted. A retry after a lost answer therefore
+    ///   answers 404: treat that as done.
+    /// - [`Error::RateLimited`] and [`Error::Transport`]: wait, then send it
+    ///   again.
+    pub fn delete_webhook_endpoint(&self, webhook_id: &str) -> Result<()> {
+        let path = webhook_endpoint_path(webhook_id)?;
+        // DELETE signs an EMPTY idempotency key and an EMPTY body; the answer
+        // is a 204 with no body.
+        self.request("DELETE", &path, "", "")?;
+        Ok(())
+    }
+
     /// Signs and sends one call, and maps the response onto the error taxonomy:
     /// [`Client::send`] plus the generic rejection for any 4xx or 5xx. The
     /// unwrapped `data` comes back on success (an empty object for a 204).
@@ -1275,6 +1364,12 @@ impl KeepsRaw for Agreement {
     }
 }
 
+impl KeepsRaw for WebhookEndpoint {
+    fn keep_raw(&mut self, raw: Value) {
+        self.raw = raw;
+    }
+}
+
 /// One `T` from the unwrapped `data`, with `raw` filled in. `what` names the
 /// object in the error.
 fn parse_object<T: KeepsRaw>(payload: Value, http_status: u16, what: &str) -> Result<T> {
@@ -1327,6 +1422,18 @@ fn agreement_path(agreement_id: &str) -> Result<String> {
         "agreement_id must be the id create_agreement returned",
     )?;
     Ok(format!("{AGREEMENTS_PATH}/{id}"))
+}
+
+/// The signed path of one webhook endpoint, the id in lowercase hyphenated
+/// form as the API signs it.
+fn webhook_endpoint_path(webhook_id: &str) -> Result<String> {
+    let id = webhook_id.trim().to_lowercase();
+    if !is_uuid(&id) {
+        return Err(Error::validation(
+            "webhook_id must be the UUID create_webhook_endpoint returned",
+        ));
+    }
+    Ok(format!("{WEBHOOKS_PATH}/{id}"))
 }
 
 /// The checks shared by every request that moves money: amount, currency,

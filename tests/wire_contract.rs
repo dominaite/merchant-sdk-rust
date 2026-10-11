@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-use dominaite::{auth_error_code, status, wallet_type, CheckoutStatus};
+use dominaite::{auth_error_code, event_type, status, wallet_type, CheckoutStatus};
 
 const WIRE: &str = include_str!("merchant-api-wire-contract.json");
 
@@ -117,6 +117,14 @@ fn the_403_codes_match_the_gateways_authorization_group_in_order() {
     assert_eq!(
         codes_with_status(&wire["errorCodes"]["authorization"]),
         expected
+    );
+}
+
+#[test]
+fn payment_event_types_match_the_gateways_catalog_in_order() {
+    assert_eq!(
+        event_type::PAYMENT.to_vec(),
+        strings(&wire()["webhookEventCatalog"])
     );
 }
 

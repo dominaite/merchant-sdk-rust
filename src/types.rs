@@ -1,5 +1,7 @@
 //! Request and response shapes.
 
+use std::fmt;
+
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
@@ -1756,4 +1758,225 @@ pub mod past_due_reason {
         SCA_REQUIRED,
         UNPROCESSABLE,
     ];
+}
+
+/// What a webhook endpoint's `Debug` output prints instead of its signing
+/// secret.
+const REDACTED_WEBHOOK_SECRET: &str = "whsec_***redacted***";
+
+/// The parameters for
+/// [`Client::create_webhook_endpoint`](crate::Client::create_webhook_endpoint).
+///
+/// `url`, `events` and the idempotency key are required and come from
+/// [`WebhookEndpointRequest::new`]. The body is these fields in this order,
+/// then the `extra` fields.
+///
+/// ```
+/// use dominaite::{event_type, IdempotencyKey, WebhookEndpointRequest};
+///
+/// # fn main() -> Result<(), dominaite::Error> {
+/// let key = IdempotencyKey::new("webhook-orders-2026-10")?;
+/// let request = WebhookEndpointRequest::new(
+///     "https://shop.example/webhooks/dominaite",
+///     [event_type::PAYMENT_SUCCEEDED, event_type::PAYMENT_REFUNDED],
+///     key,
+/// );
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookEndpointRequest {
+    /// The URL that receives the deliveries: HTTPS on a public host, at most
+    /// 500 characters.
+    pub url: String,
+    /// The event types to deliver, 1 to 50 entries, from the [`event_type`]
+    /// constants. Duplicates count once. Matching is exact.
+    pub events: Vec<String>,
+
+    /// Required. It travels in the header and in the signature, never in the
+    /// body. After a timeout or a 503, send the request again WITH THE SAME
+    /// KEY: the retry replaces an endpoint that the lost attempt registered. A
+    /// new key cannot do that. Use a fresh key for each new endpoint.
+    #[serde(skip)]
+    pub idempotency_key: IdempotencyKey,
+
+    /// Any additional field the API accepts that this struct does not model yet.
+    /// These are merged into the JSON body, after the fields above.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl WebhookEndpointRequest {
+    /// An endpoint at `url` for the `events` you name. The key is required.
+    pub fn new<I, S>(url: impl Into<String>, events: I, idempotency_key: IdempotencyKey) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        WebhookEndpointRequest {
+            url: url.into(),
+            events: events.into_iter().map(Into::into).collect(),
+            idempotency_key,
+            extra: Map::new(),
+        }
+    }
+
+    /// Adds a body field this struct does not model yet.
+    pub fn extra(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.extra.insert(key.into(), value);
+        self
+    }
+}
+
+/// A webhook endpoint, as
+/// [`Client::create_webhook_endpoint`](crate::Client::create_webhook_endpoint)
+/// and [`Client::list_webhook_endpoints`](crate::Client::list_webhook_endpoints)
+/// return it.
+///
+/// Its `Debug` output never shows the signing secret, in `secret` or in
+/// `raw`.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookEndpoint {
+    /// The endpoint id, a UUID.
+    /// [`Client::delete_webhook_endpoint`](crate::Client::delete_webhook_endpoint)
+    /// takes it.
+    pub id: String,
+    /// The URL as registered.
+    #[serde(default)]
+    pub url: String,
+    /// The event types delivered to this endpoint.
+    #[serde(default)]
+    pub events: Vec<String>,
+    /// One of the [`webhook_endpoint_status`] constants, or a status this SDK
+    /// does not know yet.
+    #[serde(default)]
+    pub status: String,
+    /// ISO 8601 UTC, when the endpoint was registered.
+    #[serde(default)]
+    pub created_at: String,
+    /// The signing secret, `whsec_` followed by 64 hex characters. Only the
+    /// first answer of a create carries it: a replay and the list leave it
+    /// out, and no route shows it again. Store it in your secret store at
+    /// once, and verify deliveries with it through
+    /// [`verify_webhook`](crate::verify_webhook). Lost it? Delete the endpoint
+    /// and create it again. Never log it.
+    #[serde(default)]
+    pub secret: Option<String>,
+
+    /// The unwrapped endpoint object as the gateway sent it, for fields this
+    /// struct does not model yet. It holds the secret too, when there is one.
+    #[serde(skip)]
+    pub raw: Value,
+}
+
+impl fmt::Debug for WebhookEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut raw = self.raw.clone();
+        if let Some(secret) = raw.get_mut("secret").filter(|secret| !secret.is_null()) {
+            *secret = Value::from(REDACTED_WEBHOOK_SECRET);
+        }
+        f.debug_struct("WebhookEndpoint")
+            .field("id", &self.id)
+            .field("url", &self.url)
+            .field("events", &self.events)
+            .field("status", &self.status)
+            .field("created_at", &self.created_at)
+            .field(
+                "secret",
+                &self.secret.as_ref().map(|_| REDACTED_WEBHOOK_SECRET),
+            )
+            .field("raw", &raw)
+            .finish()
+    }
+}
+
+/// Webhook endpoint status wire values, on [`WebhookEndpoint::status`].
+pub mod webhook_endpoint_status {
+    /// Deliveries are sent.
+    pub const ACTIVE: &str = "active";
+    /// Deliveries are paused: the endpoint was switched off in the dashboard,
+    /// or after repeated failed deliveries. It does not count toward the limit
+    /// of 25 active endpoints.
+    pub const INACTIVE: &str = "inactive";
+
+    /// The whole vocabulary, in the order the contract lists it.
+    pub const ALL: [&str; 2] = [ACTIVE, INACTIVE];
+}
+
+/// The webhook event types, the `type` of a
+/// [`WebhookEvent`](crate::WebhookEvent) and the values of
+/// [`WebhookEndpointRequest::events`]. Three groups, as the API lists them. A
+/// type outside these lists is one added after this release; ignore an event
+/// you do not know.
+pub mod event_type {
+    /// The payment succeeded. Only this event means that the money is in
+    /// hand.
+    pub const PAYMENT_SUCCEEDED: &str = "payment.succeeded";
+    /// The payment failed.
+    pub const PAYMENT_FAILED: &str = "payment.failed";
+    /// The payment is authorized and waits for a capture, for example an
+    /// approved pre-authorization hold.
+    pub const PAYMENT_REQUIRES_CAPTURE: &str = "payment.requires_capture";
+    /// The payment was voided before it completed.
+    pub const PAYMENT_CANCELLED: &str = "payment.cancelled";
+    /// The checkout was never paid, and the platform closed it.
+    pub const PAYMENT_ABANDONED: &str = "payment.abandoned";
+    /// A refund completed. One event for each refund, partial or full.
+    pub const PAYMENT_REFUNDED: &str = "payment.refunded";
+    /// The payment was disputed (a chargeback).
+    pub const PAYMENT_DISPUTED: &str = "payment.disputed";
+
+    /// The subscription session's payment was approved, and the agreement
+    /// went active.
+    pub const AGREEMENT_ACTIVATED: &str = "agreement.activated";
+    /// The platform gave up on the current period on the agreement's card.
+    pub const AGREEMENT_PAST_DUE: &str = "agreement.past_due";
+    /// You cancelled the agreement.
+    pub const AGREEMENT_CANCELLED: &str = "agreement.cancelled";
+    /// A charge on a stored card was approved: one you made, or one the
+    /// platform placed for an agreement period.
+    pub const CHARGE_SUCCEEDED: &str = "charge.succeeded";
+    /// A charge on a stored card was declined, and nothing more is tried for
+    /// it.
+    pub const CHARGE_FAILED: &str = "charge.failed";
+    /// An agreement period was declined softly, and the platform tries the
+    /// same card again later. The agreement stays active.
+    pub const CHARGE_RETRYING: &str = "charge.retrying";
+
+    /// A verify-only session checked the card. Nobody was charged. The saved
+    /// card is in `data.storedPaymentMethod`; when that is null, read the
+    /// status.
+    pub const VERIFICATION_SUCCEEDED: &str = "verification.succeeded";
+    /// A verify-only session ended with no card saved: the issuer declined, or
+    /// the payer abandoned the checkout.
+    pub const VERIFICATION_FAILED: &str = "verification.failed";
+
+    /// The `payment.*` types, in the order of the contract's
+    /// `webhookEventCatalog`.
+    pub const PAYMENT: [&str; 7] = [
+        PAYMENT_SUCCEEDED,
+        PAYMENT_FAILED,
+        PAYMENT_REQUIRES_CAPTURE,
+        PAYMENT_CANCELLED,
+        PAYMENT_ABANDONED,
+        PAYMENT_REFUNDED,
+        PAYMENT_DISPUTED,
+    ];
+
+    /// The `agreement.*` and `charge.*` types, in the order of the contract's
+    /// `recurring.webhookEvents`.
+    pub const RECURRING: [&str; 6] = [
+        AGREEMENT_ACTIVATED,
+        AGREEMENT_PAST_DUE,
+        AGREEMENT_CANCELLED,
+        CHARGE_SUCCEEDED,
+        CHARGE_FAILED,
+        CHARGE_RETRYING,
+    ];
+
+    /// The `verification.*` types of a verify-only session, in the order of
+    /// the contract's `verification.webhookEvents`.
+    pub const VERIFICATION: [&str; 2] = [VERIFICATION_SUCCEEDED, VERIFICATION_FAILED];
 }
