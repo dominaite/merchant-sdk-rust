@@ -109,8 +109,11 @@ pub mod charge_error_code {
     /// HTTP 502: nothing was charged. The charge row is attached when one
     /// exists, absent when the provider refused before one.
     pub const CHARGE_FAILED: &str = "CHARGE_FAILED";
-    /// HTTP 503: charges of stored methods are switched off; nothing was
-    /// charged. Retry later with the SAME key.
+    /// HTTP 503: nothing was charged. Stored-card charges are not switched on
+    /// for your account, or we paused charges for a short time. The code is
+    /// the same in both cases. If we never switched stored-card charges on for
+    /// your account, a retry does not help: ask us (Dominaite support). If
+    /// they are on, retry later with the SAME idempotency key.
     pub const PAYMENT_METHOD_CHARGES_DISABLED: &str = "PAYMENT_METHOD_CHARGES_DISABLED";
     /// HTTP 503: card payments are off right now; nothing was charged. Retry
     /// later with the SAME key.

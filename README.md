@@ -53,13 +53,32 @@ Each key holds one or more scopes. A route answers only a key that holds its sco
 | `webhooks:manage` | `create_webhook_endpoint`, `list_webhook_endpoints` and `delete_webhook_endpoint`. |
 
 A key holds `payments` alone, or one or both of the other two scopes. A key with
-`transactions:read` or `webhooks:manage` is a reporting key, and it is not bound to one
-storefront. A key issued without scopes holds `payments`. The scopes of a key are fixed when it
-is issued: to change them, issue a new key. Every key can call `ping` and
-`get_integration_contract`.
+`transactions:read` or `webhooks:manage` is a reporting key: a second key, next to your payments
+key. A reporting key is for the whole account, and it cannot be bound to a storefront. A key
+issued without scopes holds `payments`. The scopes of a key are fixed when it is issued. Every
+key can call `ping` and `get_integration_contract`.
+
+A payments key always gets HTTP 403 `INSUFFICIENT_SCOPE` on `list_transactions` and the three
+webhook endpoint methods. If your dashboard has no reporting key section, ask us (Dominaite
+support) for the key. An endpoint that you set on the dashboard's **Webhooks** tab needs no key.
 
 A call with a key that does not hold the scope fails with `Error::Forbidden`, code
 `INSUFFICIENT_SCOPE` (HTTP 403). Nothing was created. Use a key that holds the scope.
+
+## What we switch on for your account
+
+Every merchant with a payments key can use checkout sessions, `save_card`, the status read,
+`ping`, refunds, plans, agreements and `revoke_payment_method`. We switch the first five items
+below on for your account: ask us (Dominaite support). The last item is a second key.
+
+| Item | Without it |
+|---|---|
+| [Stored-card charges](#stored-payment-methods-recurring) | `charge_payment_method` answers HTTP 503 with code `PAYMENT_METHOD_CHARGES_DISABLED`. |
+| [Subscription sessions](#subscriptions) | `create_checkout_session` with an `agreement_id` answers `success: false` with code `SUBSCRIPTIONS_NOT_ENABLED`. |
+| [Scheduled charges](#subscriptions) | The platform runs no scheduled charge and no retry, even when the subscription session works. |
+| [Verify-only sessions](#save-a-card-without-a-payment) | `create_checkout_session` with `verify_only(true)` answers HTTP 403 with code `VERIFY_ONLY_NOT_ENABLED`. |
+| [Card fields](#card-fields) | `create_checkout_session` with `Integration::Fields` answers HTTP 400 with code `INVALID_SELECTION`. |
+| [Reporting key](#key-scopes) | A payments key always gets HTTP 403 `INSUFFICIENT_SCOPE` on `list_transactions` and the webhook endpoint methods. |
 
 ## Quickstart (zero to a signed session against dev)
 
@@ -406,6 +425,13 @@ same amount, currency and order reference as a session, and an idempotency key t
 and signed exactly like `create_checkout_session`. Derive it from what you are billing (the
 subscription and its period), so a retried charge carries the same one.
 
+Stored-card charges work only after we switch them on for your account. Until then,
+`charge_payment_method` fails with `Error::Charge`, code `PAYMENT_METHOD_CHARGES_DISABLED` (HTTP
+503). We also answer this code when we pause charges for a short time. The code is the same in
+both cases, and nothing was charged. If we never switched stored-card charges on for your
+account, a retry does not help: ask us (Dominaite support). If they are on, retry later with the
+same idempotency key.
+
 ```rust
 use dominaite::{charge_error_code, charge_status, decline_class, ChargeRequest, Error, IdempotencyKey};
 
@@ -432,8 +458,9 @@ match client.charge_payment_method(
         charge_error_code::PAYMENT_METHOD_NOT_ACTIVE => ask_for_another_card(),
         // Nothing was charged; retry later with the SAME key.
         charge_error_code::DUPLICATE_REQUEST
-        | charge_error_code::PAYMENT_METHOD_CHARGES_DISABLED
         | charge_error_code::PAYMENT_PROCESSING_UNAVAILABLE => retry_later(),
+        // Nothing was charged. Charges are off for your account, or paused for a short time.
+        charge_error_code::PAYMENT_METHOD_CHARGES_DISABLED => charges_are_off(),
         _ => give_up(), // CHARGE_FAILED, IDEMPOTENCY_KEY_REUSED
     },
     Err(other) => return Err(other.into()),
@@ -521,15 +548,21 @@ your account. Until then, the call fails with `Error::Forbidden`, code `VERIFY_O
 ## Subscriptions
 
 A plan is a recurring price that you sell. An agreement subscribes one of your customers to a
-plan. The platform then charges the saved card each period.
+plan. With scheduled charges on, the platform charges the stored card each period.
 
 1. Create a plan once for each price with `create_plan`.
 2. Create an agreement for the customer with `create_agreement`. It starts `pending` and
    charges nothing.
 3. Create a subscription session: `create_checkout_session` with the `agreement_id` and the
    customer's `consent`. The checkout takes the first payment and saves the card.
-4. When that payment is approved, the agreement goes `active`. The platform then charges each
-   period and sends the `agreement.*` and `charge.*` webhooks.
+4. When that payment is approved, the agreement goes `active`. With scheduled charges on, the
+   platform charges each period. It sends a `charge.*` webhook for each of those charges.
+
+Subscription sessions and scheduled charges are two separate switches: ask us (Dominaite
+support) for each. Until we switch subscription sessions on, `create_checkout_session` with an
+`agreement_id` fails with `Error::Refusal`, code `SUBSCRIPTIONS_NOT_ENABLED`. You can create
+plans and agreements, but the agreement stays `pending`. Until we switch scheduled charges on,
+the platform runs no scheduled charge and no retry.
 
 ```rust
 use dominaite::{
@@ -567,9 +600,9 @@ On the subscription session, the consent `text_version` is the version of the pl
 text that your page showed: one of `recurring.consentTextVersions` in the integration contract.
 On `create_agreement`, the consent `text_version` is your own label for your own wording.
 Without a trial, the session amount is the agreement's amount. With a trial, you choose the
-session amount, and the first scheduled charge comes when the trial ends. When the session
-cannot start the subscription, it fails with `Error::Refusal`, for example with code
-`SUBSCRIPTIONS_NOT_ENABLED` or `AGREEMENT_NOT_PENDING`.
+session amount. With scheduled charges on, the first scheduled charge comes when the trial ends.
+When the session cannot start the subscription, it fails with `Error::Refusal`, for example with
+code `SUBSCRIPTIONS_NOT_ENABLED` or `AGREEMENT_NOT_PENDING`.
 
 The amount, the currency and the interval of a plan never change. For a new price, create a new
 plan and archive the old one with `delete_plan`. The existing agreements keep their own price.
@@ -601,6 +634,10 @@ answer is in its `raw`.
 idempotency key is required and signed exactly like a charge. Derive the key from YOUR refund
 (the return or credit-note id), never per attempt: the same key answers the same refund and
 never refunds twice, so after a timeout or a 500 you resend it as is.
+
+The API refunds online (card-not-present) payments only, up to the paid amount. `create_refund`
+on a terminal payment fails with `Error::Api`, code `PAYMENT_NOT_FOUND` (404). Whoever holds
+your payments key can refund, so keep that key on your server.
 
 ```rust
 use dominaite::{refund_error_code, refund_status, to_minor_units, Error, IdempotencyKey, RefundRequest};
@@ -871,7 +908,8 @@ difference. Treat webhooks as the fast path and the sweep as the source of truth
 
 ### Manage endpoints with the API
 
-These three methods need a key with the `webhooks:manage` scope (see [Key scopes](#key-scopes)).
+These three methods need a reporting key with the `webhooks:manage` scope (see
+[Key scopes](#key-scopes)).
 
 ```rust
 use dominaite::{event_type, IdempotencyKey, WebhookEndpointRequest};
@@ -951,10 +989,10 @@ fields the structs do not model yet.
 
 ## Transactions
 
-`list_transactions` lists your payments created in a window, oldest first. It needs a key with
-the `transactions:read` scope (see [Key scopes](#key-scopes)). The rows are checkout payments,
-charges on saved cards and verify-only sessions. A refund is not a row of its own: it shows on
-its payment, in `refunded_amount` and `status`. Fees are not part of this read.
+`list_transactions` lists your payments created in a window, oldest first. It needs a reporting
+key with the `transactions:read` scope (see [Key scopes](#key-scopes)). The rows are checkout
+payments, charges on saved cards and verify-only sessions. A refund is not a row of its own: it
+shows on its payment, in `refunded_amount` and `status`. Fees are not part of this read.
 
 ```rust
 use dominaite::{transaction_type, TransactionListParams};
@@ -984,8 +1022,8 @@ loop {
 
 Each row has the status at the time of the read. For a statement, end the window a few minutes
 in the past, so payments still being written are not missed. Read again later to pick up
-changes such as refunds. A key bound to a storefront lists the payments of that storefront
-only. The parameters travel in the query string, which is not part of the signature.
+changes such as refunds. The parameters travel in the query string, which is not part of the
+signature.
 
 ## Integration contract
 

@@ -740,8 +740,10 @@ impl Client {
     /// `pending` and nothing is charged. Then open the subscription session:
     /// [`Client::create_checkout_session`] with
     /// [`CheckoutSessionRequest::agreement_id`] takes the first payment, saves
-    /// the card and activates the agreement. After that the platform charges
-    /// each period and sends the `agreement.*` and `charge.*` webhooks.
+    /// the card and activates the agreement. With scheduled charges on, the
+    /// platform charges each period. It sends a `charge.*` webhook for each of
+    /// those charges. Until we switch scheduled charges on for your account,
+    /// the platform runs no scheduled charge and no retry.
     ///
     /// The agreement carries the request's required `Idempotency-Key`, with
     /// the same replay rules as [`Client::create_plan`]: the same key and body
@@ -904,8 +906,8 @@ impl Client {
     /// Fees are not part of this read.
     ///
     /// The key needs the `transactions:read` scope. A key with the `payments`
-    /// scope cannot hold it. A key bound to a storefront lists the payments
-    /// of that storefront only.
+    /// scope cannot hold it. A key with this scope is for the whole account,
+    /// and it cannot be bound to a storefront.
     ///
     /// To read a whole window, send [`TransactionPage::next_cursor`] back as
     /// the cursor, with the same `from`, `to` and `status`, until it is
