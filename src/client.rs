@@ -903,16 +903,18 @@ impl Client {
     /// checkout payments, charges on saved cards (yours and the platform's
     /// for an agreement) and verify-only sessions. A refund is not a row of
     /// its own: it shows on its payment, in `refunded_amount` and `status`.
-    /// Fees are not part of this read.
+    /// `fee`, `net_amount`, `settled_at` and `payout_id` are `None` until
+    /// the acquirer settles the payment.
     ///
     /// The key needs the `transactions:read` scope. A key with the `payments`
     /// scope cannot hold it. A key with this scope is for the whole account,
     /// and it cannot be bound to a storefront.
     ///
     /// To read a whole window, send [`TransactionPage::next_cursor`] back as
-    /// the cursor, with the same `from`, `to` and `status`, until it is
-    /// `None`. Paging never repeats or skips a row. The parameters travel in
-    /// the query string, which is not part of the signature.
+    /// the cursor, with the same `from`, `to`, settlement window and
+    /// `status`, until it is `None`. Paging never repeats or skips a row. The
+    /// parameters travel in the query string, which is not part of the
+    /// signature.
     ///
     /// ```no_run
     /// use dominaite::{Client, TransactionListParams};
@@ -958,6 +960,14 @@ impl Client {
             encode_query_value(&params.from),
             encode_query_value(&params.to)
         );
+        if let Some(settled_from) = &params.settled_from {
+            query.push_str("&settledFrom=");
+            query.push_str(&encode_query_value(settled_from));
+        }
+        if let Some(settled_to) = &params.settled_to {
+            query.push_str("&settledTo=");
+            query.push_str(&encode_query_value(settled_to));
+        }
         if let Some(status) = &params.status {
             query.push_str("&status=");
             query.push_str(&encode_query_value(status));
