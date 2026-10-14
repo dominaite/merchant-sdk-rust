@@ -2003,6 +2003,13 @@ pub struct TransactionListParams {
     /// 31 days after it. For a statement, end the window a few minutes in the
     /// past, so payments still being written are not missed.
     pub to: String,
+    /// The settlement window start, inclusive: a date, e.g. `2026-10-13`.
+    /// Send it with `settled_to`. With it, the list has only the payments
+    /// the acquirer settled in the window. `from` and `to` still apply.
+    pub settled_from: Option<String>,
+    /// The settlement window end, exclusive: a date, later than
+    /// `settled_from` and at most 31 days after it.
+    pub settled_to: Option<String>,
     /// Only payments that are in this status now: one of the [`status`]
     /// constants.
     pub status: Option<String>,
@@ -2020,10 +2027,21 @@ impl TransactionListParams {
         TransactionListParams {
             from: from.into(),
             to: to.into(),
+            settled_from: None,
+            settled_to: None,
             status: None,
             limit: None,
             cursor: None,
         }
+    }
+
+    /// Lists only the payments the acquirer settled from `from` (inclusive)
+    /// to `to` (exclusive). Both are dates, e.g. `2026-10-13`. For one
+    /// settlement day, send that day and the next day.
+    pub fn settled(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
+        self.settled_from = Some(from.into());
+        self.settled_to = Some(to.into());
+        self
     }
 
     /// Lists only the payments in this status.
@@ -2107,6 +2125,23 @@ pub struct Transaction {
     /// refunded.
     #[serde(default)]
     pub refunded_amount: Option<i64>,
+    /// The acquirer fee of this payment, in MINOR units of `currency`.
+    /// `None` until the acquirer settles the payment. It can change, or go
+    /// back to `None`, when the settlement is matched again.
+    #[serde(default)]
+    pub fee: Option<i64>,
+    /// `amount` minus `fee`, in MINOR units of `currency`. `None` when `fee`
+    /// is `None`. Deductions on the whole payout are not in it.
+    #[serde(default)]
+    pub net_amount: Option<i64>,
+    /// ISO 8601 UTC, the date the acquirer settled the payment, at midnight
+    /// (`2026-10-13T00:00:00Z`). `None` until settled.
+    #[serde(default)]
+    pub settled_at: Option<String>,
+    /// The id of the payout that paid this money to you, the id the
+    /// dashboard shows. `None` until the money is paid out.
+    #[serde(default)]
+    pub payout_id: Option<String>,
 
     /// This item as the gateway sent it, for fields this struct does not
     /// model yet.

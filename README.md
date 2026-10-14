@@ -16,7 +16,7 @@ through. A git dependency works today:
 
 ```toml
 [dependencies]
-dominaite = { git = "https://github.com/dominaite/merchant-sdk-rust", tag = "v0.5.0" }
+dominaite = { git = "https://github.com/dominaite/merchant-sdk-rust", tag = "v0.5.1" }
 ```
 
 To work on the SDK itself:
@@ -86,7 +86,7 @@ Everything below is copy-paste. It assumes an empty directory and nothing instal
 
 ```sh
 cargo new my-checkout && cd my-checkout
-cargo add --git https://github.com/dominaite/merchant-sdk-rust --tag v0.5.0 dominaite
+cargo add --git https://github.com/dominaite/merchant-sdk-rust --tag v0.5.1 dominaite
 ```
 
 Set your credentials and the environment you are pointing at:
@@ -992,7 +992,7 @@ fields the structs do not model yet.
 `list_transactions` lists your payments created in a window, oldest first. It needs a reporting
 key with the `transactions:read` scope (see [Key scopes](#key-scopes)). The rows are checkout
 payments, charges on saved cards and verify-only sessions. A refund is not a row of its own: it
-shows on its payment, in `refunded_amount` and `status`. Fees are not part of this read.
+shows on its payment, in `refunded_amount` and `status`.
 
 ```rust
 use dominaite::{transaction_type, TransactionListParams};
@@ -1015,10 +1015,16 @@ loop {
 
 1. The window is `from` (inclusive) to `to` (exclusive), on the creation time of the payment.
    Both are ISO 8601 UTC, at most 31 days apart.
-2. Send `next_cursor` back as the cursor, with the same `from`, `to` and `status`, until it is
-   `None`. Paging never repeats or skips a row.
+2. Send `next_cursor` back as the cursor, with the same `from`, `to`, settlement window and
+   `status`, until it is `None`. Paging never repeats or skips a row.
 3. A page holds 1 to 100 rows (`limit`, 50 by default).
 4. `status` lists only the payments that are in that status now.
+
+`fee`, `net_amount`, `settled_at` and `payout_id` are `None` until the acquirer settles the
+payment. This is usually the next business day. `net_amount` is `amount` minus the fee of this
+payment only. Deductions on the whole payout are not in it. To get one settlement day, call
+`.settled("2026-10-13", "2026-10-14")` with that day and the next day, and a `from` and `to`
+that cover when those payments were created, for example the last 31 days.
 
 Each row has the status at the time of the read. For a statement, end the window a few minutes
 in the past, so payments still being written are not missed. Read again later to pick up

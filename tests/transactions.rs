@@ -229,3 +229,62 @@ fn a_window_the_api_refuses_is_an_api_error_with_the_details_in_raw() {
     assert_eq!(*status, 400);
     assert_eq!(raw["error"]["validationErrors"][0]["field"], "to");
 }
+
+#[test]
+fn the_settlement_window_goes_into_the_query_string_and_none_into_the_signature() {
+    let server = MockServer::start(vec![last_page()]);
+    let params = TransactionListParams::new(FROM, TO)
+        .settled("2026-10-13", "2026-10-14")
+        .status(status::SUCCEEDED);
+
+    client_for(&server)
+        .list_transactions(&params)
+        .expect("a page");
+
+    let recorded = server.only_request();
+    assert_eq!(
+        recorded.path,
+        format!(
+            "/api{TRANSACTIONS_PATH}?from={FROM_ENCODED}&to={TO_ENCODED}&settledFrom=2026-10-13&settledTo=2026-10-14&status=succeeded"
+        )
+    );
+    assert_signed_without_the_query(&recorded);
+}
+
+#[test]
+fn a_settled_payment_reads_the_settlement_fields() {
+    let server = MockServer::start(vec![Reply::enveloped(
+        r#"{"items":[{"transactionId":"11111111-1111-4111-8111-111111111111","type":"payment","status":"succeeded","amount":2500,"currency":"EUR","createdAt":"2026-10-12T09:00:00Z","fee":45,"netAmount":2455,"settledAt":"2026-10-13T00:00:00Z","payoutId":"5d0c6a52-8f1e-4b7a-9c3d-2e1f0a9b8c7d"}],"nextCursor":null}"#,
+    )]);
+    let page = client_for(&server)
+        .list_transactions(&TransactionListParams::new(FROM, TO))
+        .expect("a page");
+
+    let settled = &page.items[0];
+    assert_eq!(settled.fee, Some(45));
+    assert_eq!(settled.net_amount, Some(2455));
+    assert_eq!(settled.settled_at.as_deref(), Some("2026-10-13T00:00:00Z"));
+    assert_eq!(
+        settled.payout_id.as_deref(),
+        Some("5d0c6a52-8f1e-4b7a-9c3d-2e1f0a9b8c7d")
+    );
+}
+
+/// The gateway leaves the settlement fields out until the payment is
+/// settled, and a null reads the same as a missing field.
+#[test]
+fn an_unsettled_payment_reads_the_settlement_fields_as_none() {
+    let server = MockServer::start(vec![Reply::enveloped(
+        r#"{"items":[{"transactionId":"11111111-1111-4111-8111-111111111111","type":"payment","status":"succeeded","amount":2500,"currency":"EUR","createdAt":"2026-10-12T09:00:00Z"},{"transactionId":"22222222-2222-4222-8222-222222222222","type":"payment","status":"succeeded","amount":1000,"currency":"EUR","createdAt":"2026-10-12T10:00:00Z","fee":null,"netAmount":null,"settledAt":null,"payoutId":null}],"nextCursor":null}"#,
+    )]);
+    let page = client_for(&server)
+        .list_transactions(&TransactionListParams::new(FROM, TO))
+        .expect("a page");
+
+    for item in &page.items {
+        assert_eq!(item.fee, None);
+        assert_eq!(item.net_amount, None);
+        assert_eq!(item.settled_at, None);
+        assert_eq!(item.payout_id, None);
+    }
+}

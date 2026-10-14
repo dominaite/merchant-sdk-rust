@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.1
+
+### Added
+
+- `Transaction` has `fee`, `net_amount`, `settled_at` and `payout_id`. All four are `None` until
+  the acquirer settles the payment. `fee` and `net_amount` are in minor units, like `amount`.
+  `net_amount` is `amount` minus the fee of this payment only.
+- `TransactionListParams::settled(from, to)` lists only the payments settled in that window.
+  Both ends are dates (`2026-10-13`), at most 31 days apart. They go out as `settledFrom` and
+  `settledTo` in the query string. The signed path still has no query string.
+
 ## 0.5.0
 
 ### Added
