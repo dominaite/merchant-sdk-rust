@@ -135,6 +135,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .first_name("Ana")
                 .last_name("Kirova")
                 .email("ana@example.com"),
+            // Billing address too, when your checkout already has it: .address(),
+            // .city(), .postal_code() and .state() (US, Canada and Australia only).
         )
         .language("bg")
         .theme("dark");

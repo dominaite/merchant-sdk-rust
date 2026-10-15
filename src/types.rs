@@ -32,6 +32,21 @@ pub struct Customer {
     /// Payer phone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phone: Option<String>,
+    /// Payer billing street address, one line, up to 200 characters. The
+    /// widget asks the payer for address, city and postal code when the
+    /// payment processor needs them, and skips a field you send.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// Payer billing city, up to 100 characters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+    /// Payer billing postal code, up to 20 characters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postal_code: Option<String>,
+    /// Payer billing state or province code, up to 50 characters, e.g. `CA`
+    /// or `NSW`. Only used for the United States, Canada and Australia.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
 }
 
 impl Customer {
@@ -61,6 +76,30 @@ impl Customer {
     /// Sets the phone.
     pub fn phone(mut self, value: impl Into<String>) -> Customer {
         self.phone = Some(value.into());
+        self
+    }
+
+    /// Sets the billing street address.
+    pub fn address(mut self, value: impl Into<String>) -> Customer {
+        self.address = Some(value.into());
+        self
+    }
+
+    /// Sets the billing city.
+    pub fn city(mut self, value: impl Into<String>) -> Customer {
+        self.city = Some(value.into());
+        self
+    }
+
+    /// Sets the billing postal code.
+    pub fn postal_code(mut self, value: impl Into<String>) -> Customer {
+        self.postal_code = Some(value.into());
+        self
+    }
+
+    /// Sets the billing state or province code.
+    pub fn state(mut self, value: impl Into<String>) -> Customer {
+        self.state = Some(value.into());
         self
     }
 }
