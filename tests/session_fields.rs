@@ -163,7 +163,11 @@ fn every_session_field_the_gateway_accepts_has_a_wire_name() {
                 .first_name("Ana")
                 .last_name("Petrova")
                 .email("ana@example.com")
-                .phone("+359888123456"),
+                .phone("+359888123456")
+                .address("12 Vitosha Blvd")
+                .city("Sofia")
+                .postal_code("1000")
+                .state("CA"),
         )
         .country("BG")
         .language("bg")
@@ -210,8 +214,34 @@ fn every_session_field_the_gateway_accepts_has_a_wire_name() {
     );
     assert_eq!(
         body["customer"],
-        json!({"firstName":"Ana","lastName":"Petrova","email":"ana@example.com","phone":"+359888123456"})
+        json!({
+            "firstName": "Ana",
+            "lastName": "Petrova",
+            "email": "ana@example.com",
+            "phone": "+359888123456",
+            "address": "12 Vitosha Blvd",
+            "city": "Sofia",
+            "postalCode": "1000",
+            "state": "CA",
+        })
     );
+}
+
+#[test]
+fn a_customer_field_that_is_not_set_is_not_sent() {
+    let server = MockServer::start(vec![create_ok()]);
+    let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042", key())
+        .customer(dominaite::Customer::new().first_name("Ana").city("Sofia"));
+    client_for(&server)
+        .create_checkout_session(&request)
+        .expect("a session");
+
+    let recorded = server.only_request();
+    assert_eq!(
+        recorded.body,
+        r#"{"amount":2500,"currency":"EUR","orderReference":"order-1042","customer":{"firstName":"Ana","city":"Sofia"}}"#
+    );
+    assert_signed(&recorded);
 }
 
 #[test]
