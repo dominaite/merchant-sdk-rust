@@ -582,7 +582,7 @@ fn charge_errors_without_data_have_no_charge() {
 }
 
 #[test]
-fn a_charge_against_a_method_that_is_not_yours_is_a_404_api_error() {
+fn a_charge_against_a_method_that_is_not_yours_is_a_404_charge_error() {
     let server = MockServer::start(vec![Reply::error_envelope(
         404,
         "PAYMENT_METHOD_NOT_FOUND",
@@ -592,7 +592,7 @@ fn a_charge_against_a_method_that_is_not_yours_is_a_404_api_error() {
         .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
         .expect_err("not found");
 
-    assert!(matches!(error, Error::Api { .. }), "{error:?}");
+    assert!(matches!(error, Error::Charge { .. }), "{error:?}");
     assert_eq!(error.http_status(), Some(404));
     assert_eq!(error.code(), Some("PAYMENT_METHOD_NOT_FOUND"));
 }

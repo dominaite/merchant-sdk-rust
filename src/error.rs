@@ -45,7 +45,10 @@ pub mod session_error_code {
     /// location) this key or request points at was deactivated or deleted.
     pub const STOREFRONT_INACTIVE: &str = "STOREFRONT_INACTIVE";
     /// HTTP 400, [`Error::Api`](crate::Error::Api): the API key is bound to one
-    /// storefront and the request named a different one.
+    /// storefront and the request named a different one. When the idempotency
+    /// key already opened a session, the API answers it as an HTTP 200 refusal
+    /// instead; it still arrives as [`Error::Api`](crate::Error::Api), with
+    /// status 200.
     pub const STOREFRONT_MISMATCH: &str = "STOREFRONT_MISMATCH";
 
     /// HTTP 200 refusal: card payments are off right now; retry later with the
@@ -666,11 +669,12 @@ pub enum Error {
     /// ```
     ///
     /// A decline is NOT this variant: HTTP 402 comes back as `Ok` with a charge
-    /// whose status is `failed`. A 404 for an id that is not yours is
-    /// [`Error::Api`] with code `PAYMENT_METHOD_NOT_FOUND`, and a 5xx that
-    /// carries no gateway code (an HTML page from a proxy) is [`Error::Transport`].
+    /// whose status is `failed`. A 404 for an id that is not yours IS this
+    /// variant, with code `PAYMENT_METHOD_NOT_FOUND`. A 400 is [`Error::Api`].
+    /// A 5xx other than 502 and 503 (an HTML page from a proxy, or a coded 500)
+    /// is [`Error::Transport`].
     Charge {
-        /// The HTTP status code: 409, 422, 502 or 503.
+        /// The HTTP status code: 404, 409, 422, 502 or 503.
         status: u16,
         /// The machine-readable reason. See [`charge_error_code`].
         code: String,
@@ -688,7 +692,8 @@ pub enum Error {
     /// The gateway refused to revoke a stored payment method. Nothing changed
     /// either way; `code` is one of the [`revoke_error_code`] constants (an
     /// unlisted code arrives here too). An id that is not yours is still
-    /// [`Error::Api`] with status 404.
+    /// [`Error::Api`] with status 404. A 5xx other than 502 and 503 is
+    /// [`Error::Transport`].
     Revoke {
         /// The HTTP status code: 502 or 503.
         status: u16,
@@ -732,9 +737,20 @@ pub enum Error {
     /// A network-level failure, a timeout, or a 5xx. The request may or may not
     /// have reached the API, so retry WITH THE SAME idempotency key: a retried
     /// key never creates a second payment.
+    ///
+    /// A 5xx from the API itself keeps its status, its code and its body, e.g.
+    /// a 503 with
+    /// [`MERCHANT_API_UNAVAILABLE`](crate::transient_error_code::MERCHANT_API_UNAVAILABLE).
     Transport {
         /// What failed.
         message: String,
+        /// The HTTP status of a 5xx. `None` when no answer came back.
+        status: Option<u16>,
+        /// The machine-readable reason, when the 5xx carried one. Also on
+        /// [`Error::code`].
+        code: Option<String>,
+        /// The whole envelope of a 5xx that sent JSON. `Value::Null` otherwise.
+        raw: Value,
         /// The underlying cause, when there was one.
         source: Option<Box<dyn StdError + Send + Sync>>,
     },
@@ -744,8 +760,8 @@ impl Error {
     /// The machine-readable code, for the variants that carry one.
     ///
     /// `Refusal`, `Auth`, `Forbidden`, `Charge` and `Revoke` always have one,
-    /// `Api` and `RateLimited` have one when the API sent it; the rest return
-    /// `None`.
+    /// `Api`, `RateLimited` and `Transport` have one when the API sent it;
+    /// `Validation` returns `None`.
     pub fn code(&self) -> Option<&str> {
         match self {
             Error::Refusal { code, .. }
@@ -753,7 +769,9 @@ impl Error {
             | Error::Forbidden { code, .. }
             | Error::Charge { code, .. }
             | Error::Revoke { code, .. } => Some(code),
-            Error::Api { code, .. } | Error::RateLimited { code, .. } => code.as_deref(),
+            Error::Api { code, .. }
+            | Error::RateLimited { code, .. }
+            | Error::Transport { code, .. } => code.as_deref(),
             _ => None,
         }
     }
@@ -767,6 +785,7 @@ impl Error {
             Error::Auth { .. } => Some(401),
             Error::Forbidden { .. } => Some(403),
             Error::RateLimited { .. } => Some(429),
+            Error::Transport { status, .. } => *status,
             _ => None,
         }
     }
@@ -892,13 +911,46 @@ impl Error {
         }
     }
 
+    /// A failure with no answer from the API: nothing to read a status or a
+    /// code from.
     pub(crate) fn transport(
         message: impl Into<String>,
         source: Option<Box<dyn StdError + Send + Sync>>,
     ) -> Error {
         Error::Transport {
             message: message.into(),
+            status: None,
+            code: None,
+            raw: Value::Null,
             source,
+        }
+    }
+
+    /// A 5xx. The code, the API's message and the body travel with it when the
+    /// API sent them.
+    pub(crate) fn unavailable(
+        status: u16,
+        code: Option<String>,
+        api_message: Option<String>,
+        raw: Value,
+    ) -> Error {
+        let mut message = format!("The Dominaite API is unavailable (HTTP {status}");
+        if let Some(code) = &code {
+            message.push_str(", ");
+            message.push_str(code);
+        }
+        message.push(')');
+        if let Some(api_message) = api_message.filter(|text| !text.trim().is_empty()) {
+            message.push_str(": ");
+            message.push_str(api_message.trim_end_matches('.'));
+        }
+        message.push_str("; retry with the same idempotency key.");
+        Error::Transport {
+            message,
+            status: Some(status),
+            code,
+            raw,
+            source: None,
         }
     }
 }

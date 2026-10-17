@@ -485,7 +485,8 @@ impl Client {
         request: &CheckoutSessionRequest,
     ) -> Result<CheckoutSession> {
         let (idempotency_key, body) = prepare_session_request(request)?;
-        let payload = self.request("POST", SESSIONS_PATH, &body, &idempotency_key)?;
+        let reply = self.request_reply("POST", SESSIONS_PATH, "", &body, &idempotency_key)?;
+        let payload = reply.payload();
 
         // Create is the nested shape: an inner `success` next to `checkout`.
         let succeeded = payload.get("success").and_then(Value::as_bool) == Some(true);
@@ -500,14 +501,28 @@ impl Client {
                 session.raw = checkout.clone();
                 Ok(session)
             }
+            // A storefront mismatch on a replay comes back as a 200 refusal, but
+            // it is the same storefront error as the 400: one class for one code.
+            _ if string_field(payload, "errorCode").as_deref()
+                == Some(session_error_code::STOREFRONT_MISMATCH) =>
+            {
+                let message = string_field(payload, "errorMessage")
+                    .unwrap_or_else(|| "The API key is bound to another storefront.".to_string());
+                Err(Error::api_with_code(
+                    reply.status,
+                    Some(session_error_code::STOREFRONT_MISMATCH.to_string()),
+                    message,
+                    reply.envelope,
+                ))
+            }
             // A replay refusal names the transaction the key collided with. Carry
             // it so the caller can reconcile with get_status instead of minting a
             // second payment for the same order.
             _ => Err(Error::refusal(
-                string_field(&payload, "errorCode").unwrap_or_else(|| "UNKNOWN".to_string()),
-                string_field(&payload, "errorMessage")
+                string_field(payload, "errorCode").unwrap_or_else(|| "UNKNOWN".to_string()),
+                string_field(payload, "errorMessage")
                     .unwrap_or_else(|| "The checkout session was refused.".to_string()),
-                string_field(&payload, "transactionId"),
+                string_field(payload, "transactionId"),
             )),
         }
     }
@@ -619,16 +634,17 @@ impl Client {
     ///   allowlisted.
     /// - [`Error::Forbidden`]: the key does not hold the `payments` scope.
     /// - [`Error::Charge`]: the gateway answered with a code instead of a charge
-    ///   (409, 422, 502, 503); branch on `code`. `CHARGE_OUTCOME_UNKNOWN` carries
-    ///   the charge row to poll; never retry it under a new key.
-    /// - [`Error::Api`]: 404 (`PAYMENT_METHOD_NOT_FOUND`) for an id that is not
-    ///   yours, a 400 validation rejection, or an unexpected response.
+    ///   (404, 409, 422, 502, 503); branch on `code`. A 404
+    ///   `PAYMENT_METHOD_NOT_FOUND` is an id that is not yours.
+    ///   `CHARGE_OUTCOME_UNKNOWN` carries the charge row to poll; never retry it
+    ///   under a new key.
+    /// - [`Error::Api`]: a 400 validation rejection, or an unexpected response.
     /// - [`Error::RateLimited`]: HTTP 429. Wait, then send it again with the
     ///   same idempotency key. The charge route's own limits arrive here too,
     ///   with `code` `CHARGE_VELOCITY_EXCEEDED` or `CHARGE_DECLINE_RATE_EXCEEDED`
     ///   (see [`rate_limit_error_code`](crate::rate_limit_error_code)).
-    /// - [`Error::Transport`]: network failure, or a 5xx that carries no gateway
-    ///   code. Safe to retry WITH the same idempotency key.
+    /// - [`Error::Transport`]: network failure, or a 5xx that is not a coded 502
+    ///   or 503. Safe to retry WITH the same idempotency key.
     pub fn charge_payment_method(
         &self,
         payment_method_id: &str,
@@ -654,7 +670,7 @@ impl Client {
         if reply.status >= 400 {
             if let Some(code) = reply
                 .error_code()
-                .filter(|_| !is_generic_failure_status(reply.status))
+                .filter(|_| is_charge_outcome_status(reply.status))
             {
                 let message = reply
                     .error_message()
@@ -704,7 +720,7 @@ impl Client {
 
         if let Some(code) = reply
             .error_code()
-            .filter(|_| !is_generic_failure_status(reply.status))
+            .filter(|_| is_revoke_outcome_status(reply.status))
         {
             let message = reply
                 .error_message()
@@ -1197,11 +1213,25 @@ impl Client {
         body: &str,
         idempotency_key: &str,
     ) -> Result<(u16, Value)> {
+        let reply = self.request_reply(method, path, query, body, idempotency_key)?;
+        Ok((reply.status, reply.payload().clone()))
+    }
+
+    /// [`Client::send`] plus the generic rejection for any 4xx or 5xx, for
+    /// the routes that read more of the answer than the unwrapped `data`.
+    fn request_reply(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &str,
+        idempotency_key: &str,
+    ) -> Result<Reply> {
         let reply = self.send(method, path, query, body, idempotency_key)?;
         if reply.status >= 400 {
             return Err(reply.rejection());
         }
-        Ok((reply.status, reply.payload().clone()))
+        Ok(reply)
     }
 
     /// Signs and sends one call, and parses whatever came back into a [`Reply`].
@@ -1486,12 +1516,30 @@ fn is_processing_unavailable(error: &Error) -> bool {
     )
 }
 
-/// The statuses that stay generic on every route: input validation, credentials,
-/// an id that is not yours, and rate limiting. A coded answer outside this set
-/// is the gateway describing a payment method outcome, which the charge and
-/// revoke routes surface as [`Error::Charge`] and [`Error::Revoke`].
-fn is_generic_failure_status(status: u16) -> bool {
-    matches!(status, 400 | 401 | 403 | 404 | 429)
+/// Whether a coded answer on the charge route is a charge outcome
+/// ([`Error::Charge`]): any 4xx except input validation, credentials and rate
+/// limiting, and the 502 and 503 the charge route documents. A coded 404
+/// (`PAYMENT_METHOD_NOT_FOUND`, `AGREEMENT_NOT_FOUND`) is a charge outcome too.
+/// Any other 5xx is an outage and stays a retryable [`Error::Transport`].
+fn is_charge_outcome_status(status: u16) -> bool {
+    match status {
+        400 | 401 | 403 | 429 => false,
+        402..=499 => true,
+        502 | 503 => true,
+        _ => false,
+    }
+}
+
+/// Whether a coded answer on the revoke route is a revoke outcome
+/// ([`Error::Revoke`]). A 404 stays [`Error::Api`]: the API answers it with a
+/// generic validation code. Any 5xx other than 502 and 503 is an outage.
+fn is_revoke_outcome_status(status: u16) -> bool {
+    match status {
+        400 | 401 | 403 | 404 | 429 => false,
+        402..=499 => true,
+        502 | 503 => true,
+        _ => false,
+    }
 }
 
 /// Why this base URL is not usable, or `None` when it is fine.
@@ -1585,12 +1633,9 @@ fn classify_status(
             }),
         ),
         403 => Error::forbidden(code, message),
-        status if status >= 500 => Error::transport(
-            format!(
-                "The Dominaite API is unavailable (HTTP {status}); retry with the same idempotency key."
-            ),
-            None,
-        ),
+        // Retryable whatever the body says, and the code the API sent, if any,
+        // travels with it.
+        status if status >= 500 => Error::unavailable(status, code, message, raw),
         // The code is the whole point of a validation rejection
         // (IDEMPOTENCY_KEY_REQUIRED on a 400), so it travels with the error
         // instead of being flattened into a status the caller cannot branch on.

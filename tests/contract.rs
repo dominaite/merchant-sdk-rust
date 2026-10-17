@@ -935,7 +935,7 @@ fn the_charge_outcome_unknown_example_names_the_transaction_to_poll() {
 }
 
 #[test]
-fn the_charge_not_found_example_is_an_api_error_with_its_code() {
+fn the_charge_not_found_example_is_a_charge_error_with_its_code() {
     let example = endpoint("chargePaymentMethod")["notFoundExample"].clone();
     assert_eq!(example["httpStatus"], 404);
 
@@ -944,7 +944,9 @@ fn the_charge_not_found_example_is_an_api_error_with_its_code() {
         let error = client_for(&server)
             .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
             .expect_err("not found");
-        assert!(matches!(error, Error::Api { .. }), "{form}: {error:?}");
+        // A coded charge answer is a charge error, whatever its status. This
+        // fixture still files the 404 with the generic errors.
+        assert!(matches!(error, Error::Charge { .. }), "{form}: {error:?}");
         assert_eq!(error.http_status(), Some(404), "{form}");
         assert_eq!(error.code(), Some("PAYMENT_METHOD_NOT_FOUND"), "{form}");
     }
