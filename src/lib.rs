@@ -16,8 +16,8 @@
 //!     std::env::var("DOMINAITE_KEY_ID")?,
 //!     std::env::var("DOMINAITE_SECRET")?,
 //! )
-//! // Unset is fine: an empty value keeps the production default.
-//! .base_url(std::env::var("DOMINAITE_BASE_URL").unwrap_or_default())
+//! // Required: dominaite::SANDBOX_BASE_URL or dominaite::PRODUCTION_BASE_URL.
+//! .base_url(std::env::var("DOMINAITE_BASE_URL")?)
 //! .build()?;
 //!
 //! // Verify credentials and clock before minting anything.
@@ -50,8 +50,8 @@ mod types;
 mod webhooks;
 
 pub use client::{
-    Client, ClientBuilder, RetryOptions, AGREEMENTS_PATH, DEFAULT_BASE_URL,
-    INTEGRATION_CONTRACT_PATH, PAYMENTS_PATH, PAYMENT_METHODS_PATH, PING_PATH, PLANS_PATH,
+    Client, ClientBuilder, RetryOptions, AGREEMENTS_PATH, INTEGRATION_CONTRACT_PATH, PAYMENTS_PATH,
+    PAYMENT_METHODS_PATH, PING_PATH, PLANS_PATH, PRODUCTION_BASE_URL, SANDBOX_BASE_URL,
     SESSIONS_PATH, TRANSACTIONS_PATH, VERSION, WEBHOOKS_PATH,
 };
 pub use error::{

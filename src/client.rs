@@ -16,8 +16,14 @@ use crate::types::{
     WebhookEndpointRequest,
 };
 
-/// The production merchant API.
-pub const DEFAULT_BASE_URL: &str = "https://api.dominaite.com/payments";
+/// The sandbox merchant API. Use it with sandbox credentials.
+pub const SANDBOX_BASE_URL: &str = "https://api.staging.dominaite.com/payments";
+
+/// The production merchant API. Use it with production credentials.
+pub const PRODUCTION_BASE_URL: &str = "https://api.dominaite.com/payments";
+
+/// What [`ClientBuilder::build`] says when no base URL was set.
+const BASE_URL_REQUIRED: &str = "base_url is required. Use https://api.staging.dominaite.com/payments for the sandbox or https://api.dominaite.com/payments for production.";
 
 /// The canonical path that gets signed. POST creates a session; GET
 /// `SESSIONS_PATH/{transaction_id}` reads its status.
@@ -92,7 +98,7 @@ pub(crate) const REDACTED_SECRET: &str = "dms_***redacted***";
 pub struct ClientBuilder {
     key_id: String,
     secret: String,
-    base_url: String,
+    base_url: Option<String>,
     timeout: Duration,
     user_agent: Option<String>,
     agent: Option<ureq::Agent>,
@@ -114,19 +120,18 @@ impl fmt::Debug for ClientBuilder {
 }
 
 impl ClientBuilder {
-    /// Points the client at a non-production environment. Empty and
-    /// whitespace-only values are ignored, so you can pass an unset environment
-    /// variable straight through and still get production. Trailing slashes are
-    /// trimmed.
+    /// Sets the API the client calls: [`SANDBOX_BASE_URL`],
+    /// [`PRODUCTION_BASE_URL`] or your own value. Required: there is no default,
+    /// so an unset environment variable cannot send sandbox credentials to
+    /// production. Whitespace and trailing slashes are trimmed.
     ///
-    /// The URL has to be `https://`. [`ClientBuilder::build`] rejects anything
-    /// else with [`Error::Validation`], except plain `http://` on a loopback
-    /// host (`localhost`, `127.0.0.1`, `[::1]`) so a local mock still works.
+    /// [`ClientBuilder::build`] rejects a missing, empty or whitespace-only value
+    /// with [`Error::Validation`]. The URL also has to be `https://`, except
+    /// plain `http://` on a loopback host (`localhost`, `127.0.0.1`, `[::1]`) so
+    /// a local mock still works.
     pub fn base_url(mut self, base_url: impl AsRef<str>) -> Self {
         let trimmed = base_url.as_ref().trim().trim_end_matches('/');
-        if !trimmed.is_empty() {
-            self.base_url = trimmed.to_string();
-        }
+        self.base_url = Some(trimmed.to_string());
         self
     }
 
@@ -167,8 +172,9 @@ impl ClientBuilder {
     /// Validates the credentials and the base URL, and builds the client.
     ///
     /// Returns [`Error::Validation`] when either credential has the wrong prefix,
-    /// which catches a swapped key id and secret before anything is sent, and
-    /// when the base URL is not `https://` on a non-loopback host.
+    /// which catches a swapped key id and secret before anything is sent, when
+    /// the base URL is missing, empty or whitespace-only, and when the base URL
+    /// is not `https://` on a non-loopback host.
     pub fn build(self) -> Result<Client> {
         if !self.key_id.starts_with("dmk_") {
             return Err(Error::validation("key_id must start with dmk_"));
@@ -176,7 +182,11 @@ impl ClientBuilder {
         if !self.secret.starts_with("dms_") {
             return Err(Error::validation("secret must start with dms_"));
         }
-        if let Some(problem) = base_url_problem(&self.base_url) {
+        let base_url = match self.base_url {
+            Some(base_url) if !base_url.is_empty() => base_url,
+            _ => return Err(Error::validation(BASE_URL_REQUIRED)),
+        };
+        if let Some(problem) = base_url_problem(&base_url) {
             return Err(Error::validation(problem));
         }
 
@@ -204,7 +214,7 @@ impl ClientBuilder {
         Ok(Client {
             key_id: self.key_id,
             secret: self.secret,
-            base_url: self.base_url,
+            base_url,
             user_agent,
             agent,
         })
@@ -241,20 +251,26 @@ impl fmt::Debug for Client {
 }
 
 impl Client {
-    /// A client on the production base URL with the default 45s timeout.
+    /// A client on `base_url` with the default 45s timeout.
     ///
-    /// Both credentials come from the dashboard's Website integration tab.
-    pub fn new(key_id: impl Into<String>, secret: impl Into<String>) -> Result<Client> {
-        Client::builder(key_id, secret).build()
+    /// Both credentials come from the dashboard's Website integration tab. Pass
+    /// [`SANDBOX_BASE_URL`] or [`PRODUCTION_BASE_URL`] to match them. A missing
+    /// or blank base URL fails with [`Error::Validation`].
+    pub fn new(
+        key_id: impl Into<String>,
+        secret: impl Into<String>,
+        base_url: impl AsRef<str>,
+    ) -> Result<Client> {
+        Client::builder(key_id, secret).base_url(base_url).build()
     }
 
-    /// A builder, for a non-production base URL, a different timeout, or your own
-    /// HTTP agent.
+    /// A builder, for a different timeout, a User-Agent suffix, or your own HTTP
+    /// agent. Set [`ClientBuilder::base_url`] before [`ClientBuilder::build`].
     pub fn builder(key_id: impl Into<String>, secret: impl Into<String>) -> ClientBuilder {
         ClientBuilder {
             key_id: key_id.into(),
             secret: secret.into(),
-            base_url: DEFAULT_BASE_URL.to_string(),
+            base_url: None,
             timeout: DEFAULT_TIMEOUT,
             user_agent: None,
             agent: None,
@@ -920,7 +936,7 @@ impl Client {
     /// use dominaite::{Client, TransactionListParams};
     ///
     /// # fn main() -> Result<(), dominaite::Error> {
-    /// # let client = Client::new("dmk_0123456789abcdef0123456789abcdef", "dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")?;
+    /// # let client = Client::new("dmk_0123456789abcdef0123456789abcdef", "dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", dominaite::SANDBOX_BASE_URL)?;
     /// let mut params =
     ///     TransactionListParams::new("2026-10-01T00:00:00Z", "2026-10-08T00:00:00Z").limit(100);
     /// loop {

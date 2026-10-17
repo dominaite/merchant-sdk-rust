@@ -23,7 +23,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// ```no_run
 /// # use dominaite::{session_error_code, CheckoutSessionRequest, Client, Error, IdempotencyKey};
 /// # fn main() -> Result<(), Error> {
-/// # let client = Client::new("dmk_x", "dms_y")?;
+/// # let client = Client::new("dmk_x", "dms_y", dominaite::SANDBOX_BASE_URL)?;
 /// # let key = IdempotencyKey::new("order-1042")?;
 /// # let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042", key);
 /// match client.create_checkout_session(&request) {
@@ -312,7 +312,7 @@ pub enum Error {
         /// ```no_run
         /// # use dominaite::{Client, CheckoutSessionRequest, Error, IdempotencyKey};
         /// # fn main() -> Result<(), Error> {
-        /// # let client = Client::new("dmk_x", "dms_y")?;
+        /// # let client = Client::new("dmk_x", "dms_y", dominaite::SANDBOX_BASE_URL)?;
         /// # let key = IdempotencyKey::new("order-1042")?;
         /// # let request = CheckoutSessionRequest::new(2500, "EUR", "order-1042", key);
         /// match client.create_checkout_session(&request) {
@@ -399,7 +399,7 @@ pub enum Error {
     /// ```no_run
     /// # use dominaite::{charge_error_code, ChargeRequest, Client, Error, IdempotencyKey};
     /// # fn main() -> Result<(), Error> {
-    /// # let client = Client::new("dmk_x", "dms_y")?;
+    /// # let client = Client::new("dmk_x", "dms_y", dominaite::SANDBOX_BASE_URL)?;
     /// # let key = IdempotencyKey::new("order-1043")?;
     /// # let request = ChargeRequest::new(2500, "EUR", "order-1043", key);
     /// match client.charge_payment_method("pm_...", &request) {

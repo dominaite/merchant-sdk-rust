@@ -3,11 +3,12 @@
 //! ```sh
 //! export DOMINAITE_KEY_ID=dmk_...
 //! export DOMINAITE_SECRET=dms_...
-//! export DOMINAITE_BASE_URL=https://...   # a test environment only
+//! export DOMINAITE_BASE_URL=https://api.staging.dominaite.com/payments
 //! cargo run --example create_session
 //! ```
 //!
-//! Leave DOMINAITE_BASE_URL unset to hit production.
+//! DOMINAITE_BASE_URL is required. Use https://api.staging.dominaite.com/payments
+//! for the sandbox or https://api.dominaite.com/payments for production.
 
 use std::env;
 
@@ -21,11 +22,13 @@ fn main() {
         std::process::exit(2);
     }
 
-    let client = Client::builder(key_id, secret)
-        // An unset variable is an empty string, which keeps the production default.
-        .base_url(env::var("DOMINAITE_BASE_URL").unwrap_or_default())
-        .build()
-        .unwrap_or_else(|error| fail(error));
+    // Required. Unset, it is an empty string, and build() refuses it.
+    let client = Client::new(
+        key_id,
+        secret,
+        env::var("DOMINAITE_BASE_URL").unwrap_or_default(),
+    )
+    .unwrap_or_else(|error| fail(error));
 
     // Ping first: it creates nothing and tells you whether the key, the secret,
     // the signing and the clock are all good.
