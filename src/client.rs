@@ -775,8 +775,8 @@ impl Client {
     ///   `code`.
     /// - [`Error::Api`]: 404 for an id that is not yours (code
     ///   `VALIDATION_ERROR`), or an unexpected response.
-    /// - [`Error::Transport`]: network failure, or a 5xx that carries no
-    ///   gateway code.
+    /// - [`Error::Transport`]: network failure, or a 5xx that is not a coded 502
+    ///   or 503 (a coded 500 or 504 too). Nothing changed; retry later.
     pub fn revoke_payment_method(&self, payment_method_id: &str) -> Result<()> {
         let id = normalize_payment_method_id(payment_method_id)?;
 
