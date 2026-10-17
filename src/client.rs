@@ -1835,15 +1835,19 @@ fn validate_order_params(currency: &str, order_reference: &str) -> Result<()> {
     Ok(())
 }
 
-/// A payment method id is opaque (`pm_...`), so this only pins what keeps it a
-/// single path segment: no slash, no query, no whitespace, nothing that needs
-/// percent-encoding. The id goes into the signed canonical path verbatim, so
-/// anything else would sign one path and request another.
+/// A payment method id (`pm_...`) must stay a single path segment: no slash,
+/// no query, no whitespace, nothing that needs percent-encoding. Anything else
+/// would sign one path and request another.
+///
+/// The id is lowercased. The API signs the lowercase id, so an id typed in
+/// upper case would fail with `INVALID_SIGNATURE`. The API itself only hands
+/// out lowercase ids.
 fn normalize_payment_method_id(payment_method_id: &str) -> Result<String> {
     normalize_opaque_id(
         payment_method_id,
         "payment_method_id must be the payment_method.id from get_status",
     )
+    .map(|id| id.to_ascii_lowercase())
 }
 
 /// The single-path-segment rule of [`normalize_payment_method_id`], for any

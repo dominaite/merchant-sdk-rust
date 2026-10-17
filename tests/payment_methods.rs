@@ -237,6 +237,29 @@ fn a_revoked_or_unknown_payment_method_status_is_not_chargeable() {
 }
 
 #[test]
+fn an_uppercase_payment_method_id_is_sent_and_signed_in_lowercase() {
+    // The API signs the lowercase id. An id typed in upper case used to go out
+    // as typed and fail with INVALID_SIGNATURE.
+    let upper = PAYMENT_METHOD_ID.to_ascii_uppercase();
+
+    let server = MockServer::start(vec![charge_ok()]);
+    client_for(&server)
+        .charge_payment_method(&upper, &charge_request())
+        .expect("charged");
+    let recorded = server.only_request();
+    assert_eq!(recorded.path, format!("/api{}", charge_path()));
+    assert_signature_matches(&recorded, &charge_path(), CHARGE_KEY);
+
+    let server = MockServer::start(vec![revoke_ok()]);
+    client_for(&server)
+        .revoke_payment_method(&upper)
+        .expect("revoked");
+    let recorded = server.only_request();
+    assert_eq!(recorded.path, format!("/api{}", revoke_path()));
+    assert_signature_matches(&recorded, &revoke_path(), "");
+}
+
+#[test]
 fn charge_payment_method_signs_the_charge_vector_byte_for_byte() {
     let server = MockServer::start(vec![charge_ok()]);
     let charge = client_for(&server)
