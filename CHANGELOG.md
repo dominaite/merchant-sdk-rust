@@ -8,7 +8,9 @@
   retried after a transport failure, a 5xx or `PAYMENT_PROCESSING_UNAVAILABLE`, up to 2 times
   by default, with the same key and body. Set `ClientBuilder::max_retries(0)` for the old
   behaviour. Webhook endpoint create, PATCH and DELETE are never retried, and neither is a
-  429.
+  429. A charge that answers `CHARGE_OUTCOME_UNKNOWN`, `CHARGE_FAILED` or
+  `PAYMENT_METHOD_CHARGES_DISABLED` is not retried either. `PAYMENT_METHOD_CHARGES_DISABLED`
+  stays until stored-card charges are switched on for your account, which takes hours or days.
 - The timeout is per attempt. With retries on, one call can take up to (max retries + 1) x
   timeout, plus the waits between attempts: 3 x 45 s plus up to 1.5 s with the defaults.
 - Every `Error` variant except `Validation` has a new `request_id` field, and

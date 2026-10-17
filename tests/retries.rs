@@ -205,6 +205,26 @@ fn a_charge_with_an_unknown_or_failed_outcome_is_not_retried() {
 }
 
 #[test]
+fn a_charge_answered_charges_disabled_is_sent_once() {
+    let server = MockServer::start(vec![
+        Reply::error_envelope(
+            503,
+            "PAYMENT_METHOD_CHARGES_DISABLED",
+            "Charges of stored payment methods are not enabled.",
+        ),
+        Reply::Json(201, ok(CHARGE)),
+    ]);
+    let (client, waits) = client_for(&server);
+    let error = client
+        .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
+        .expect_err("charges are off");
+    assert!(matches!(error, Error::Charge { .. }), "{error:?}");
+    assert_eq!(error.code(), Some("PAYMENT_METHOD_CHARGES_DISABLED"));
+    assert_eq!(server.requests().len(), 1);
+    assert!(waits.all().is_empty());
+}
+
+#[test]
 fn a_refusal_or_a_4xx_is_not_retried() {
     let refusal =
         r#"{"success":false,"errorCode":"DUPLICATE_REQUEST","errorMessage":"Already open."}"#;
