@@ -452,9 +452,12 @@ pub mod validation_error_code {
 /// The codes of a temporary outage. Nothing was created; send the same
 /// request again later WITH THE SAME idempotency key.
 pub mod transient_error_code {
-    /// HTTP 503 on any route: the platform could not handle the request right
-    /// now. It arrives as [`Error::Transport`](crate::Error::Transport) with
-    /// this code.
+    /// HTTP 503: the platform could not handle the request right now. It
+    /// arrives as [`Error::Transport`](crate::Error::Transport) with this code,
+    /// except on two routes: as [`Error::Charge`](crate::Error::Charge) from
+    /// [`Client::charge_payment_method`](crate::Client::charge_payment_method)
+    /// and as [`Error::Revoke`](crate::Error::Revoke) from
+    /// [`Client::revoke_payment_method`](crate::Client::revoke_payment_method).
     pub const MERCHANT_API_UNAVAILABLE: &str = "MERCHANT_API_UNAVAILABLE";
     /// Card payments are off right now. An HTTP 200
     /// [`Error::Refusal`](crate::Error::Refusal) on the checkout route, an HTTP
