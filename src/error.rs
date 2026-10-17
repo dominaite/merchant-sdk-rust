@@ -411,8 +411,8 @@ pub mod webhook_error_code {
 
 /// The codes of a rejected field, on an HTTP 400.
 ///
-/// The envelope's own code is [`VALIDATION_ERROR`]. The field codes in
-/// [`ALL`] name what was wrong with each field: read them in the error's `raw`,
+/// The envelope's own code is [`VALIDATION_ERROR`](validation_error_code::VALIDATION_ERROR). The field codes in
+/// [`ALL`](validation_error_code::ALL) name what was wrong with each field: read them in the error's `raw`,
 /// under `error.validationErrors[].code`, next to the field name.
 pub mod validation_error_code {
     /// The `error.code` of a 400 that rejected one or more fields. The details
