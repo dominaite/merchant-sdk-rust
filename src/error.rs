@@ -197,7 +197,9 @@ pub mod charge_error_code {
     /// for your account, or we paused charges for a short time. The code is
     /// the same in both cases. If we never switched stored-card charges on for
     /// your account, a retry does not help: ask us (Dominaite support). If
-    /// they are on, retry later with the SAME idempotency key.
+    /// they are on, retry later with the SAME idempotency key. The client
+    /// never retries this code on its own: a switch like this takes hours or
+    /// days, not seconds.
     pub const PAYMENT_METHOD_CHARGES_DISABLED: &str = "PAYMENT_METHOD_CHARGES_DISABLED";
     /// HTTP 503: card payments are off right now; nothing was charged. Retry
     /// later with the SAME key.

@@ -8,7 +8,12 @@
   retried after a transport failure, a 5xx or `PAYMENT_PROCESSING_UNAVAILABLE`, up to 2 times
   by default, with the same key and body. Set `ClientBuilder::max_retries(0)` for the old
   behaviour. Webhook endpoint create, PATCH and DELETE are never retried, and neither is a
-  429.
+  429. A charge that answers `CHARGE_OUTCOME_UNKNOWN`, `CHARGE_FAILED` or
+  `PAYMENT_METHOD_CHARGES_DISABLED` is not retried either. `PAYMENT_METHOD_CHARGES_DISABLED`
+  stays until stored-card charges are switched on for your account, which takes hours or days.
+  Every retry, on every route, sends one line to `ClientBuilder::on_warning` before its wait.
+  Without that hook, retries make no output. In 0.6.0 only `create_checkout_session_with_retry`
+  warned.
 - The timeout is per attempt. With retries on, one call can take up to (max retries + 1) x
   timeout, plus the waits between attempts: 3 x 45 s plus up to 1.5 s with the defaults.
 - Every `Error` variant except `Validation` has a new `request_id` field, and
@@ -46,7 +51,9 @@
   time between 0 and min(8 s, 500 ms x 2^n).
 - `WebhookEvent::charge_data()` and `WebhookEvent::agreement_data()`, with `ChargeEventData`,
   `ChargeEventPaymentMethod` and `AgreementEventData`. Every field but the id is an `Option`,
-  so explicit nulls read as `None`. `charge_outcome` holds the `outcome` values.
+  so explicit nulls read as `None`. `charge_outcome` holds the `outcome` values. One field of
+  the wrong type makes the whole typed object `None`; `WebhookEvent::data` keeps the raw data,
+  and the signature still verifies.
 - Error code constants for every code in the wire contract: the subscription refusals and
   `IDEMPOTENCY_KEY_REQUIRED` in `session_error_code`, the rest of the charge codes in
   `charge_error_code`, and the new modules `recurring_error_code`, `webhook_error_code`,

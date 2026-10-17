@@ -389,7 +389,8 @@ The client retries a call that is safe to replay, with one policy for every rout
   refusal). Never a 429: the client returns `Error::RateLimited` with `retry_after_seconds` at
   once. Never a refusal, a 4xx or an authentication failure: they will not change. A charge
   that answers `CHARGE_OUTCOME_UNKNOWN` or `CHARGE_FAILED` is not resent either; read the
-  charge back instead.
+  charge back instead. Nor is a charge that answers `PAYMENT_METHOD_CHARGES_DISABLED`: it stays
+  until stored-card charges are switched on for your account, which takes hours or days.
 - **How often:** `.max_retries(n)` on the builder, default 2, so one call sends at most 3
   requests. `.max_retries(0)` turns retries off.
 - **How long:** before retry n (counted from 0), the client waits a random time between 0 and
@@ -908,6 +909,11 @@ then `plan_id`, `customer_reference`, `stored_payment_method_id`, `status`, `pre
 `amount`, `currency`, `interval_unit`, `interval_count`, `period_count`, `trial_days`,
 `next_charge_at`, `activated_at`, `cancelled_at`, `version`, `sequence`). Every field but the id
 is an `Option`. Both return `None` on other event types.
+
+A typed view never fails the delivery. When one field has an unexpected type, for example
+`"paymentMethod":"visa"` where an object belongs, `payment_data()`, `charge_data()` or
+`agreement_data()` returns `None` for the whole object, not for that one field. The signature
+still verifies, and `event.data` keeps every field as sent, so read what you need from it.
 
 `payment.succeeded` (and `payment.requires_capture` for an authorization) can carry
 `data.storedPaymentMethod`, the card the payment kept on file. `stored_payment_method` (also

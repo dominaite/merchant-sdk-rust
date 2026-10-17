@@ -2,7 +2,12 @@
 //! explicit nulls, and every field the platform can leave empty must read as
 //! `None`, not fail the parse.
 
-use dominaite::{agreement_status, charge_outcome, decline_class, event_type, WebhookEvent};
+use dominaite::{
+    agreement_status, charge_outcome, decline_class, event_type, verify_webhook, WebhookEvent,
+    DEFAULT_TOLERANCE_SECS,
+};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 
 fn parse_event(event_type: &str, data: &str) -> WebhookEvent {
     WebhookEvent::parse(&format!(
@@ -130,4 +135,42 @@ fn event_with_only_id() -> WebhookEvent {
 #[test]
 fn the_charge_outcome_vocabulary_matches_the_charge_events() {
     assert_eq!(charge_outcome::ALL, ["succeeded", "retrying", "failed"]);
+}
+
+/// The `X-Webhook-Signature` header the platform sends for `body` at `timestamp`.
+fn sign(body: &str, secret: &str, timestamp: u64) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("any key length");
+    mac.update(format!("{timestamp}.{body}").as_bytes());
+    format!(
+        "t={timestamp},v1={}",
+        hex::encode(mac.finalize().into_bytes())
+    )
+}
+
+#[test]
+fn a_signed_charge_event_with_a_misfit_field_verifies_and_keeps_its_raw_data() {
+    // paymentMethod is an object on the wire. A string in its place must not
+    // fail verification: the typed view is None and `data` keeps every field.
+    let secret = "whsec_abababababababababababababababababababababababababababababababab";
+    let timestamp = 1792231200;
+    let body = r#"{"id":"7f9c24e5-1d1f-4c0a-9b6c-2f3a4d5e6f70","type":"charge.succeeded","apiVersion":"2026-09-25","createdAt":"2026-09-25T10:00:00Z","data":{"chargeId":"ch_1","transactionId":"t","outcome":"succeeded","amount":2500,"currency":"EUR","paymentMethod":"visa","sequence":1}}"#;
+    let header = sign(body, secret, timestamp);
+
+    assert_eq!(
+        verify_webhook(
+            body,
+            &header,
+            secret,
+            DEFAULT_TOLERANCE_SECS,
+            Some(timestamp)
+        ),
+        Ok(())
+    );
+    let event = WebhookEvent::parse(body).expect("the envelope still parses");
+    assert_eq!(event.event_type, event_type::CHARGE_SUCCEEDED);
+    assert!(event.charge_data().is_none());
+    assert_eq!(event.data["paymentMethod"], "visa");
+    assert_eq!(event.data["chargeId"], "ch_1");
+    assert_eq!(event.data["amount"], 2500);
+    assert_eq!(event.sequence(), Some(1));
 }

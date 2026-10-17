@@ -229,7 +229,9 @@ impl ClientBuilder {
     /// checkout's HTTP 200 refusal). It never retries a 429: wait out
     /// [`Error::RateLimited`]'s `retry_after_seconds` yourself. A charge that
     /// answers `CHARGE_OUTCOME_UNKNOWN` or `CHARGE_FAILED` is not retried
-    /// either: read the charge back instead.
+    /// either: read the charge back instead. Nor is
+    /// `PAYMENT_METHOD_CHARGES_DISABLED`: it stays until stored-card charges are
+    /// switched on for your account, which takes hours or days.
     ///
     /// Before retry n (counted from 0), the client waits a random time between
     /// 0 and min(8 s, 500 ms x 2^n). Each retry goes to
@@ -1338,8 +1340,8 @@ impl Client {
                 Some(reason) if retry < policy.max_retries => {
                     self.warn(&format!(
                         "dominaite-rust: retrying {method} {path} after {reason} (attempt {} of {})",
-                        retry + 2,
-                        policy.max_retries + 1
+                        retry.saturating_add(2),
+                        policy.max_retries.saturating_add(1)
                     ));
                     self.pause(retry, policy.base_delay);
                     retry += 1;
@@ -2209,7 +2211,14 @@ fn reply_retry_reason(reply: &Reply) -> Option<String> {
         return None;
     }
     match code.as_deref() {
-        Some(charge_error_code::CHARGE_OUTCOME_UNKNOWN | charge_error_code::CHARGE_FAILED) => None,
+        // A charge outcome is read back, not resent. PAYMENT_METHOD_CHARGES_DISABLED
+        // stays until stored-card charges are switched on for the account, which
+        // takes hours or days, so a retry a second later never helps.
+        Some(
+            charge_error_code::CHARGE_OUTCOME_UNKNOWN
+            | charge_error_code::CHARGE_FAILED
+            | charge_error_code::PAYMENT_METHOD_CHARGES_DISABLED,
+        ) => None,
         Some(code) => Some(code.to_string()),
         None => Some(format!("HTTP {}", reply.status)),
     }

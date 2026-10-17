@@ -51,6 +51,29 @@ fn client_for(server: &MockServer) -> (Client, Waits) {
     (client, waits)
 }
 
+/// Every warning the client handed to `on_warning`, in order.
+#[derive(Clone, Default)]
+struct Warnings(Arc<Mutex<Vec<String>>>);
+
+impl Warnings {
+    fn all(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// A client on `max_retries` that records its waits and its warnings.
+fn warning_client(server: &MockServer, max_retries: u32) -> (Client, Warnings) {
+    let warnings = Warnings::default();
+    let recorder = warnings.clone();
+    let client = builder(server)
+        .max_retries(max_retries)
+        .retry_sleep(|_| {})
+        .on_warning(move |line| recorder.0.lock().unwrap().push(line.to_string()))
+        .build()
+        .expect("valid credentials");
+    (client, warnings)
+}
+
 fn key(value: &str) -> IdempotencyKey {
     IdempotencyKey::new(value).expect("a valid idempotency key")
 }
@@ -205,6 +228,26 @@ fn a_charge_with_an_unknown_or_failed_outcome_is_not_retried() {
 }
 
 #[test]
+fn a_charge_answered_charges_disabled_is_sent_once() {
+    let server = MockServer::start(vec![
+        Reply::error_envelope(
+            503,
+            "PAYMENT_METHOD_CHARGES_DISABLED",
+            "Charges of stored payment methods are not enabled.",
+        ),
+        Reply::Json(201, ok(CHARGE)),
+    ]);
+    let (client, waits) = client_for(&server);
+    let error = client
+        .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
+        .expect_err("charges are off");
+    assert!(matches!(error, Error::Charge { .. }), "{error:?}");
+    assert_eq!(error.code(), Some("PAYMENT_METHOD_CHARGES_DISABLED"));
+    assert_eq!(server.requests().len(), 1);
+    assert!(waits.all().is_empty());
+}
+
+#[test]
 fn a_refusal_or_a_4xx_is_not_retried() {
     let refusal =
         r#"{"success":false,"errorCode":"DUPLICATE_REQUEST","errorMessage":"Already open."}"#;
@@ -296,4 +339,37 @@ fn the_default_jitter_stays_inside_the_ceiling() {
 
 fn ok(data: &str) -> String {
     format!(r#"{{"success":true,"data":{data},"metadata":{{}}}}"#)
+}
+
+#[test]
+fn the_largest_max_retries_counts_its_attempts_without_overflow() {
+    let server = MockServer::start(vec![Reply::HangUp, Reply::Json(201, ok(CHARGE))]);
+    let (client, warnings) = warning_client(&server, u32::MAX);
+    let charge = client
+        .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
+        .expect("the retry lands");
+    assert_eq!(charge.status, "succeeded");
+    assert_eq!(server.requests().len(), 2);
+    assert_eq!(warnings.all().len(), 1);
+    assert!(
+        warnings.all()[0].ends_with(&format!("(attempt 2 of {})", u32::MAX)),
+        "{:?}",
+        warnings.all()
+    );
+}
+
+#[test]
+fn every_retry_reaches_on_warning() {
+    let server = MockServer::start(vec![unavailable()]);
+    let (client, warnings) = warning_client(&server, 2);
+    client.get_status(TRANSACTION_ID).expect_err("still down");
+    assert_eq!(server.requests().len(), 3);
+    let path = format!("/merchant-api/checkout/sessions/{TRANSACTION_ID}");
+    assert_eq!(
+        warnings.all(),
+        vec![
+            format!("dominaite-rust: retrying GET {path} after MERCHANT_API_UNAVAILABLE (attempt 2 of 3)"),
+            format!("dominaite-rust: retrying GET {path} after MERCHANT_API_UNAVAILABLE (attempt 3 of 3)"),
+        ]
+    );
 }
