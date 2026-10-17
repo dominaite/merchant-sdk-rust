@@ -1,5 +1,9 @@
 //! Client-level tests against a loopback mock server. No network, no credentials.
 
+// The deprecated create_checkout_session_with_retry keeps its tests until it
+// is removed.
+#![allow(deprecated)]
+
 mod support;
 
 use std::time::Duration;
@@ -65,6 +69,8 @@ fn client_for(server: &MockServer) -> Client {
     Client::builder(KEY_ID, SECRET)
         .base_url(format!("{}/api", server.base_url()))
         .timeout(Duration::from_secs(5))
+        // Retries stay on; the waits between them cost no time here.
+        .retry_sleep(|_| {})
         .build()
         .expect("valid credentials")
 }

@@ -545,9 +545,9 @@ pub enum Error {
     /// `IDEMPOTENCY_KEY_REUSED`).
     ///
     /// Never blind-retry a refusal. It will not change on its own. The one
-    /// exception is `PAYMENT_PROCESSING_UNAVAILABLE`, which is temporary:
-    /// [`create_checkout_session_with_retry`](crate::Client::create_checkout_session_with_retry)
-    /// retries it with the same key.
+    /// exception is `PAYMENT_PROCESSING_UNAVAILABLE`, which is temporary: the
+    /// client already retried it with the same key
+    /// ([`ClientBuilder::max_retries`](crate::ClientBuilder::max_retries)).
     Refusal {
         /// The machine-readable reason, e.g. `PAYMENT_PROCESSING_UNAVAILABLE`.
         code: String,
@@ -816,9 +816,10 @@ impl Error {
 
     /// True only for [`Error::Transport`], the one kind that is safe to retry
     /// blindly - and only with the SAME idempotency key.
-    /// [`create_checkout_session_with_retry`](crate::Client::create_checkout_session_with_retry)
-    /// does exactly that, and also retries the `PAYMENT_PROCESSING_UNAVAILABLE`
-    /// refusal, which this answers false for. False for [`Error::Charge`] even on a 503: those
+    /// The client already does that on every call that is safe to replay
+    /// ([`ClientBuilder::max_retries`](crate::ClientBuilder::max_retries)), so
+    /// this error means the retries ran out. The client also retries the
+    /// `PAYMENT_PROCESSING_UNAVAILABLE` refusal, which this answers false for. False for [`Error::Charge`] even on a 503: those
     /// codes each carry their own advice, and `CHARGE_OUTCOME_UNKNOWN` must be
     /// polled, never resent.
     pub fn is_retryable(&self) -> bool {

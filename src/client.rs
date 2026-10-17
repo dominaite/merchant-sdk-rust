@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::error::{session_error_code, Error, Result};
+use crate::error::{charge_error_code, session_error_code, transient_error_code, Error, Result};
 use crate::signing::{sign_request, SignRequest};
 use crate::types::{
     Agreement, AgreementRequest, ChargeRequest, CheckoutSession, CheckoutSessionRequest,
@@ -75,12 +75,15 @@ const RUSTC_VERSION: &str = env!("DOMINAITE_RUSTC_VERSION");
 /// does not turn a cold start into a false transport failure.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// How [`Client::create_checkout_session_with_retry`] backs off.
+/// How the deprecated [`Client::create_checkout_session_with_retry`] backs off.
+/// Use [`ClientBuilder::max_retries`] instead: every call that is safe to
+/// replay is retried for you.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryOptions {
     /// Total attempts including the first. Defaults to 3.
     pub attempts: u32,
-    /// The wait before the first retry; it doubles each attempt. Defaults to 500ms.
+    /// The ceiling of the first retry's wait; it doubles on each retry, up to
+    /// 8 seconds. Defaults to 500ms.
     pub base_delay: Duration,
 }
 
@@ -93,6 +96,22 @@ impl Default for RetryOptions {
     }
 }
 
+/// How many times a call that is safe to replay is retried by default.
+const DEFAULT_MAX_RETRIES: u32 = 2;
+
+/// The ceiling of the first retry's wait. It doubles on each retry after that.
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+
+/// No retry waits longer than this.
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(8);
+
+/// How many times one call is retried, and the first wait's ceiling.
+#[derive(Debug, Clone, Copy)]
+struct RetryPolicy {
+    max_retries: u32,
+    base_delay: Duration,
+}
+
 /// What every `Debug` in this crate prints instead of the API secret.
 pub(crate) const REDACTED_SECRET: &str = "dms_***redacted***";
 
@@ -101,6 +120,12 @@ const HOOK_SET: &str = "<fn>";
 
 /// A warning or debug sink. Shared, so a clone of the client keeps it.
 type Sink = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// The wait between two attempts, injectable for tests.
+type Sleeper = Arc<dyn Fn(Duration) + Send + Sync>;
+
+/// The random number in `[0, 1)` behind the retry jitter, injectable for tests.
+type Random = Arc<dyn Fn() -> f64 + Send + Sync>;
 
 /// The response header that tells an old SDK version to upgrade.
 const NOTICE_HEADER: &str = "dominaite-sdk-notice";
@@ -134,6 +159,9 @@ pub struct ClientBuilder {
     agent: Option<ureq::Agent>,
     on_warning: Option<Sink>,
     on_debug: Option<Sink>,
+    max_retries: u32,
+    retry_sleep: Option<Sleeper>,
+    retry_random: Option<Random>,
 }
 
 /// Hand-written so a debug-logged builder cannot leak the secret. A derived one
@@ -149,6 +177,12 @@ impl fmt::Debug for ClientBuilder {
             .field("agent", &self.agent)
             .field("on_warning", &self.on_warning.as_ref().map(|_| HOOK_SET))
             .field("on_debug", &self.on_debug.as_ref().map(|_| HOOK_SET))
+            .field("max_retries", &self.max_retries)
+            .field("retry_sleep", &self.retry_sleep.as_ref().map(|_| HOOK_SET))
+            .field(
+                "retry_random",
+                &self.retry_random.as_ref().map(|_| HOOK_SET),
+            )
             .finish()
     }
 }
@@ -169,11 +203,53 @@ impl ClientBuilder {
         self
     }
 
-    /// Sets the per-request timeout. Defaults to 45 seconds. Ignored when you
-    /// supply your own [`ClientBuilder::agent`]; set the timeout on that agent's
-    /// config instead.
+    /// Sets the timeout of one attempt. Defaults to 45 seconds. Ignored when
+    /// you supply your own [`ClientBuilder::agent`]; set the timeout on that
+    /// agent's config instead.
+    ///
+    /// The timeout applies to each attempt, not to the whole call. With
+    /// retries on, one call can take up to (max retries + 1) x timeout, plus
+    /// the waits between attempts. See [`ClientBuilder::max_retries`].
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Sets how many times the client retries a call that is safe to replay.
+    /// Defaults to 2, so one call sends at most 3 requests. 0 turns retries
+    /// off.
+    ///
+    /// Safe to replay means every GET and every POST that carries an
+    /// idempotency key, except [`Client::create_webhook_endpoint`]. Every
+    /// attempt sends the same key and the same body, so a request that did
+    /// land is replayed, never repeated. PATCH and DELETE are never retried.
+    ///
+    /// The client retries a transport failure, a 5xx, and
+    /// `PAYMENT_PROCESSING_UNAVAILABLE` in both its forms (the 503 and the
+    /// checkout's HTTP 200 refusal). It never retries a 429: wait out
+    /// [`Error::RateLimited`]'s `retry_after_seconds` yourself. A charge that
+    /// answers `CHARGE_OUTCOME_UNKNOWN` or `CHARGE_FAILED` is not retried
+    /// either: read the charge back instead.
+    ///
+    /// Before retry n (counted from 0), the client waits a random time between
+    /// 0 and min(8 s, 500 ms x 2^n). Each retry goes to
+    /// [`ClientBuilder::on_warning`].
+    pub fn max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
+    /// Replaces the wait between two attempts. Defaults to
+    /// [`std::thread::sleep`]. Useful in tests, and to record or cap the waits.
+    pub fn retry_sleep(mut self, sleep: impl Fn(Duration) + Send + Sync + 'static) -> Self {
+        self.retry_sleep = Some(Arc::new(sleep));
+        self
+    }
+
+    /// Replaces the random number behind the retry jitter. Return a value in
+    /// `[0, 1)`; the client clamps anything outside it. Useful in tests.
+    pub fn retry_random(mut self, random: impl Fn() -> f64 + Send + Sync + 'static) -> Self {
+        self.retry_random = Some(Arc::new(random));
         self
     }
 
@@ -192,9 +268,8 @@ impl ClientBuilder {
     }
 
     /// Receives the SDK's warnings, one line each: a `Dominaite-Sdk-Notice`
-    /// from the API (your SDK version is deprecated), a retry in
-    /// [`Client::create_checkout_session_with_retry`], and a ping clock skew
-    /// over 60 seconds.
+    /// from the API (your SDK version is deprecated), a retry (see
+    /// [`ClientBuilder::max_retries`]), and a ping clock skew over 60 seconds.
     ///
     /// Without it, warnings go nowhere: a library must not write to your
     /// stderr. Forward them to your logger, for example
@@ -295,9 +370,15 @@ impl ClientBuilder {
             base_url,
             user_agent,
             agent,
+            retry: RetryPolicy {
+                max_retries: self.max_retries,
+                base_delay: RETRY_BASE_DELAY,
+            },
             hooks: Hooks {
                 on_warning: self.on_warning,
                 on_debug: self.on_debug,
+                retry_sleep: self.retry_sleep,
+                retry_random: self.retry_random,
                 seen_notices: Arc::new(Mutex::new(Vec::new())),
             },
         })
@@ -318,15 +399,18 @@ pub struct Client {
     base_url: String,
     user_agent: String,
     agent: ureq::Agent,
+    retry: RetryPolicy,
     hooks: Hooks,
 }
 
-/// The warning and debug sinks of one client, and the notices it already
-/// warned about.
+/// The warning and debug sinks of one client, its retry clock and dice, and
+/// the notices it already warned about.
 #[derive(Clone)]
 struct Hooks {
     on_warning: Option<Sink>,
     on_debug: Option<Sink>,
+    retry_sleep: Option<Sleeper>,
+    retry_random: Option<Random>,
     seen_notices: Arc<Mutex<Vec<String>>>,
 }
 
@@ -352,6 +436,7 @@ impl fmt::Debug for Client {
                 &self.hooks.on_warning.as_ref().map(|_| HOOK_SET),
             )
             .field("on_debug", &self.hooks.on_debug.as_ref().map(|_| HOOK_SET))
+            .field("max_retries", &self.retry.max_retries)
             .finish()
     }
 }
@@ -382,6 +467,9 @@ impl Client {
             agent: None,
             on_warning: None,
             on_debug: None,
+            max_retries: DEFAULT_MAX_RETRIES,
+            retry_sleep: None,
+            retry_random: None,
         }
     }
 
@@ -474,14 +562,24 @@ impl Client {
     ///   and `code`. The storefront codes arrive here, e.g. a 409 with
     ///   [`session_error_code::STOREFRONT_NOT_WHITELISTED`](crate::session_error_code::STOREFRONT_NOT_WHITELISTED).
     /// - [`Error::Transport`]: network failure or 5xx. Safe to retry WITH the same
-    ///   idempotency key, which is what [`Client::create_checkout_session_with_retry`]
-    ///   does.
+    ///   idempotency key, which the client already did
+    ///   ([`ClientBuilder::max_retries`]) before it returned this.
     pub fn create_checkout_session(
         &self,
         request: &CheckoutSessionRequest,
     ) -> Result<CheckoutSession> {
+        self.checkout_session(request, self.retry)
+    }
+
+    /// [`Client::create_checkout_session`] under `policy`.
+    fn checkout_session(
+        &self,
+        request: &CheckoutSessionRequest,
+        policy: RetryPolicy,
+    ) -> Result<CheckoutSession> {
         let (idempotency_key, body) = prepare_session_request(request)?;
-        let reply = self.request_reply("POST", SESSIONS_PATH, "", &body, &idempotency_key)?;
+        let reply =
+            self.request_reply_with(policy, "POST", SESSIONS_PATH, "", &body, &idempotency_key)?;
         let payload = reply.payload();
 
         // Create is the nested shape: an inner `success` next to `checkout`.
@@ -524,15 +622,14 @@ impl Client {
         }
     }
 
-    /// Creates a session, retrying [`Error::Transport`] and the
-    /// `PAYMENT_PROCESSING_UNAVAILABLE` refusal, with THE SAME idempotency key
-    /// across every attempt.
+    /// Creates a session with its own retry settings, with THE SAME
+    /// idempotency key across every attempt.
     ///
-    /// Reusing the key is what makes the retry safe. A transport failure leaves
-    /// you not knowing whether the request landed; a key the API has already seen
-    /// never opens a second session. Every attempt sends the request's own key,
-    /// never a fresh one: a new key per attempt would be exactly the
-    /// double-charge bug this method exists to prevent.
+    /// Deprecated: [`Client::create_checkout_session`] now retries on its own
+    /// under [`ClientBuilder::max_retries`], with the same rules. This wrapper
+    /// runs that same retry loop with `options.attempts - 1` retries and
+    /// `options.base_delay` as the first wait's ceiling, whatever the client's
+    /// own setting. The waits are now jittered and capped at 8 seconds.
     ///
     /// When the first attempt did land, the retry is a replay. A clean replay of
     /// a session that is still open returns the ORIGINAL session, with the same
@@ -543,12 +640,10 @@ impl Client {
     /// and `DUPLICATE_REQUEST` means the open session cannot be handed back just
     /// yet. When the refusal names a transaction id, read it back with
     /// [`Client::get_status`] to find out what the earlier attempt did.
-    ///
-    /// `PAYMENT_PROCESSING_UNAVAILABLE` is retried in both of its forms: a 503
-    /// (already a transport error) and the HTTP 200 refusal. Card payments being
-    /// off is temporary, and nothing was created, so the same key is safe.
-    /// Every other refusal, and every authentication failure, is returned
-    /// immediately. They will not change on a retry.
+    #[deprecated(
+        since = "0.7.0",
+        note = "create_checkout_session retries on its own; set ClientBuilder::max_retries"
+    )]
     pub fn create_checkout_session_with_retry(
         &self,
         request: &CheckoutSessionRequest,
@@ -557,28 +652,11 @@ impl Client {
         if options.attempts < 1 {
             return Err(Error::validation("attempts must be at least 1"));
         }
-
-        let mut last_error = None;
-        for attempt in 0..options.attempts {
-            match self.create_checkout_session(request) {
-                Ok(session) => return Ok(session),
-                Err(error) if error.is_retryable() || is_processing_unavailable(&error) => {
-                    if attempt + 1 < options.attempts {
-                        self.warn(&format!(
-                            "dominaite-rust: retrying create_checkout_session_with_retry after {} (attempt {} of {})",
-                            retry_reason(&error),
-                            attempt + 2,
-                            options.attempts
-                        ));
-                        std::thread::sleep(options.base_delay * 2u32.pow(attempt.min(16)));
-                    }
-                    last_error = Some(error);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| Error::transport("Retrying gave up", None)))
+        let policy = RetryPolicy {
+            max_retries: options.attempts - 1,
+            base_delay: options.base_delay,
+        };
+        self.checkout_session(request, policy)
     }
 
     /// Reads the payment status of one of your checkout sessions.
@@ -1180,11 +1258,107 @@ impl Client {
         body: &str,
         idempotency_key: &str,
     ) -> Result<Reply> {
-        let reply = self.send(method, path, query, body, idempotency_key)?;
+        let policy = self.policy_for(method, path, idempotency_key);
+        self.request_reply_with(policy, method, path, query, body, idempotency_key)
+    }
+
+    /// [`Client::request_reply`] under `policy`.
+    fn request_reply_with(
+        &self,
+        policy: RetryPolicy,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &str,
+        idempotency_key: &str,
+    ) -> Result<Reply> {
+        let reply = self.send_with(policy, method, path, query, body, idempotency_key)?;
         if reply.status >= 400 {
             return Err(reply.rejection());
         }
         Ok(reply)
+    }
+
+    /// The client's retry policy when the call is safe to replay, else none.
+    ///
+    /// Safe means a GET, or a POST with an idempotency key: the API answers a
+    /// key it has seen with the first answer. Webhook endpoint create is the
+    /// exception. A replayed create can register a second endpoint, which
+    /// then delivers every event twice.
+    fn policy_for(&self, method: &str, path: &str, idempotency_key: &str) -> RetryPolicy {
+        let replayable = method == "GET"
+            || (method == "POST" && !idempotency_key.is_empty() && path != WEBHOOKS_PATH);
+        RetryPolicy {
+            max_retries: if replayable {
+                self.retry.max_retries
+            } else {
+                0
+            },
+            ..self.retry
+        }
+    }
+
+    /// [`Client::send`] under the client's policy for this call.
+    fn send(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &str,
+        idempotency_key: &str,
+    ) -> Result<Reply> {
+        let policy = self.policy_for(method, path, idempotency_key);
+        self.send_with(policy, method, path, query, body, idempotency_key)
+    }
+
+    /// Sends the call, and again while the answer is worth retrying and
+    /// `policy` allows. Every attempt is signed afresh over the same method,
+    /// path, idempotency key and body; only the timestamp moves. Returns the
+    /// last answer, whatever it is.
+    fn send_with(
+        &self,
+        policy: RetryPolicy,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &str,
+        idempotency_key: &str,
+    ) -> Result<Reply> {
+        let mut retry = 0;
+        loop {
+            let result = self.send_once(method, path, query, body, idempotency_key);
+            let reason = match &result {
+                Ok(reply) => reply_retry_reason(reply),
+                Err(error @ Error::Transport { .. }) => Some(retry_reason(error)),
+                Err(_) => None,
+            };
+            match reason {
+                Some(reason) if retry < policy.max_retries => {
+                    self.warn(&format!(
+                        "dominaite-rust: retrying {method} {path} after {reason} (attempt {} of {})",
+                        retry + 2,
+                        policy.max_retries + 1
+                    ));
+                    self.pause(retry, policy.base_delay);
+                    retry += 1;
+                }
+                _ => return result,
+            }
+        }
+    }
+
+    /// Waits before retry `retry` (counted from 0): full jitter under a
+    /// doubling ceiling.
+    fn pause(&self, retry: u32, base_delay: Duration) {
+        let random = match &self.hooks.retry_random {
+            Some(random) => random(),
+            None => default_random(),
+        };
+        let delay = backoff_delay(retry, base_delay, random);
+        match &self.hooks.retry_sleep {
+            Some(sleep) => sleep(delay),
+            None => std::thread::sleep(delay),
+        }
     }
 
     /// Signs and sends one call, and parses whatever came back into a [`Reply`].
@@ -1194,10 +1368,10 @@ impl Client {
     /// of that kind is a retryable transport error; anything else is an API
     /// error). Every other status comes back as a reply, so the payment method
     /// routes can read a 402 decline or a coded 502 as the typed answers they
-    /// are, while [`Client::request`] rejects them generically.
+    /// are, while [`Client::request_reply`] rejects them generically.
     ///
     /// Writes the debug line when [`ClientBuilder::on_debug`] is set.
-    fn send(
+    fn send_once(
         &self,
         method: &str,
         path: &str,
@@ -1371,7 +1545,7 @@ impl Client {
         // host, not from the API, so the body is an HTML error page or empty;
         // reading it as "the API returned a non-JSON response" would make a
         // non-retryable Api error out of what is plainly a retryable outage,
-        // and the with_retry helper would give up on the first attempt. A JSON
+        // and the client's retries would give up on the first attempt. A JSON
         // 5xx is different: that is the gateway itself talking, and the payment
         // method routes need its code.
         let envelope = match serde_json::from_str::<Value>(&raw) {
@@ -1493,15 +1667,6 @@ impl Reply {
         classify_status(self.status, code, message, self.envelope)
             .with_request_id(self.request_id.as_deref())
     }
-}
-
-/// The one refusal the session retry helper sends again: card payments are off
-/// for now and nothing was created, so the same key comes back safely later.
-fn is_processing_unavailable(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::Refusal { code, .. } if code == session_error_code::PAYMENT_PROCESSING_UNAVAILABLE
-    )
 }
 
 /// Whether a coded answer on the charge route is a charge outcome
@@ -2030,6 +2195,53 @@ fn debug_line(
 
 /// Why a retry happens, for the warning: the error code, else the HTTP
 /// status, else the kind of error. Never the message, which may quote a body.
+/// Why an answer is worth sending again, or `None` when it is final: a 5xx,
+/// or `PAYMENT_PROCESSING_UNAVAILABLE` in any form. A charge whose outcome is
+/// unknown or failed is final: it is read back, never resent.
+fn reply_retry_reason(reply: &Reply) -> Option<String> {
+    let code = reply.error_code();
+    if code.as_deref() == Some(transient_error_code::PAYMENT_PROCESSING_UNAVAILABLE) {
+        return code;
+    }
+    if reply.status < 500 {
+        return None;
+    }
+    match code.as_deref() {
+        Some(charge_error_code::CHARGE_OUTCOME_UNKNOWN | charge_error_code::CHARGE_FAILED) => None,
+        Some(code) => Some(code.to_string()),
+        None => Some(format!("HTTP {}", reply.status)),
+    }
+}
+
+/// The wait before retry `retry` (counted from 0): `random` times
+/// min(8 s, base x 2^retry). `random` is clamped to `[0, 1]`.
+fn backoff_delay(retry: u32, base_delay: Duration, random: f64) -> Duration {
+    let ceiling = base_delay
+        .saturating_mul(1u32 << retry.min(16))
+        .min(RETRY_MAX_DELAY);
+    let random = if random.is_finite() {
+        random.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    ceiling.mul_f64(random)
+}
+
+/// A random number in `[0, 1)` for the jitter, without a dependency. Each
+/// `RandomState` is keyed differently, and the clock mixes in the moment. Not
+/// for anything secret.
+fn default_random() -> f64 {
+    use std::hash::{BuildHasher, Hasher};
+
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    hasher.write_u128(nanos);
+    (hasher.finish() >> 11) as f64 / (1u64 << 53) as f64
+}
+
 fn retry_reason(error: &Error) -> String {
     if let Some(code) = error.code() {
         return code.to_string();
