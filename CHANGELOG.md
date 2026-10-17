@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.0
+
+### Breaking
+
+- The base URL is required. The client no longer falls back to production when you leave it
+  out, so an unset environment variable cannot send sandbox credentials to production.
+  Construction fails with `Error::Validation` when the base URL is missing, empty or whitespace.
+  Pass `SANDBOX_BASE_URL` (`https://api.staging.dominaite.com/payments`) or
+  `PRODUCTION_BASE_URL` (`https://api.dominaite.com/payments`), or your own value.
+- `DEFAULT_BASE_URL` is removed. Use `PRODUCTION_BASE_URL`.
+- `Client::new` takes the base URL: `Client::new(key_id, secret, base_url)`. With
+  `Client::builder`, `.base_url(url)` is required before `.build()`.
+
 ## 0.5.2
 
 ### Added
