@@ -519,9 +519,9 @@ session status; `pending` is the one status that is not terminal.
 (`CHARGE_OUTCOME_UNKNOWN`, `CHARGE_FAILED`) or 503 (`PAYMENT_METHOD_CHARGES_DISABLED`,
 `PAYMENT_PROCESSING_UNAVAILABLE`). The variant keeps the status, the code, the message, and the
 charge row when the gateway attached one (always for `CHARGE_OUTCOME_UNKNOWN`, whose
-`transaction_id` is what you poll). A 404 is a method id that is not yours and stays the plain
-`Error::Api` with code `PAYMENT_METHOD_NOT_FOUND`; a 5xx without a gateway code (an HTML page
-from a proxy) stays `Error::Transport`.
+`transaction_id` is what you poll). A coded 404 is a charge error too: `PAYMENT_METHOD_NOT_FOUND`
+is a method id that is not yours, and `AGREEMENT_NOT_FOUND` an agreement id that is not. Any
+other 5xx (an HTML page from a proxy, a 500) stays `Error::Transport`.
 
 `revoke_payment_method` drops the card: the gateway deletes the saved credential at the provider
 and marks the method `revoked`, and any later charge on it is refused with
@@ -868,6 +868,17 @@ fields you do not recognise. A redelivery keeps the `apiVersion` of its first at
 on a `verification.*` event. Webhooks
 spell unset values as explicit `null`; they read as `None`, the same as a missing field.
 
+`event.charge_data()` types `data` on `charge.*` events as `ChargeEventData` (`charge_id`, then
+`transaction_id`, `stored_payment_method_id`, `agreement_id`, `customer_reference`, `outcome`,
+`period_number`, `attempt_number`, `amount`, `currency`, `payment_method` with `brand` and
+`last4`, `order_reference`, `description`, `decline_class`, `decline_code`, `next_attempt_at`,
+`next_charge_at`, `sequence`). `outcome` is one of the `charge_outcome` constants.
+`event.agreement_data()` types `data` on `agreement.*` events as `AgreementEventData` (`id`,
+then `plan_id`, `customer_reference`, `stored_payment_method_id`, `status`, `previous_status`,
+`amount`, `currency`, `interval_unit`, `interval_count`, `period_count`, `trial_days`,
+`next_charge_at`, `activated_at`, `cancelled_at`, `version`, `sequence`). Every field but the id
+is an `Option`. Both return `None` on other event types.
+
 `payment.succeeded` (and `payment.requires_capture` for an authorization) can carry
 `data.storedPaymentMethod`, the card the payment kept on file. `stored_payment_method` (also
 `event.stored_payment_method()`) is the same `StoredPaymentMethod` that `get_status` returns
@@ -1096,11 +1107,11 @@ string where there is one.
 | `Error::Refusal { code, .. }` | HTTP 200 with `success: false`. | Branch on `code`. Do not blind-retry. |
 | `Error::Auth { code, .. }` | 401. `code` is `INVALID_API_KEY`, `INVALID_SIGNATURE`, `TIMESTAMP_OUT_OF_RANGE`, or `IP_NOT_ALLOWED`. | Fix the key id, secret, server clock, or allowlist. Never retry-loop. |
 | `Error::Forbidden { code, .. }` | 403. The request was signed correctly, but this key may not do this. `INSUFFICIENT_SCOPE`: the key does not hold the scope the route needs. `VERIFY_ONLY_NOT_ENABLED`: verify-only is not on for your account. | `INSUFFICIENT_SCOPE`: use a key that holds the scope; a key's scopes are fixed when it is issued. `VERIFY_ONLY_NOT_ENABLED`: we switch it on for your account. Never retry-loop. |
-| `Error::Transport { .. }` | Network failure, timeout, or a 5xx without a gateway code, including one whose body is an HTML error page from a proxy. The cause is reachable through `source()`. | Retry with the **same** idempotency key. `error.is_retryable()` is true only here. |
+| `Error::Transport { .. }` | Network failure, timeout, or a 5xx (outside the charge and revoke answers below), including one whose body is an HTML error page from a proxy. `code()` keeps the gateway code when it sent one, e.g. `MERCHANT_API_UNAVAILABLE`, and `http_status()` the status. The cause is reachable through `source()`. | Retry with the **same** idempotency key. `error.is_retryable()` is true only here. |
 | `Error::RateLimited { retry_after_seconds, code, .. }` | 429. The platform allows 60 requests per minute per API key and 120 per minute per IP (`code` `RATE_LIMIT_EXCEEDED`). The charge route has two limits of its own: `CHARGE_VELOCITY_EXCEEDED` and `CHARGE_DECLINE_RATE_EXCEEDED` (constants in `dominaite::rate_limit_error_code`). | Wait `retry_after_seconds` (or back off yourself when it is `None`), then send the request again with the **same** idempotency key. Never auto-retried: `is_retryable()` is false. |
-| `Error::Charge { status, code, charge, transaction_id, .. }` | `charge_payment_method` got an error code instead of a charge: 409, 422, 502 or 503. | Branch on `code` (see [Stored payment methods](#stored-payment-methods-recurring)). `CHARGE_OUTCOME_UNKNOWN` carries the `transaction_id` to poll; never retry it under a new key. |
+| `Error::Charge { status, code, charge, transaction_id, .. }` | `charge_payment_method` got an error code instead of a charge: a 4xx other than 400, 401, 403 and 429 (for example 404 `PAYMENT_METHOD_NOT_FOUND`, 409, 422), a 502 or a 503. | Branch on `code` (see [Stored payment methods](#stored-payment-methods-recurring)). `CHARGE_OUTCOME_UNKNOWN` carries the `transaction_id` to poll; never retry it under a new key. |
 | `Error::Revoke { status, code, .. }` | `revoke_payment_method` was refused: 502 `UPSTREAM_CONTRACT_ERROR` or 503 `MERCHANT_API_UNAVAILABLE`. Nothing changed. | Retry later on 503; contact support on 502. |
-| `Error::Api { status, code, .. }` | Any other rejecting or unexpected response. `code` carries the API's machine-readable reason when it sent one, e.g. `IDEMPOTENCY_KEY_REQUIRED` on a 400, `STOREFRONT_NOT_WHITELISTED` on a 409, `PAYMENT_METHOD_NOT_FOUND` on a charge 404, and every refund code (see [Refunds](#refunds)). | Inspect `status` and `code`. `raw` keeps the whole envelope, with `error.validationErrors` and `error.params`. A 404 from `get_status` is an unknown transaction id. |
+| `Error::Api { status, code, .. }` | Any other rejecting or unexpected response. `code` carries the API's machine-readable reason when it sent one, e.g. `IDEMPOTENCY_KEY_REQUIRED` on a 400, `STOREFRONT_NOT_WHITELISTED` on a 409, and every refund code (see [Refunds](#refunds)). | Inspect `status` and `code`. `raw` keeps the whole envelope, with `error.validationErrors` and `error.params`. A 404 from `get_status` is an unknown transaction id. |
 | `Error::Validation { .. }` | Bad arguments (non-positive amount, missing field, malformed key id). | Fix the call; nothing was sent. |
 
 Refusal codes on `Error::Refusal`:
@@ -1123,7 +1134,8 @@ Every refusal code is a constant in `dominaite::session_error_code` (`REFUSALS` 
 A subscription session (one with an `agreement_id`) has refusal codes of its own, for example
 `AGREEMENT_NOT_PENDING`, `AGREEMENT_SESSION_OPEN` or `SUBSCRIPTIONS_NOT_ENABLED`. They also
 arrive as `Error::Refusal`, and nothing was created. The integration contract lists them under
-`recurring.subscriptionSessionOutcomes`. They have no constants: compare the code as a string.
+`recurring.subscriptionSessionOutcomes`. Their constants are in `dominaite::session_error_code`
+too, and `REFUSALS` lists them after the five above.
 
 ### Storefront errors
 
@@ -1135,7 +1147,7 @@ storefront cannot take payments, session creation fails with a real HTTP status 
 |---|---|---|
 | `STOREFRONT_NOT_WHITELISTED` | 409 | The site's domain is not whitelisted with the payment provider yet. |
 | `STOREFRONT_INACTIVE` | 409 | The storefront was deactivated or deleted. |
-| `STOREFRONT_MISMATCH` | 400 | The API key is bound to one storefront and the request named another. |
+| `STOREFRONT_MISMATCH` | 400, or 200 on a replay | The API key is bound to one storefront and the request named another. A replay of the same key can answer it as an HTTP 200 refusal; it still arrives as `Error::Api`, with `status` 200. |
 
 None of them fixes itself on a retry, and none is a code bug on your side: the fix is in the
 Dominaite backoffice or onboarding. Show the customer "payments are unavailable" and alert your
