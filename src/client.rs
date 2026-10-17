@@ -66,6 +66,9 @@ pub const TRANSACTIONS_PATH: &str = "/merchant-api/transactions";
 /// This SDK's version, reported in the User-Agent.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The compiler version, from `build.rs`, reported in the User-Agent.
+const RUSTC_VERSION: &str = env!("DOMINAITE_RUSTC_VERSION");
+
 /// Serverless cold starts hit 10+ seconds outside prod, so 45s is the floor that
 /// does not turn a cold start into a false transport failure.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(45);
@@ -144,7 +147,11 @@ impl ClientBuilder {
     }
 
     /// Appends your own identifier to the SDK's User-Agent, which helps when
-    /// Dominaite support reads the access logs for your integration.
+    /// Dominaite support reads the access logs for your integration. The
+    /// User-Agent is `dominaite-rust/<version> (rust <rustc version>)`, then a
+    /// space and this suffix. Whitespace is trimmed and a blank value is
+    /// ignored. [`ClientBuilder::build`] rejects a suffix with a control
+    /// character with [`Error::Validation`].
     pub fn user_agent(mut self, user_agent: impl Into<String>) -> Self {
         let value = user_agent.into();
         if !value.trim().is_empty() {
@@ -190,8 +197,15 @@ impl ClientBuilder {
             return Err(Error::validation(problem));
         }
 
-        let mut user_agent = format!("dominaite-rust/{VERSION}");
+        let mut user_agent = format!("dominaite-rust/{VERSION} (rust {RUSTC_VERSION})");
         if let Some(extra) = self.user_agent {
+            // Checked before the trim, so a stray "\n" is a bug you hear about,
+            // not one that is quietly cut off.
+            if extra.chars().any(char::is_control) {
+                return Err(Error::validation(
+                    "user_agent must not contain control characters",
+                ));
+            }
             user_agent.push(' ');
             user_agent.push_str(extra.trim());
         }
@@ -280,6 +294,12 @@ impl Client {
     /// The base URL this client is pointed at.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// The User-Agent this client sends:
+    /// `dominaite-rust/<version> (rust <rustc version>)`, then your suffix.
+    pub fn user_agent(&self) -> &str {
+        &self.user_agent
     }
 
     /// Verifies your credentials, your signing, and your clock without creating
