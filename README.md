@@ -261,7 +261,9 @@ signing; a 503 means retry later. Never both at once.
 | Method | What |
 |---|---|
 | `.base_url(url)` | Required. `dominaite::SANDBOX_BASE_URL` (`https://api.staging.dominaite.com/payments`), `dominaite::PRODUCTION_BASE_URL` (`https://api.dominaite.com/payments`) or your own `https://` value. `.build()` returns `Error::Validation` when it is missing, empty or whitespace-only. |
-| `.timeout(d)` | Per-request timeout. Defaults to 45s (serverless cold starts can take 10+s). |
+| `.timeout(d)` | Timeout of one attempt. Defaults to 45s (serverless cold starts can take 10+s). With retries on, one call can take up to (max retries + 1) x timeout, plus the waits between attempts. |
+| `.max_retries(n)` | How many times a call that is safe to replay is retried. Defaults to 2; 0 turns retries off. See [Retries and double-charges](#retries-and-double-charges). |
+| `.retry_sleep(f)` / `.retry_random(f)` | Replace the wait between attempts (default `std::thread::sleep`) and the random number in `[0, 1)` behind the jitter. For tests. |
 | `.agent(a)` | Your own `ureq::Agent`: proxy-aware transport, custom TLS, a test double. Replaces `.timeout(d)`. Redirects stay off regardless of how the agent is configured: the SDK forces `max_redirects(0)` on every request, so signed headers never cross to another host. |
 | `.user_agent(s)` | Appends your identifier to the SDK's User-Agent, which helps when support reads the access logs. The User-Agent is `dominaite-rust/<version> (rust <rustc version>)`, then a space and your suffix. A suffix with a control character fails `.build()` with `Error::Validation`. |
 | `.on_warning(f)` | Receives the SDK's warnings. See [Logging and warnings](#logging-and-warnings). |
@@ -283,13 +285,15 @@ let client = dominaite::Client::builder(key_id, secret)
 ```
 
 - `.on_warning(f)` gets three kinds of warning: a `Dominaite-Sdk-Notice` from the API, a retry
-  in `create_checkout_session_with_retry`, and a ping clock skew over 60 seconds. Without the
+  (`dominaite-rust: retrying POST /merchant-api/checkout/sessions after HTTP 503 (attempt 2 of 3)`),
+  and a ping clock skew over 60 seconds. Without the
   hook, warnings go nowhere, because a library must not write to your stderr. Forward them to
   your logger.
 - `.on_debug(f)` is off by default. With it, every HTTP request writes one line: the method,
   the signed path without the query string, the HTTP status (`error` when nothing came back),
-  the time in milliseconds, the `Dominaite-Request-Id` the API answered with, and the
-  idempotency key when the request sent one:
+  the time in milliseconds, the request id the API answered with (the `Dominaite-Request-Id`
+  header, else `metadata.requestId` in the body), and the idempotency key when the request
+  sent one. A retried call writes one line per attempt:
   `dominaite-rust: POST /merchant-api/checkout/sessions 201 84ms request_id=<id> idempotency_key=<key>`.
   Give the request id to Dominaite support to find the call.
 - No line ever holds the secret, the signature, a cashier token, a request or response body,
@@ -369,20 +373,42 @@ What a replayed key gets back depends on where the first attempt is:
 When a refusal names a transaction id, read it back with `get_status` to find out what the
 earlier attempt did; see [Recovering from a replay refusal](#recovering-from-a-replay-refusal).
 
-`create_checkout_session_with_retry` does that for you: it sends the request's key on every
-attempt, retrying `Error::Transport` (network failures and 5xx, including
-`MERCHANT_API_UNAVAILABLE`) and `PAYMENT_PROCESSING_UNAVAILABLE` in both its forms, the 503 and
-the HTTP 200 refusal. Other refusals and authentication failures are not retried - they will
-not change.
+### The client retries for you
+
+The client retries a call that is safe to replay, with one policy for every route:
+
+- **Which calls:** every GET, and every POST that carries an idempotency key (checkout session,
+  charge, refund, plan, agreement). Every attempt sends the same key and the same body, so a
+  request that did land is replayed, never repeated. Webhook endpoint create is never retried:
+  a replay could register a second endpoint, which would deliver every event twice. PATCH and
+  DELETE are never retried.
+- **Which answers:** a transport failure (network error, timeout), a 5xx, and
+  `PAYMENT_PROCESSING_UNAVAILABLE` in both its forms (the 503 and the checkout's HTTP 200
+  refusal). Never a 429: the client returns `Error::RateLimited` with `retry_after_seconds` at
+  once. Never a refusal, a 4xx or an authentication failure: they will not change. A charge
+  that answers `CHARGE_OUTCOME_UNKNOWN` or `CHARGE_FAILED` is not resent either; read the
+  charge back instead.
+- **How often:** `.max_retries(n)` on the builder, default 2, so one call sends at most 3
+  requests. `.max_retries(0)` turns retries off.
+- **How long:** before retry n (counted from 0), the client waits a random time between 0 and
+  min(8 s, 500 ms x 2^n). Each retry goes to the `.on_warning(f)` hook.
+- **Timeout:** `.timeout(d)` applies to each attempt, not to the whole call. One call can take
+  up to (max retries + 1) x timeout, plus the waits. With the defaults that is 3 x 45 s plus up
+  to 1.5 s.
+
+When an error comes back, the retries already ran out. Retry later yourself, always with the
+**same** idempotency key.
 
 ```rust
-use dominaite::RetryOptions;
-
-let session = client.create_checkout_session_with_retry(
-    &request,
-    RetryOptions::default(), // 3 attempts, 500ms base delay, doubling
-)?;
+let client = dominaite::Client::builder(key_id, secret)
+    .base_url(dominaite::SANDBOX_BASE_URL)
+    .max_retries(3)
+    .build()?;
 ```
+
+`create_checkout_session_with_retry` is deprecated. `create_checkout_session` now retries on its
+own under the same rules. The wrapper still works: it runs the same loop with `attempts - 1`
+retries and its own `base_delay`, whatever `.max_retries(n)` says.
 
 ## Sessions expire
 
@@ -521,7 +547,9 @@ session status; `pending` is the one status that is not terminal.
 charge row when the gateway attached one (always for `CHARGE_OUTCOME_UNKNOWN`, whose
 `transaction_id` is what you poll). A coded 404 is a charge error too: `PAYMENT_METHOD_NOT_FOUND`
 is a method id that is not yours, and `AGREEMENT_NOT_FOUND` an agreement id that is not. Any
-other 5xx (an HTML page from a proxy, a 500) stays `Error::Transport`.
+other 5xx (an HTML page from a proxy, a 500) stays `Error::Transport`. The client retries a
+charge after a transport failure, a 5xx or `PAYMENT_PROCESSING_UNAVAILABLE`, with the same key;
+it never resends `CHARGE_OUTCOME_UNKNOWN` or `CHARGE_FAILED`.
 
 `revoke_payment_method` drops the card: the gateway deletes the saved credential at the provider
 and marks the method `revoked`, and any later charge on it is refused with
@@ -1102,12 +1130,18 @@ Every call returns `Result<T, dominaite::Error>`. `Error` is an enum implementin
 `std::error::Error`; match on the variant, and read `error.code()` for the machine-readable
 string where there is one.
 
+Every error the API answered carries a request id: `error.request_id()`. Every result type
+carries it too, in its `request_id` field. It is the `Dominaite-Request-Id` response header,
+else `metadata.requestId` in the body. Give it to Dominaite support to find the call. It is
+`None` on `Error::Validation`, which never reached the network, when no answer came back, and
+on the calls that return `()` (the DELETE routes).
+
 | Variant | When | What to do |
 |---|---|---|
 | `Error::Refusal { code, .. }` | HTTP 200 with `success: false`. | Branch on `code`. Do not blind-retry. |
 | `Error::Auth { code, .. }` | 401. `code` is `INVALID_API_KEY`, `INVALID_SIGNATURE`, `TIMESTAMP_OUT_OF_RANGE`, or `IP_NOT_ALLOWED`. | Fix the key id, secret, server clock, or allowlist. Never retry-loop. |
 | `Error::Forbidden { code, .. }` | 403. The request was signed correctly, but this key may not do this. `INSUFFICIENT_SCOPE`: the key does not hold the scope the route needs. `VERIFY_ONLY_NOT_ENABLED`: verify-only is not on for your account. | `INSUFFICIENT_SCOPE`: use a key that holds the scope; a key's scopes are fixed when it is issued. `VERIFY_ONLY_NOT_ENABLED`: we switch it on for your account. Never retry-loop. |
-| `Error::Transport { .. }` | Network failure, timeout, or a 5xx (outside the charge and revoke answers below), including one whose body is an HTML error page from a proxy. `code()` keeps the gateway code when it sent one, e.g. `MERCHANT_API_UNAVAILABLE`, and `http_status()` the status. The cause is reachable through `source()`. | Retry with the **same** idempotency key. `error.is_retryable()` is true only here. |
+| `Error::Transport { .. }` | Network failure, timeout, or a 5xx (outside the charge and revoke answers below), including one whose body is an HTML error page from a proxy. `code()` keeps the gateway code when it sent one, e.g. `MERCHANT_API_UNAVAILABLE`, and `http_status()` the status. The cause is reachable through `source()`. | The client already retried it on a call that is safe to replay. Retry later with the **same** idempotency key. `error.is_retryable()` is true only here. |
 | `Error::RateLimited { retry_after_seconds, code, .. }` | 429. The platform allows 60 requests per minute per API key and 120 per minute per IP (`code` `RATE_LIMIT_EXCEEDED`). The charge route has two limits of its own: `CHARGE_VELOCITY_EXCEEDED` and `CHARGE_DECLINE_RATE_EXCEEDED` (constants in `dominaite::rate_limit_error_code`). | Wait `retry_after_seconds` (or back off yourself when it is `None`), then send the request again with the **same** idempotency key. Never auto-retried: `is_retryable()` is false. |
 | `Error::Charge { status, code, charge, transaction_id, .. }` | `charge_payment_method` got an error code instead of a charge: a 4xx other than 400, 401, 403 and 429 (for example 404 `PAYMENT_METHOD_NOT_FOUND`, 409, 422), a 502 or a 503. | Branch on `code` (see [Stored payment methods](#stored-payment-methods-recurring)). `CHARGE_OUTCOME_UNKNOWN` carries the `transaction_id` to poll; never retry it under a new key. |
 | `Error::Revoke { status, code, .. }` | `revoke_payment_method` was refused: 502 `UPSTREAM_CONTRACT_ERROR` or 503 `MERCHANT_API_UNAVAILABLE`. Nothing changed. | Retry later on 503; contact support on 502. |
