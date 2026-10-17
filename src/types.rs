@@ -902,6 +902,22 @@ pub mod charge_status {
     pub const ALL: [&str; 4] = [SUCCEEDED, FAILED, PENDING, CANCELLED];
 }
 
+/// The `outcome` of a `charge.*` webhook,
+/// [`ChargeEventData::outcome`](crate::ChargeEventData::outcome).
+pub mod charge_outcome {
+    /// The charge was approved (`charge.succeeded`).
+    pub const SUCCEEDED: &str = "succeeded";
+    /// The charge was declined softly, and the platform tries again later
+    /// (`charge.retrying`).
+    pub const RETRYING: &str = "retrying";
+    /// The charge was declined, and nothing more is tried for it
+    /// (`charge.failed`).
+    pub const FAILED: &str = "failed";
+
+    /// The whole vocabulary.
+    pub const ALL: [&str; 3] = [SUCCEEDED, RETRYING, FAILED];
+}
+
 /// Decline class wire values, on [`PaymentMethodCharge::decline_class`](crate::PaymentMethodCharge::decline_class)
 /// and [`CheckoutStatus::decline_class`]. Coarse enough to act on without
 /// reading the issuer's code. A value outside this list is a class added after
