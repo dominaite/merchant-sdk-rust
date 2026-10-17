@@ -129,6 +129,14 @@ fn payment_event_types_match_the_gateways_catalog_in_order() {
 }
 
 #[test]
+fn recurring_event_types_match_the_gateways_recurring_events_in_order() {
+    assert_eq!(
+        event_type::RECURRING.to_vec(),
+        strings(&wire()["recurringWebhookEvents"])
+    );
+}
+
+#[test]
 fn the_contract_still_lists_this_sdk() {
     let wire = wire();
     assert!(
