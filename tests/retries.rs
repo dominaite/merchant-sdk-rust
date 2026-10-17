@@ -357,3 +357,19 @@ fn the_largest_max_retries_counts_its_attempts_without_overflow() {
         warnings.all()
     );
 }
+
+#[test]
+fn every_retry_reaches_on_warning() {
+    let server = MockServer::start(vec![unavailable()]);
+    let (client, warnings) = warning_client(&server, 2);
+    client.get_status(TRANSACTION_ID).expect_err("still down");
+    assert_eq!(server.requests().len(), 3);
+    let path = format!("/merchant-api/checkout/sessions/{TRANSACTION_ID}");
+    assert_eq!(
+        warnings.all(),
+        vec![
+            format!("dominaite-rust: retrying GET {path} after MERCHANT_API_UNAVAILABLE (attempt 2 of 3)"),
+            format!("dominaite-rust: retrying GET {path} after MERCHANT_API_UNAVAILABLE (attempt 3 of 3)"),
+        ]
+    );
+}

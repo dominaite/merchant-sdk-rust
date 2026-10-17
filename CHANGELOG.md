@@ -11,6 +11,9 @@
   429. A charge that answers `CHARGE_OUTCOME_UNKNOWN`, `CHARGE_FAILED` or
   `PAYMENT_METHOD_CHARGES_DISABLED` is not retried either. `PAYMENT_METHOD_CHARGES_DISABLED`
   stays until stored-card charges are switched on for your account, which takes hours or days.
+  Every retry, on every route, sends one line to `ClientBuilder::on_warning` before its wait.
+  Without that hook, retries make no output. In 0.6.0 only `create_checkout_session_with_retry`
+  warned.
 - The timeout is per attempt. With retries on, one call can take up to (max retries + 1) x
   timeout, plus the waits between attempts: 3 x 45 s plus up to 1.5 s with the defaults.
 - Every `Error` variant except `Validation` has a new `request_id` field, and
