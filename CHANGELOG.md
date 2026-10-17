@@ -13,6 +13,21 @@
 - `Client::new` takes the base URL: `Client::new(key_id, secret, base_url)`. With
   `Client::builder`, `.base_url(url)` is required before `.build()`.
 
+### Added
+
+- The User-Agent is `dominaite-rust/<version> (rust <rustc version>)`, then a space and your
+  `.user_agent(s)` suffix. A suffix with a control character fails `.build()` with
+  `Error::Validation`.
+- `ClientBuilder::on_warning(f)`: a closure for the SDK's warnings. It gets the
+  `Dominaite-Sdk-Notice` header (once per distinct value, on every status), a retry in
+  `create_checkout_session_with_retry`, and a ping clock skew over 60 seconds. Without it,
+  warnings go nowhere.
+- `ClientBuilder::on_debug(f)`: the debug log, off by default. One line per request with the
+  method, the path, the status, the time in milliseconds, the `Dominaite-Request-Id` and the
+  idempotency key. No line holds the secret, the signature, a cashier token, a body or a query
+  string.
+- `Client::user_agent()` returns the User-Agent the client sends.
+
 ## 0.5.2
 
 ### Added
