@@ -51,6 +51,29 @@ fn client_for(server: &MockServer) -> (Client, Waits) {
     (client, waits)
 }
 
+/// Every warning the client handed to `on_warning`, in order.
+#[derive(Clone, Default)]
+struct Warnings(Arc<Mutex<Vec<String>>>);
+
+impl Warnings {
+    fn all(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// A client on `max_retries` that records its waits and its warnings.
+fn warning_client(server: &MockServer, max_retries: u32) -> (Client, Warnings) {
+    let warnings = Warnings::default();
+    let recorder = warnings.clone();
+    let client = builder(server)
+        .max_retries(max_retries)
+        .retry_sleep(|_| {})
+        .on_warning(move |line| recorder.0.lock().unwrap().push(line.to_string()))
+        .build()
+        .expect("valid credentials");
+    (client, warnings)
+}
+
 fn key(value: &str) -> IdempotencyKey {
     IdempotencyKey::new(value).expect("a valid idempotency key")
 }
@@ -316,4 +339,21 @@ fn the_default_jitter_stays_inside_the_ceiling() {
 
 fn ok(data: &str) -> String {
     format!(r#"{{"success":true,"data":{data},"metadata":{{}}}}"#)
+}
+
+#[test]
+fn the_largest_max_retries_counts_its_attempts_without_overflow() {
+    let server = MockServer::start(vec![Reply::HangUp, Reply::Json(201, ok(CHARGE))]);
+    let (client, warnings) = warning_client(&server, u32::MAX);
+    let charge = client
+        .charge_payment_method(PAYMENT_METHOD_ID, &charge_request())
+        .expect("the retry lands");
+    assert_eq!(charge.status, "succeeded");
+    assert_eq!(server.requests().len(), 2);
+    assert_eq!(warnings.all().len(), 1);
+    assert!(
+        warnings.all()[0].ends_with(&format!("(attempt 2 of {})", u32::MAX)),
+        "{:?}",
+        warnings.all()
+    );
 }

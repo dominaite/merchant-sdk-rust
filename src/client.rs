@@ -1340,8 +1340,8 @@ impl Client {
                 Some(reason) if retry < policy.max_retries => {
                     self.warn(&format!(
                         "dominaite-rust: retrying {method} {path} after {reason} (attempt {} of {})",
-                        retry + 2,
-                        policy.max_retries + 1
+                        retry.saturating_add(2),
+                        policy.max_retries.saturating_add(1)
                     ));
                     self.pause(retry, policy.base_delay);
                     retry += 1;
