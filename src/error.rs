@@ -45,7 +45,10 @@ pub mod session_error_code {
     /// location) this key or request points at was deactivated or deleted.
     pub const STOREFRONT_INACTIVE: &str = "STOREFRONT_INACTIVE";
     /// HTTP 400, [`Error::Api`](crate::Error::Api): the API key is bound to one
-    /// storefront and the request named a different one.
+    /// storefront and the request named a different one. When the idempotency
+    /// key already opened a session, the API answers it as an HTTP 200 refusal
+    /// instead; it still arrives as [`Error::Api`](crate::Error::Api), with
+    /// status 200.
     pub const STOREFRONT_MISMATCH: &str = "STOREFRONT_MISMATCH";
 
     /// HTTP 200 refusal: card payments are off right now; retry later with the
@@ -67,16 +70,56 @@ pub mod session_error_code {
     /// HTTP 200 refusal: the earlier attempt with this key failed, was
     /// cancelled or was abandoned. The key is spent; use a fresh one.
     pub const PRIOR_ATTEMPT_FAILED: &str = "PRIOR_ATTEMPT_FAILED";
+    /// HTTP 400, [`Error::Api`](crate::Error::Api): the Idempotency-Key header
+    /// is missing or longer than 100 characters. It is part of the signed
+    /// payload.
+    pub const IDEMPOTENCY_KEY_REQUIRED: &str = "IDEMPOTENCY_KEY_REQUIRED";
 
-    /// The business refusal codes, in the order the canonical contract lists
-    /// them. An unlisted code still arrives as
-    /// [`Error::Refusal`](crate::Error::Refusal).
-    pub const REFUSALS: [&str; 5] = [
+    /// HTTP 200 refusal, subscription session: no agreement with this
+    /// `agreement_id` under your account. The `agr_` handle is case-sensitive.
+    pub const AGREEMENT_NOT_FOUND: &str = "AGREEMENT_NOT_FOUND";
+    /// HTTP 200 refusal, subscription session: the agreement is already
+    /// active, cancelled, completed or failed, so there is no first payment
+    /// left to take.
+    pub const AGREEMENT_NOT_PENDING: &str = "AGREEMENT_NOT_PENDING";
+    /// HTTP 200 refusal, subscription session: the amount or the currency
+    /// differs from the agreement's own.
+    pub const AGREEMENT_AMOUNT_MISMATCH: &str = "AGREEMENT_AMOUNT_MISMATCH";
+    /// HTTP 200 refusal, subscription session: neither the request nor the
+    /// agreement carries consent. Send `consent` on the session.
+    pub const AGREEMENT_CONSENT_REQUIRED: &str = "AGREEMENT_CONSENT_REQUIRED";
+    /// HTTP 200 refusal, subscription session: a session for this agreement
+    /// is already open. The refusal's `transaction_id` names it.
+    pub const AGREEMENT_SESSION_OPEN: &str = "AGREEMENT_SESSION_OPEN";
+    /// HTTP 200 refusal, subscription session: the session of this agreement
+    /// was already paid and the agreement is still pending. Read the status of
+    /// the refusal's `transaction_id`.
+    pub const AGREEMENT_ALREADY_PAID: &str = "AGREEMENT_ALREADY_PAID";
+    /// HTTP 200 refusal, subscription session: the agreement has a
+    /// `max_amount_per_period`, and a session can only take a fixed amount.
+    pub const AGREEMENT_VARIABLE_AMOUNT_UNSUPPORTED: &str = "AGREEMENT_VARIABLE_AMOUNT_UNSUPPORTED";
+    /// HTTP 200 refusal, subscription session: subscriptions are not switched
+    /// on for your account yet. Nothing was created.
+    pub const SUBSCRIPTIONS_NOT_ENABLED: &str = "SUBSCRIPTIONS_NOT_ENABLED";
+
+    /// The business refusal codes. Each arrives as
+    /// [`Error::Refusal`](crate::Error::Refusal), and so does an unlisted
+    /// code. The first five are the replay and availability codes; the rest
+    /// belong to subscription sessions.
+    pub const REFUSALS: [&str; 13] = [
         PAYMENT_PROCESSING_UNAVAILABLE,
         DUPLICATE_REQUEST,
         ALREADY_PROCESSED,
         IDEMPOTENCY_KEY_REUSED,
         PRIOR_ATTEMPT_FAILED,
+        AGREEMENT_NOT_FOUND,
+        AGREEMENT_NOT_PENDING,
+        AGREEMENT_AMOUNT_MISMATCH,
+        AGREEMENT_CONSENT_REQUIRED,
+        AGREEMENT_SESSION_OPEN,
+        AGREEMENT_ALREADY_PAID,
+        AGREEMENT_VARIABLE_AMOUNT_UNSUPPORTED,
+        SUBSCRIPTIONS_NOT_ENABLED,
     ];
 
     /// The storefront codes, in the order the canonical contract lists them.
@@ -94,14 +137,55 @@ pub mod session_error_code {
 /// (HTTP 402) is deliberately not one of them: a decline is a charge result with
 /// status `failed`, not an error.
 pub mod charge_error_code {
-    /// HTTP 409: the method is revoked or expired; ask the customer for another
-    /// card via a hosted session with `save_card`.
+    /// HTTP 409: the method is revoked, expired or retired; ask the customer
+    /// for another card via a hosted session with `save_card`.
     pub const PAYMENT_METHOD_NOT_ACTIVE: &str = "PAYMENT_METHOD_NOT_ACTIVE";
+    /// HTTP 404: no stored payment method with this id under your account.
+    /// Nothing was charged.
+    pub const PAYMENT_METHOD_NOT_FOUND: &str = "PAYMENT_METHOD_NOT_FOUND";
+    /// HTTP 409: another charge on this payment method, sent with a different
+    /// key, still waits for its verdict. Nothing was charged and the key is not
+    /// burnt. `error.params` in `raw` names the other charge: read its status
+    /// first, then resend with the SAME key if this charge is still owed.
+    pub const CHARGE_IN_PROGRESS: &str = "CHARGE_IN_PROGRESS";
     /// HTTP 409: a request with this key is still in flight; retry with the
     /// SAME key in a moment.
     pub const DUPLICATE_REQUEST: &str = "DUPLICATE_REQUEST";
     /// HTTP 422: same key, different body or method; a bug on your side.
     pub const IDEMPOTENCY_KEY_REUSED: &str = "IDEMPOTENCY_KEY_REUSED";
+    /// HTTP 422: a card is only charged in the currency of the payment it was
+    /// saved from. Nothing was charged.
+    pub const CHARGE_CURRENCY_MISMATCH: &str = "CHARGE_CURRENCY_MISMATCH";
+    /// HTTP 404: `agreement_id` is not one of your agreements. Nothing was
+    /// charged and the key is not burnt.
+    pub const AGREEMENT_NOT_FOUND: &str = "AGREEMENT_NOT_FOUND";
+    /// HTTP 422: the agreement is linked to a different payment method than
+    /// the one in the path. Nothing was charged.
+    pub const AGREEMENT_METHOD_MISMATCH: &str = "AGREEMENT_METHOD_MISMATCH";
+    /// HTTP 422: the agreement has no consent on record, so it cannot back a
+    /// charge. Nothing was charged.
+    pub const AGREEMENT_CONSENT_MISSING: &str = "AGREEMENT_CONSENT_MISSING";
+    /// HTTP 422: the agreement is in a different currency than the charge.
+    /// Nothing was charged.
+    pub const AGREEMENT_CURRENCY_MISMATCH: &str = "AGREEMENT_CURRENCY_MISMATCH";
+    /// HTTP 422: a fixed agreement charges exactly its per-period amount, and
+    /// this amount is below it. Nothing was charged.
+    pub const AGREEMENT_AMOUNT_MISMATCH: &str = "AGREEMENT_AMOUNT_MISMATCH";
+    /// HTTP 422: the amount is above what the customer agreed to under this
+    /// agreement. Nothing was charged.
+    pub const CHARGE_AMOUNT_ABOVE_AGREEMENT: &str = "CHARGE_AMOUNT_ABOVE_AGREEMENT";
+    /// HTTP 422: the current billing period of the agreement already has its
+    /// charge. Nothing was charged.
+    pub const AGREEMENT_PERIOD_ALREADY_CHARGED: &str = "AGREEMENT_PERIOD_ALREADY_CHARGED";
+    /// HTTP 422: the agreement billed its last period, or was cancelled before
+    /// the current period began. Nothing was charged.
+    pub const AGREEMENT_ENDED: &str = "AGREEMENT_ENDED";
+    /// HTTP 422: the agreement is not active yet or is still in its trial.
+    /// Nothing was charged.
+    pub const AGREEMENT_NOT_STARTED: &str = "AGREEMENT_NOT_STARTED";
+    /// HTTP 422: the amount is above the most one charge may be in this
+    /// currency. Nothing was charged.
+    pub const CHARGE_AMOUNT_ABOVE_CAP: &str = "CHARGE_AMOUNT_ABOVE_CAP";
     /// HTTP 502: the provider gave no verdict and the charge MAY have happened.
     /// The charge row is attached: poll `get_status` with its transaction id or
     /// wait for the webhook. Never retry under a new key.
@@ -119,9 +203,9 @@ pub mod charge_error_code {
     /// later with the SAME key.
     pub const PAYMENT_PROCESSING_UNAVAILABLE: &str = "PAYMENT_PROCESSING_UNAVAILABLE";
 
-    /// The whole vocabulary, in the order the canonical contract lists it. An
-    /// unlisted code still arrives as [`Error::Charge`](crate::Error::Charge).
-    pub const ALL: [&str; 7] = [
+    /// The whole vocabulary. An unlisted code still arrives as
+    /// [`Error::Charge`](crate::Error::Charge).
+    pub const ALL: [&str; 20] = [
         PAYMENT_METHOD_NOT_ACTIVE,
         DUPLICATE_REQUEST,
         IDEMPOTENCY_KEY_REUSED,
@@ -129,6 +213,19 @@ pub mod charge_error_code {
         CHARGE_FAILED,
         PAYMENT_METHOD_CHARGES_DISABLED,
         PAYMENT_PROCESSING_UNAVAILABLE,
+        PAYMENT_METHOD_NOT_FOUND,
+        CHARGE_IN_PROGRESS,
+        CHARGE_CURRENCY_MISMATCH,
+        AGREEMENT_NOT_FOUND,
+        AGREEMENT_METHOD_MISMATCH,
+        AGREEMENT_CONSENT_MISSING,
+        AGREEMENT_CURRENCY_MISMATCH,
+        AGREEMENT_AMOUNT_MISMATCH,
+        CHARGE_AMOUNT_ABOVE_AGREEMENT,
+        AGREEMENT_PERIOD_ALREADY_CHARGED,
+        AGREEMENT_ENDED,
+        AGREEMENT_NOT_STARTED,
+        CHARGE_AMOUNT_ABOVE_CAP,
     ];
 }
 
@@ -209,6 +306,166 @@ pub mod refund_error_code {
             _ => None,
         }
     }
+}
+
+/// The codes of the plan and agreement routes
+/// ([`Client::create_plan`](crate::Client::create_plan),
+/// [`Client::create_agreement`](crate::Client::create_agreement) and the
+/// reads, updates and deletes of both). They arrive as
+/// [`Error::Api`](crate::Error::Api) with the code and the HTTP status set.
+///
+/// The codes of a subscription session are refusals on the checkout route:
+/// see [`session_error_code::REFUSALS`].
+pub mod recurring_error_code {
+    /// HTTP 404: no plan with this id under your account. The `plan_` handle is
+    /// case-sensitive.
+    pub const PLAN_NOT_FOUND: &str = "PLAN_NOT_FOUND";
+    /// HTTP 409: the plan is archived; create the agreement from an active
+    /// plan.
+    pub const PLAN_NOT_ACTIVE: &str = "PLAN_NOT_ACTIVE";
+    /// HTTP 404: no agreement with this id under your account.
+    pub const AGREEMENT_NOT_FOUND: &str = "AGREEMENT_NOT_FOUND";
+    /// HTTP 409: the agreement already completed or failed, so there is
+    /// nothing left to cancel.
+    pub const AGREEMENT_ENDED: &str = "AGREEMENT_ENDED";
+    /// HTTP 404: no stored payment method with the `stored_payment_method_id`
+    /// you sent under your account.
+    pub const PAYMENT_METHOD_NOT_FOUND: &str = "PAYMENT_METHOD_NOT_FOUND";
+    /// HTTP 409: the stored payment method is revoked, expired or retired and
+    /// cannot back an agreement.
+    pub const PAYMENT_METHOD_NOT_ACTIVE: &str = "PAYMENT_METHOD_NOT_ACTIVE";
+    /// HTTP 422: the stored payment method was saved in another currency than
+    /// the plan's.
+    pub const PAYMENT_METHOD_CURRENCY_MISMATCH: &str = "PAYMENT_METHOD_CURRENCY_MISMATCH";
+    /// HTTP 422: `max_amount_per_period` is below the plan's amount.
+    pub const MAX_AMOUNT_BELOW_PLAN_AMOUNT: &str = "MAX_AMOUNT_BELOW_PLAN_AMOUNT";
+    /// HTTP 422: the agreement names a stored payment method or a
+    /// `max_amount_per_period` but carries no consent.
+    pub const AGREEMENT_CONSENT_REQUIRED: &str = "AGREEMENT_CONSENT_REQUIRED";
+    /// HTTP 422: the currency of the stored payment method is not known, so it
+    /// cannot back an agreement.
+    pub const PAYMENT_METHOD_CURRENCY_UNKNOWN: &str = "PAYMENT_METHOD_CURRENCY_UNKNOWN";
+    /// HTTP 422: this key was first used to create a different plan or
+    /// agreement. Use a fresh key.
+    pub const IDEMPOTENCY_KEY_REUSED: &str = "IDEMPOTENCY_KEY_REUSED";
+    /// HTTP 400: the platform does not process this currency.
+    pub const INVALID_CURRENCY: &str = "INVALID_CURRENCY";
+
+    /// The whole vocabulary, in the order the contract lists it. An unlisted
+    /// code still arrives as [`Error::Api`](crate::Error::Api) with its code.
+    pub const ALL: [&str; 12] = [
+        PLAN_NOT_FOUND,
+        PLAN_NOT_ACTIVE,
+        AGREEMENT_NOT_FOUND,
+        AGREEMENT_ENDED,
+        PAYMENT_METHOD_NOT_FOUND,
+        PAYMENT_METHOD_NOT_ACTIVE,
+        PAYMENT_METHOD_CURRENCY_MISMATCH,
+        MAX_AMOUNT_BELOW_PLAN_AMOUNT,
+        AGREEMENT_CONSENT_REQUIRED,
+        PAYMENT_METHOD_CURRENCY_UNKNOWN,
+        IDEMPOTENCY_KEY_REUSED,
+        INVALID_CURRENCY,
+    ];
+}
+
+/// The codes of the webhook endpoint routes
+/// ([`Client::create_webhook_endpoint`](crate::Client::create_webhook_endpoint),
+/// [`Client::list_webhook_endpoints`](crate::Client::list_webhook_endpoints)
+/// and [`Client::delete_webhook_endpoint`](crate::Client::delete_webhook_endpoint)).
+/// They arrive as [`Error::Api`](crate::Error::Api) with the code and the HTTP
+/// status set.
+pub mod webhook_error_code {
+    /// HTTP 400: the url is not HTTPS, is malformed, does not resolve, or
+    /// points at a private, loopback or link-local host.
+    pub const WEBHOOK_URL_REJECTED: &str = "WEBHOOK_URL_REJECTED";
+    /// HTTP 409: you already have the maximum number of active endpoints.
+    pub const WEBHOOK_LIMIT_REACHED: &str = "WEBHOOK_LIMIT_REACHED";
+    /// HTTP 409, create only: this key registered an endpoint more than a day
+    /// ago and that endpoint still exists. Its id is in `raw`, under
+    /// `error.params.webhookId`.
+    pub const WEBHOOK_ALREADY_REGISTERED: &str = "WEBHOOK_ALREADY_REGISTERED";
+    /// HTTP 404, delete only: no endpoint with this id under your account.
+    pub const WEBHOOK_NOT_FOUND: &str = "WEBHOOK_NOT_FOUND";
+    /// HTTP 422: this key was first used for a different url or events.
+    pub const IDEMPOTENCY_KEY_REUSED: &str = "IDEMPOTENCY_KEY_REUSED";
+    /// HTTP 409: a request with this key is being processed right now. Retry
+    /// with the SAME key after a second.
+    pub const DUPLICATE_REQUEST: &str = "DUPLICATE_REQUEST";
+    /// HTTP 400, create only: the Idempotency-Key header is missing or longer
+    /// than 100 characters.
+    pub const IDEMPOTENCY_KEY_REQUIRED: &str = "IDEMPOTENCY_KEY_REQUIRED";
+
+    /// The whole vocabulary, in the order the contract lists it. An unlisted
+    /// code still arrives as [`Error::Api`](crate::Error::Api) with its code.
+    pub const ALL: [&str; 7] = [
+        WEBHOOK_URL_REJECTED,
+        WEBHOOK_LIMIT_REACHED,
+        WEBHOOK_ALREADY_REGISTERED,
+        WEBHOOK_NOT_FOUND,
+        IDEMPOTENCY_KEY_REUSED,
+        DUPLICATE_REQUEST,
+        IDEMPOTENCY_KEY_REQUIRED,
+    ];
+}
+
+/// The codes of a rejected field, on an HTTP 400.
+///
+/// The envelope's own code is [`VALIDATION_ERROR`](validation_error_code::VALIDATION_ERROR). The field codes in
+/// [`ALL`](validation_error_code::ALL) name what was wrong with each field: read them in the error's `raw`,
+/// under `error.validationErrors[].code`, next to the field name.
+pub mod validation_error_code {
+    /// The `error.code` of a 400 that rejected one or more fields. The details
+    /// are in `raw`, under `error.validationErrors`.
+    pub const VALIDATION_ERROR: &str = "VALIDATION_ERROR";
+
+    /// The field was missing or empty.
+    pub const REQUIRED: &str = "REQUIRED";
+    /// The amount must be a positive integer in minor units.
+    pub const MIN_VALUE: &str = "MIN_VALUE";
+    /// The value is longer than the maximum. The limit is in `params.max`.
+    pub const MAX_LENGTH: &str = "MAX_LENGTH";
+    /// The value does not have the expected format.
+    pub const INVALID_FORMAT: &str = "INVALID_FORMAT";
+    /// The value is not one of the accepted choices.
+    pub const INVALID_SELECTION: &str = "INVALID_SELECTION";
+    /// `consent.acceptedAt` is later than now.
+    pub const DATE_IN_FUTURE: &str = "DATE_IN_FUTURE";
+    /// The email address was rejected.
+    pub const INVALID_EMAIL: &str = "INVALID_EMAIL";
+    /// The format is fine but the platform does not process this currency.
+    pub const INVALID_CURRENCY: &str = "INVALID_CURRENCY";
+
+    /// The field codes, in the order the contract lists them.
+    pub const ALL: [&str; 8] = [
+        REQUIRED,
+        MIN_VALUE,
+        MAX_LENGTH,
+        INVALID_FORMAT,
+        INVALID_SELECTION,
+        DATE_IN_FUTURE,
+        INVALID_EMAIL,
+        INVALID_CURRENCY,
+    ];
+}
+
+/// The codes of a temporary outage. Nothing was created; send the same
+/// request again later WITH THE SAME idempotency key.
+pub mod transient_error_code {
+    /// HTTP 503: the platform could not handle the request right now. It
+    /// arrives as [`Error::Transport`](crate::Error::Transport) with this code,
+    /// except on two routes: as [`Error::Charge`](crate::Error::Charge) from
+    /// [`Client::charge_payment_method`](crate::Client::charge_payment_method)
+    /// and as [`Error::Revoke`](crate::Error::Revoke) from
+    /// [`Client::revoke_payment_method`](crate::Client::revoke_payment_method).
+    pub const MERCHANT_API_UNAVAILABLE: &str = "MERCHANT_API_UNAVAILABLE";
+    /// Card payments are off right now. An HTTP 200
+    /// [`Error::Refusal`](crate::Error::Refusal) on the checkout route, an HTTP
+    /// 503 [`Error::Charge`](crate::Error::Charge) on the charge route.
+    pub const PAYMENT_PROCESSING_UNAVAILABLE: &str = "PAYMENT_PROCESSING_UNAVAILABLE";
+
+    /// The whole vocabulary, in the order the contract lists it.
+    pub const ALL: [&str; 2] = [MERCHANT_API_UNAVAILABLE, PAYMENT_PROCESSING_UNAVAILABLE];
 }
 
 /// The codes the API answers with when it refuses the key itself, on any
@@ -415,11 +672,12 @@ pub enum Error {
     /// ```
     ///
     /// A decline is NOT this variant: HTTP 402 comes back as `Ok` with a charge
-    /// whose status is `failed`. A 404 for an id that is not yours is
-    /// [`Error::Api`] with code `PAYMENT_METHOD_NOT_FOUND`, and a 5xx that
-    /// carries no gateway code (an HTML page from a proxy) is [`Error::Transport`].
+    /// whose status is `failed`. A 404 for an id that is not yours IS this
+    /// variant, with code `PAYMENT_METHOD_NOT_FOUND`. A 400 is [`Error::Api`].
+    /// A 5xx other than 502 and 503 (an HTML page from a proxy, or a coded 500)
+    /// is [`Error::Transport`].
     Charge {
-        /// The HTTP status code: 409, 422, 502 or 503.
+        /// The HTTP status code: 404, 409, 422, 502 or 503.
         status: u16,
         /// The machine-readable reason. See [`charge_error_code`].
         code: String,
@@ -437,7 +695,8 @@ pub enum Error {
     /// The gateway refused to revoke a stored payment method. Nothing changed
     /// either way; `code` is one of the [`revoke_error_code`] constants (an
     /// unlisted code arrives here too). An id that is not yours is still
-    /// [`Error::Api`] with status 404.
+    /// [`Error::Api`] with status 404. A 5xx other than 502 and 503 is
+    /// [`Error::Transport`].
     Revoke {
         /// The HTTP status code: 502 or 503.
         status: u16,
@@ -481,9 +740,20 @@ pub enum Error {
     /// A network-level failure, a timeout, or a 5xx. The request may or may not
     /// have reached the API, so retry WITH THE SAME idempotency key: a retried
     /// key never creates a second payment.
+    ///
+    /// A 5xx from the API itself keeps its status, its code and its body, e.g.
+    /// a 503 with
+    /// [`MERCHANT_API_UNAVAILABLE`](crate::transient_error_code::MERCHANT_API_UNAVAILABLE).
     Transport {
         /// What failed.
         message: String,
+        /// The HTTP status of a 5xx. `None` when no answer came back.
+        status: Option<u16>,
+        /// The machine-readable reason, when the 5xx carried one. Also on
+        /// [`Error::code`].
+        code: Option<String>,
+        /// The whole envelope of a 5xx that sent JSON. `Value::Null` otherwise.
+        raw: Value,
         /// The underlying cause, when there was one.
         source: Option<Box<dyn StdError + Send + Sync>>,
     },
@@ -493,8 +763,8 @@ impl Error {
     /// The machine-readable code, for the variants that carry one.
     ///
     /// `Refusal`, `Auth`, `Forbidden`, `Charge` and `Revoke` always have one,
-    /// `Api` and `RateLimited` have one when the API sent it; the rest return
-    /// `None`.
+    /// `Api`, `RateLimited` and `Transport` have one when the API sent it;
+    /// `Validation` returns `None`.
     pub fn code(&self) -> Option<&str> {
         match self {
             Error::Refusal { code, .. }
@@ -502,7 +772,9 @@ impl Error {
             | Error::Forbidden { code, .. }
             | Error::Charge { code, .. }
             | Error::Revoke { code, .. } => Some(code),
-            Error::Api { code, .. } | Error::RateLimited { code, .. } => code.as_deref(),
+            Error::Api { code, .. }
+            | Error::RateLimited { code, .. }
+            | Error::Transport { code, .. } => code.as_deref(),
             _ => None,
         }
     }
@@ -516,6 +788,7 @@ impl Error {
             Error::Auth { .. } => Some(401),
             Error::Forbidden { .. } => Some(403),
             Error::RateLimited { .. } => Some(429),
+            Error::Transport { status, .. } => *status,
             _ => None,
         }
     }
@@ -641,13 +914,46 @@ impl Error {
         }
     }
 
+    /// A failure with no answer from the API: nothing to read a status or a
+    /// code from.
     pub(crate) fn transport(
         message: impl Into<String>,
         source: Option<Box<dyn StdError + Send + Sync>>,
     ) -> Error {
         Error::Transport {
             message: message.into(),
+            status: None,
+            code: None,
+            raw: Value::Null,
             source,
+        }
+    }
+
+    /// A 5xx. The code, the API's message and the body travel with it when the
+    /// API sent them.
+    pub(crate) fn unavailable(
+        status: u16,
+        code: Option<String>,
+        api_message: Option<String>,
+        raw: Value,
+    ) -> Error {
+        let mut message = format!("The Dominaite API is unavailable (HTTP {status}");
+        if let Some(code) = &code {
+            message.push_str(", ");
+            message.push_str(code);
+        }
+        message.push(')');
+        if let Some(api_message) = api_message.filter(|text| !text.trim().is_empty()) {
+            message.push_str(": ");
+            message.push_str(api_message.trim_end_matches('.'));
+        }
+        message.push_str("; retry with the same idempotency key.");
+        Error::Transport {
+            message,
+            status: Some(status),
+            code,
+            raw,
+            source: None,
         }
     }
 }

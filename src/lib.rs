@@ -55,22 +55,24 @@ pub use client::{
     SESSIONS_PATH, TRANSACTIONS_PATH, VERSION, WEBHOOKS_PATH,
 };
 pub use error::{
-    auth_error_code, charge_error_code, rate_limit_error_code, refund_error_code,
-    revoke_error_code, session_error_code, Error, Result,
+    auth_error_code, charge_error_code, rate_limit_error_code, recurring_error_code,
+    refund_error_code, revoke_error_code, session_error_code, transient_error_code,
+    validation_error_code, webhook_error_code, Error, Result,
 };
 pub use idempotency::IdempotencyKey;
 pub use money::{currency_exponent, to_minor_units};
 pub use signing::{sha256_hex, sign_request, SignRequest};
 pub use types::{
-    agreement_status, charge_status, decline_class, event_type, interval_unit, past_due_reason,
-    payment_method, plan_status, refund_failure_code, refund_status, retired_reason, status,
-    stored_payment_method_status, transaction_type, wallet_type, webhook_endpoint_status,
-    Agreement, AgreementRequest, AgreementSummary, ChargeRequest, CheckoutSession,
-    CheckoutSessionRequest, CheckoutStatus, Consent, ConsentRecord, Customer, Integration,
-    IntegrationContract, PaymentMethodCharge, Ping, Plan, PlanRequest, PlanUpdate, Refund,
-    RefundList, RefundRequest, StoredPaymentMethod, Transaction, TransactionListParams,
+    agreement_status, charge_outcome, charge_status, decline_class, event_type, interval_unit,
+    past_due_reason, payment_method, plan_status, refund_failure_code, refund_status,
+    retired_reason, status, stored_payment_method_status, transaction_type, wallet_type,
+    webhook_endpoint_status, Agreement, AgreementRequest, AgreementSummary, ChargeRequest,
+    CheckoutSession, CheckoutSessionRequest, CheckoutStatus, Consent, ConsentRecord, Customer,
+    Integration, IntegrationContract, PaymentMethodCharge, Ping, Plan, PlanRequest, PlanUpdate,
+    Refund, RefundList, RefundRequest, StoredPaymentMethod, Transaction, TransactionListParams,
     TransactionPage, WebhookEndpoint, WebhookEndpointRequest,
 };
 pub use webhooks::{
-    verify_webhook, PaymentEventData, WebhookError, WebhookEvent, DEFAULT_TOLERANCE_SECS,
+    verify_webhook, AgreementEventData, ChargeEventData, ChargeEventPaymentMethod,
+    PaymentEventData, WebhookError, WebhookEvent, DEFAULT_TOLERANCE_SECS,
 };

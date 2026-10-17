@@ -176,7 +176,9 @@ pub fn verify_webhook(
 ///
 /// `data` stays a [`serde_json::Value`]: its shape depends on `type`, and fields
 /// are only ever added under an `apiVersion`, never renamed or removed, so ignore
-/// fields you do not recognise.
+/// fields you do not recognise. [`WebhookEvent::payment_data`],
+/// [`WebhookEvent::charge_data`] and [`WebhookEvent::agreement_data`] read it
+/// typed.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WebhookEvent {
@@ -240,6 +242,24 @@ impl WebhookEvent {
         if !(self.event_type.starts_with("payment.")
             || self.event_type.starts_with("verification."))
         {
+            return None;
+        }
+        serde_json::from_value(self.data.clone()).ok()
+    }
+
+    /// `data` of a `charge.*` event, typed. `None` on every other event type,
+    /// and when `data` does not have the documented shape.
+    pub fn charge_data(&self) -> Option<ChargeEventData> {
+        if !self.event_type.starts_with("charge.") {
+            return None;
+        }
+        serde_json::from_value(self.data.clone()).ok()
+    }
+
+    /// `data` of an `agreement.*` event, typed. `None` on every other event
+    /// type, and when `data` does not have the documented shape.
+    pub fn agreement_data(&self) -> Option<AgreementEventData> {
+        if !self.event_type.starts_with("agreement.") {
             return None;
         }
         serde_json::from_value(self.data.clone()).ok()
@@ -355,6 +375,151 @@ pub struct PaymentEventData {
     /// when nobody declined the payment.
     #[serde(default)]
     pub decline_class: Option<String>,
+}
+
+/// `data` on a `charge.*` event, from [`WebhookEvent::charge_data`]: a charge
+/// on a stored card, one you made or one the platform placed for an agreement
+/// period.
+///
+/// Webhooks spell a missing value as an explicit `null`; the SDK reads null
+/// and absent alike as `None`. Fields are only ever added, so older deliveries
+/// that lack one still parse.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChargeEventData {
+    /// The charge, `ch_...`.
+    pub charge_id: String,
+    /// The transaction of the charge. Poll
+    /// [`Client::get_status`](crate::Client::get_status) with it.
+    #[serde(default)]
+    pub transaction_id: Option<String>,
+    /// The card that was charged, `pm_...`.
+    #[serde(default)]
+    pub stored_payment_method_id: Option<String>,
+    /// The agreement the charge is for, `agr_...`. `None` for a one-off charge
+    /// you made.
+    #[serde(default)]
+    pub agreement_id: Option<String>,
+    /// Your customer reference from the agreement.
+    #[serde(default)]
+    pub customer_reference: Option<String>,
+    /// `succeeded`, `retrying` or `failed`, one of the
+    /// [`charge_outcome`](crate::charge_outcome) constants, or a value this SDK
+    /// does not know yet.
+    #[serde(default)]
+    pub outcome: Option<String>,
+    /// The agreement period the charge is for, from 1.
+    #[serde(default)]
+    pub period_number: Option<i64>,
+    /// The attempt within the period, from 1.
+    #[serde(default)]
+    pub attempt_number: Option<i64>,
+    /// The amount in MINOR units.
+    #[serde(default)]
+    pub amount: Option<i64>,
+    /// ISO 4217 currency.
+    #[serde(default)]
+    pub currency: Option<String>,
+    /// The brand and the last four digits of the card.
+    #[serde(default)]
+    pub payment_method: Option<ChargeEventPaymentMethod>,
+    /// The order reference of the charge.
+    #[serde(default)]
+    pub order_reference: Option<String>,
+    /// The description of the charge.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// On `charge.failed` and `charge.retrying`: the class of the decline, one
+    /// of the [`decline_class`](crate::decline_class) constants.
+    #[serde(default)]
+    pub decline_class: Option<String>,
+    /// The provider's decline code.
+    #[serde(default)]
+    pub decline_code: Option<String>,
+    /// On `charge.retrying`: when the platform tries the card again, ISO 8601.
+    #[serde(default)]
+    pub next_attempt_at: Option<String>,
+    /// When the next period is charged, ISO 8601.
+    #[serde(default)]
+    pub next_charge_at: Option<String>,
+    /// The counter that orders this event; see [`WebhookEvent::sequence`].
+    #[serde(default)]
+    pub sequence: Option<i64>,
+}
+
+/// The card on a `charge.*` event, [`ChargeEventData::payment_method`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChargeEventPaymentMethod {
+    /// Lower-cased card brand.
+    #[serde(default)]
+    pub brand: Option<String>,
+    /// The last four card digits.
+    #[serde(default)]
+    pub last4: Option<String>,
+}
+
+/// `data` on an `agreement.*` event, from [`WebhookEvent::agreement_data`]: the
+/// agreement as it is after the change, plus the status it moved from.
+///
+/// Webhooks spell a missing value as an explicit `null`; the SDK reads null
+/// and absent alike as `None`. A field this struct does not model is still in
+/// [`WebhookEvent::data`].
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgreementEventData {
+    /// The agreement, `agr_...`.
+    pub id: String,
+    /// The plan, `plan_...`.
+    #[serde(default)]
+    pub plan_id: Option<String>,
+    /// Your customer reference.
+    #[serde(default)]
+    pub customer_reference: Option<String>,
+    /// The card the agreement charges, `pm_...`.
+    #[serde(default)]
+    pub stored_payment_method_id: Option<String>,
+    /// The status it moved to, one of the
+    /// [`agreement_status`](crate::agreement_status) constants.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// The status it moved from.
+    #[serde(default)]
+    pub previous_status: Option<String>,
+    /// The amount per period in MINOR units.
+    #[serde(default)]
+    pub amount: Option<i64>,
+    /// ISO 4217 currency.
+    #[serde(default)]
+    pub currency: Option<String>,
+    /// One of the [`interval_unit`](crate::interval_unit) constants.
+    #[serde(default)]
+    pub interval_unit: Option<String>,
+    /// How many interval units one period is.
+    #[serde(default)]
+    pub interval_count: Option<i64>,
+    /// How many periods the agreement bills. `None` when it runs until
+    /// cancelled.
+    #[serde(default)]
+    pub period_count: Option<i64>,
+    /// The trial in days.
+    #[serde(default)]
+    pub trial_days: Option<i64>,
+    /// When the next period is charged, ISO 8601.
+    #[serde(default)]
+    pub next_charge_at: Option<String>,
+    /// When the agreement went active, ISO 8601.
+    #[serde(default)]
+    pub activated_at: Option<String>,
+    /// When the agreement was cancelled, ISO 8601.
+    #[serde(default)]
+    pub cancelled_at: Option<String>,
+    /// The version of the agreement.
+    #[serde(default)]
+    pub version: Option<i64>,
+    /// The counter that orders this event; see [`WebhookEvent::sequence`].
+    #[serde(default)]
+    pub sequence: Option<i64>,
 }
 
 struct SignatureHeader<'a> {

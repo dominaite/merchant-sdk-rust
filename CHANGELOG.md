@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.7.0 (unreleased)
+
+### Breaking
+
+- `Error::Transport` has new `status`, `code` and `raw` fields. A `match` that lists every
+  field of the variant needs a trailing `..`. Code that builds `Error::Transport` itself, for
+  example a test double, must set the new fields. For a network failure, use `status: None`,
+  `code: None` and `raw: Value::Null`.
+- A 5xx with a gateway code keeps the code: `Error::Transport` now answers `code()` and
+  `http_status()`. On `charge_payment_method`, a coded 500 or 504 is now `Error::Transport`
+  instead of `Error::Charge`; 502 and 503 stay `Error::Charge`. On `revoke_payment_method`, a
+  coded 500 or 504 is now `Error::Transport` instead of `Error::Revoke`; 502 and 503 stay
+  `Error::Revoke`.
+- `session_error_code::REFUSALS` grows from 5 to 13 codes: it now also lists the
+  `AGREEMENT_*` codes and `SUBSCRIPTIONS_NOT_ENABLED`. Code that checks
+  `REFUSALS.contains(code)` now matches the subscription refusals too. The array type changes
+  from `[&str; 5]` to `[&str; 13]`.
+- `charge_error_code::ALL` grows from 7 to 20 codes, and its type from `[&str; 7]` to
+  `[&str; 20]`. Code that checks `ALL.contains(code)` now matches the new codes too.
+- A coded 404 from `charge_payment_method` (`PAYMENT_METHOD_NOT_FOUND`, `AGREEMENT_NOT_FOUND`)
+  is now `Error::Charge` instead of `Error::Api`.
+- `STOREFRONT_MISMATCH` on a checkout replay (an HTTP 200 refusal) is now `Error::Api` with
+  `status` 200, like the 400, instead of `Error::Refusal`.
+- The retry warning of `create_checkout_session_with_retry` reads `after HTTP 503` instead of
+  `after Transport` when a 5xx without a code is retried, because the error keeps its status.
+
+### Added
+
+- `WebhookEvent::charge_data()` and `WebhookEvent::agreement_data()`, with `ChargeEventData`,
+  `ChargeEventPaymentMethod` and `AgreementEventData`. Every field but the id is an `Option`,
+  so explicit nulls read as `None`. `charge_outcome` holds the `outcome` values.
+- Error code constants for every code in the wire contract: the subscription refusals and
+  `IDEMPOTENCY_KEY_REQUIRED` in `session_error_code`, the rest of the charge codes in
+  `charge_error_code`, and the new modules `recurring_error_code`, `webhook_error_code`,
+  `validation_error_code` and `transient_error_code`. A test pins them to the contract. The
+  larger `REFUSALS` and `charge_error_code::ALL` arrays are listed under Breaking.
+
+### Fixed
+
+- A payment method id with uppercase letters is lowercased before it is sent and signed. The
+  API signs the lowercase id, so an uppercase id could fail the signature check.
+
 ## 0.6.0
 
 ### Breaking

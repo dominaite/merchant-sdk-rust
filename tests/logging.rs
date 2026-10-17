@@ -338,7 +338,7 @@ fn a_retry_is_warned_about() {
 
     assert_eq!(
         warnings.all(),
-        vec!["dominaite-rust: retrying create_checkout_session_with_retry after Transport (attempt 2 of 3)".to_string()]
+        vec!["dominaite-rust: retrying create_checkout_session_with_retry after HTTP 503 (attempt 2 of 3)".to_string()]
     );
 }
 
