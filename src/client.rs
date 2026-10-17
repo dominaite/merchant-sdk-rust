@@ -1082,9 +1082,10 @@ impl Client {
     ///
     /// The endpoint carries the request's required `Idempotency-Key`. The same
     /// key with the same url and events answers the same endpoint without its
-    /// secret, and registers nothing new. After a timeout or a 503, send it
-    /// again WITH THE SAME KEY: the retry replaces an endpoint that the lost
-    /// attempt registered, and answers a new endpoint with a new secret.
+    /// secret, and registers nothing new. The client never retries this call
+    /// (see [`ClientBuilder::max_retries`]). After a timeout or a 503, send it
+    /// again yourself WITH THE SAME KEY. If the answer has no secret, delete
+    /// that endpoint and create it again with a new key.
     ///
     /// Errors it returns:
     /// - [`Error::Validation`]: an empty url or no events; nothing was sent.
@@ -1283,8 +1284,9 @@ impl Client {
     ///
     /// Safe means a GET, or a POST with an idempotency key: the API answers a
     /// key it has seen with the first answer. Webhook endpoint create is the
-    /// exception. A replayed create can register a second endpoint, which
-    /// then delivers every event twice.
+    /// exception. The API keeps its first answer without the signing secret,
+    /// so a replay after a lost answer comes back with no secret. The caller
+    /// must see the timeout to know that the secret is lost.
     fn policy_for(&self, method: &str, path: &str, idempotency_key: &str) -> RetryPolicy {
         let replayable = method == "GET"
             || (method == "POST" && !idempotency_key.is_empty() && path != WEBHOOKS_PATH);

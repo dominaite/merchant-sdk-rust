@@ -380,8 +380,10 @@ The client retries a call that is safe to replay, with one policy for every rout
 - **Which calls:** every GET, and every POST that carries an idempotency key (checkout session,
   charge, refund, plan, agreement). Every attempt sends the same key and the same body, so a
   request that did land is replayed, never repeated. Webhook endpoint create is never retried:
-  a replay could register a second endpoint, which would deliver every event twice. PATCH and
-  DELETE are never retried.
+  the API keeps its first answer without the signing secret, so a replay after a lost answer
+  comes back with no secret. After a timeout, send the create again yourself with the same key.
+  If the answer has no secret, delete that endpoint and create it again with a new key. PATCH
+  and DELETE are never retried.
 - **Which answers:** a transport failure (network error, timeout), a 5xx, and
   `PAYMENT_PROCESSING_UNAVAILABLE` in both its forms (the 503 and the checkout's HTTP 200
   refusal). Never a 429: the client returns `Error::RateLimited` with `retry_after_seconds` at
@@ -1013,8 +1015,9 @@ secret (`whsec_` followed by 64 hex characters). A replay with the same key answ
 endpoint without the secret. Lost the secret? Delete the endpoint and create it again. The `Debug`
 output of `WebhookEndpoint` never shows the secret.
 
-After a timeout or a 503, send the create again with the SAME key. The retry replaces an
-endpoint that the lost attempt registered. A new key cannot do that. The url must be HTTPS on a
+After a timeout or a 503, send the create again with the SAME key; the client does not do it for
+you. If the answer has no secret, delete that endpoint and create it again with a new key. Never
+answer a timeout with a new key: that can register a second endpoint. The url must be HTTPS on a
 public host, or the create fails with `Error::Api`, code `WEBHOOK_URL_REJECTED` (400). With 25
 active endpoints, it fails with `WEBHOOK_LIMIT_REACHED` (409).
 

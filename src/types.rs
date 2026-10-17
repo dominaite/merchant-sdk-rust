@@ -1912,8 +1912,8 @@ pub struct WebhookEndpointRequest {
 
     /// Required. It travels in the header and in the signature, never in the
     /// body. After a timeout or a 503, send the request again WITH THE SAME
-    /// KEY: the retry replaces an endpoint that the lost attempt registered. A
-    /// new key cannot do that. Use a fresh key for each new endpoint.
+    /// KEY. If the answer has no secret, delete that endpoint and create it
+    /// again with a new key. Use a fresh key for each new endpoint.
     #[serde(skip)]
     pub idempotency_key: IdempotencyKey,
 
