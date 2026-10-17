@@ -529,6 +529,7 @@ fn a_charge_limit_429_keeps_its_code_and_params() {
             retry_after_seconds,
             code,
             raw,
+            ..
         } => {
             assert_eq!(*retry_after_seconds, Some(120));
             assert_eq!(

@@ -527,6 +527,7 @@ fn charge_outcome_unknown_carries_the_transaction_to_poll() {
             charge,
             transaction_id,
             raw,
+            ..
         } => {
             assert_eq!(status, 502);
             assert_eq!(code, charge_error_code::CHARGE_OUTCOME_UNKNOWN);

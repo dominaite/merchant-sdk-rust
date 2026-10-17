@@ -167,6 +167,7 @@ fn a_storefront_mismatch_on_a_replay_is_a_storefront_error() {
             code,
             message,
             raw,
+            ..
         } => {
             assert_eq!(*status, 200);
             assert_eq!(code.as_deref(), Some(mismatch));

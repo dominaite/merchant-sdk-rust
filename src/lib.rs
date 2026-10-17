@@ -40,6 +40,9 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// Every error keeps its raw body and request id inline, so callers can match on
+// plain fields. The copy costs far less than the network call that made it.
+#![allow(clippy::result_large_err)]
 
 mod client;
 mod error;

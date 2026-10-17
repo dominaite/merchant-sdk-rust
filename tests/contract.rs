@@ -377,6 +377,7 @@ fn the_refusal_example_comes_back_as_a_refusal_with_its_transaction() {
             code,
             message,
             transaction_id,
+            ..
         } => {
             assert_eq!(code, "DUPLICATE_REQUEST");
             assert_eq!(message, "An identical request was already processed.");
@@ -888,6 +889,7 @@ fn every_charge_error_example_comes_back_as_a_charge_error() {
                     charge,
                     transaction_id,
                     raw,
+                    ..
                 } => {
                     assert_eq!(status, http_status, "{label}");
                     assert_eq!(got, code, "{label}");
@@ -1008,6 +1010,7 @@ fn every_revoke_error_example_comes_back_as_a_revoke_error() {
                     code: got,
                     message,
                     raw,
+                    ..
                 } => {
                     assert_eq!(status, http_status, "{label}");
                     assert_eq!(got, code, "{label}");

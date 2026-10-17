@@ -434,10 +434,9 @@ impl Client {
     /// [`ClientBuilder::on_warning`].
     pub fn ping(&self) -> Result<Ping> {
         // GET signs an EMPTY idempotency key and an EMPTY body.
-        let payload = self.request("GET", PING_PATH, "", "")?;
-        let mut ping: Ping = serde_json::from_value(payload.clone())
-            .map_err(|_| Error::api(200, "The API returned an unexpected ping response"))?;
-        ping.raw = payload;
+        let ping: Ping = self
+            .request_reply("GET", PING_PATH, "", "", "")?
+            .object("ping")?;
         if ping.clock_skew_seconds.unsigned_abs() > CLOCK_SKEW_WARNING_SECONDS {
             self.warn(&format!(
                 "dominaite-rust: clock skew is {} s; requests fail at 300 s. Sync this server's clock.",
@@ -456,11 +455,8 @@ impl Client {
     /// credentials on this route at all, so a successful read proves nothing
     /// about them: use [`Client::ping`] for that.
     pub fn get_integration_contract(&self) -> Result<IntegrationContract> {
-        let payload = self.request("GET", INTEGRATION_CONTRACT_PATH, "", "")?;
-        let mut contract: IntegrationContract = serde_json::from_value(payload.clone())
-            .map_err(|_| Error::api(200, "The API returned an unexpected integration contract"))?;
-        contract.raw = payload;
-        Ok(contract)
+        self.request_reply("GET", INTEGRATION_CONTRACT_PATH, "", "", "")?
+            .object("integration contract")
     }
 
     /// Opens a hosted checkout session for one payment.
@@ -493,14 +489,12 @@ impl Client {
         let checkout = payload.get("checkout").filter(|value| value.is_object());
 
         match (succeeded, checkout) {
-            (true, Some(checkout)) => {
-                let mut session: CheckoutSession = serde_json::from_value(checkout.clone())
-                    .map_err(|_| {
-                        Error::api(200, "The API returned an unexpected checkout object")
-                    })?;
-                session.raw = checkout.clone();
-                Ok(session)
-            }
+            (true, Some(checkout)) => parse_object(
+                checkout.clone(),
+                reply.status,
+                "checkout",
+                reply.request_id(),
+            ),
             // A storefront mismatch on a replay comes back as a 200 refusal, but
             // it is the same storefront error as the 400: one class for one code.
             _ if string_field(payload, "errorCode").as_deref()
@@ -508,12 +502,14 @@ impl Client {
             {
                 let message = string_field(payload, "errorMessage")
                     .unwrap_or_else(|| "The API key is bound to another storefront.".to_string());
+                let request_id = reply.request_id.clone();
                 Err(Error::api_with_code(
                     reply.status,
                     Some(session_error_code::STOREFRONT_MISMATCH.to_string()),
                     message,
                     reply.envelope,
-                ))
+                )
+                .with_request_id(request_id.as_deref()))
             }
             // A replay refusal names the transaction the key collided with. Carry
             // it so the caller can reconcile with get_status instead of minting a
@@ -523,7 +519,8 @@ impl Client {
                 string_field(payload, "errorMessage")
                     .unwrap_or_else(|| "The checkout session was refused.".to_string()),
                 string_field(payload, "transactionId"),
-            )),
+            )
+            .with_request_id(reply.request_id())),
         }
     }
 
@@ -602,12 +599,8 @@ impl Client {
         // GET signs an EMPTY idempotency key and an EMPTY body, and sends no
         // Idempotency-Key header.
         let path = format!("{SESSIONS_PATH}/{normalized}");
-        let payload = self.request("GET", &path, "", "")?;
-
-        let mut status: CheckoutStatus = serde_json::from_value(payload.clone())
-            .map_err(|_| Error::api(200, "The API returned an unexpected status response"))?;
-        status.raw = payload;
-        Ok(status)
+        self.request_reply("GET", &path, "", "", "")?
+            .object("status")
     }
 
     /// Charges a card kept on file, off-session: no widget, no payer present.
@@ -675,13 +668,11 @@ impl Client {
                 let message = reply
                     .error_message()
                     .unwrap_or_else(|| "The charge was refused.".to_string());
-                return Err(Error::charge(
-                    reply.status,
-                    code,
-                    message,
-                    charge,
-                    reply.envelope,
-                ));
+                let request_id = reply.request_id.clone();
+                return Err(
+                    Error::charge(reply.status, code, message, charge, reply.envelope)
+                        .with_request_id(request_id.as_deref()),
+                );
             }
             return Err(reply.rejection());
         }
@@ -689,7 +680,8 @@ impl Client {
         Err(Error::api(
             reply.status,
             "The API answered the charge without a charge body",
-        ))
+        )
+        .with_request_id(reply.request_id()))
     }
 
     /// Revokes a card kept on file. The saved credential is deleted at the
@@ -725,7 +717,9 @@ impl Client {
             let message = reply
                 .error_message()
                 .unwrap_or_else(|| "The revoke was refused.".to_string());
-            return Err(Error::revoke(reply.status, code, message, reply.envelope));
+            let request_id = reply.request_id.clone();
+            return Err(Error::revoke(reply.status, code, message, reply.envelope)
+                .with_request_id(request_id.as_deref()));
         }
         Err(reply.rejection())
     }
@@ -759,8 +753,8 @@ impl Client {
         let transaction_id = normalize_transaction_id(transaction_id)?;
         let (idempotency_key, body) = prepare_refund_request(request)?;
         let path = format!("{PAYMENTS_PATH}/{transaction_id}/refunds");
-        let payload = self.request("POST", &path, &body, &idempotency_key)?;
-        parse_refund(payload, 202)
+        self.request_reply("POST", &path, "", &body, &idempotency_key)?
+            .object("refund")
     }
 
     /// Reads one refund of a payment: `transaction_id` is the payment,
@@ -783,8 +777,8 @@ impl Client {
         // GET signs an EMPTY idempotency key and an EMPTY body, and sends no
         // Idempotency-Key header.
         let path = format!("{PAYMENTS_PATH}/{transaction_id}/refunds/{refund_id}");
-        let payload = self.request("GET", &path, "", "")?;
-        parse_refund(payload, 200)
+        self.request_reply("GET", &path, "", "", "")?
+            .object("refund")
     }
 
     /// Lists the refunds of one payment that you created through the API,
@@ -806,16 +800,8 @@ impl Client {
     pub fn list_refunds(&self, transaction_id: &str) -> Result<RefundList> {
         let transaction_id = normalize_transaction_id(transaction_id)?;
         let path = format!("{PAYMENTS_PATH}/{transaction_id}/refunds");
-        let payload = self.request("GET", &path, "", "")?;
-        let mut list: RefundList = serde_json::from_value(payload.clone())
-            .map_err(|_| Error::api(200, "The API returned an unexpected refund list"))?;
-        if let Some(items) = payload.get("refunds").and_then(Value::as_array) {
-            for (refund, raw) in list.refunds.iter_mut().zip(items) {
-                refund.raw = raw.clone();
-            }
-        }
-        list.raw = payload;
-        Ok(list)
+        self.request_reply("GET", &path, "", "", "")?
+            .object("refund list")
     }
 
     /// Creates a subscription plan: a price and a billing interval you sell.
@@ -860,9 +846,14 @@ impl Client {
             ));
         }
         let body = json_body(request)?;
-        let (status, payload) =
-            self.request_with_status("POST", PLANS_PATH, &body, request.idempotency_key.as_str())?;
-        parse_object(payload, status, "plan")
+        self.request_reply(
+            "POST",
+            PLANS_PATH,
+            "",
+            &body,
+            request.idempotency_key.as_str(),
+        )?
+        .object("plan")
     }
 
     /// Lists your plans: at most 200, active first, and the newest first
@@ -872,8 +863,8 @@ impl Client {
     /// Errors it returns: as [`Client::get_plan`], without the 404.
     pub fn list_plans(&self) -> Result<Vec<Plan>> {
         // GET signs an EMPTY idempotency key and an EMPTY body.
-        let payload = self.request("GET", PLANS_PATH, "", "")?;
-        parse_array(payload, "plan")
+        self.request_reply("GET", PLANS_PATH, "", "", "")?
+            .array("plan")
     }
 
     /// Reads one plan, archived ones too.
@@ -889,8 +880,7 @@ impl Client {
     ///   again.
     pub fn get_plan(&self, plan_id: &str) -> Result<Plan> {
         let path = plan_path(plan_id)?;
-        let payload = self.request("GET", &path, "", "")?;
-        parse_object(payload, 200, "plan")
+        self.request_reply("GET", &path, "", "", "")?.object("plan")
     }
 
     /// Changes the name, the trial or the cancel page of a plan, and answers
@@ -907,8 +897,8 @@ impl Client {
         let path = plan_path(plan_id)?;
         let body = json_body(update)?;
         // PATCH signs an EMPTY idempotency key, like GET, but signs its body.
-        let payload = self.request("PATCH", &path, &body, "")?;
-        parse_object(payload, 200, "plan")
+        self.request_reply("PATCH", &path, "", &body, "")?
+            .object("plan")
     }
 
     /// Archives a plan: it accepts no new agreements, and the agreements it
@@ -921,7 +911,7 @@ impl Client {
         let path = plan_path(plan_id)?;
         // DELETE signs an EMPTY idempotency key and an EMPTY body; the answer
         // is a 204 with no body.
-        self.request("DELETE", &path, "", "")?;
+        self.request_reply("DELETE", &path, "", "", "")?;
         Ok(())
     }
 
@@ -961,13 +951,14 @@ impl Client {
             ));
         }
         let body = json_body(request)?;
-        let (status, payload) = self.request_with_status(
+        self.request_reply(
             "POST",
             AGREEMENTS_PATH,
+            "",
             &body,
             request.idempotency_key.as_str(),
-        )?;
-        parse_object(payload, status, "agreement")
+        )?
+        .object("agreement")
     }
 
     /// Reads one agreement: its status, its next charge, why it is past due,
@@ -984,8 +975,8 @@ impl Client {
     ///   again.
     pub fn get_agreement(&self, agreement_id: &str) -> Result<Agreement> {
         let path = agreement_path(agreement_id)?;
-        let payload = self.request("GET", &path, "", "")?;
-        parse_object(payload, 200, "agreement")
+        self.request_reply("GET", &path, "", "", "")?
+            .object("agreement")
     }
 
     /// Cancels an agreement that is pending, active or past due. No further
@@ -999,7 +990,7 @@ impl Client {
         let path = agreement_path(agreement_id)?;
         // DELETE signs an EMPTY idempotency key and an EMPTY body; the answer
         // is a 204 with no body.
-        self.request("DELETE", &path, "", "")?;
+        self.request_reply("DELETE", &path, "", "", "")?;
         Ok(())
     }
 
@@ -1048,13 +1039,14 @@ impl Client {
             ));
         }
         let body = json_body(request)?;
-        let (status, payload) = self.request_with_status(
+        self.request_reply(
             "POST",
             WEBHOOKS_PATH,
+            "",
             &body,
             request.idempotency_key.as_str(),
-        )?;
-        parse_object(payload, status, "webhook endpoint")
+        )?
+        .object("webhook endpoint")
     }
 
     /// Lists your webhook endpoints, the newest first: every active endpoint
@@ -1065,8 +1057,8 @@ impl Client {
     /// 404.
     pub fn list_webhook_endpoints(&self) -> Result<Vec<WebhookEndpoint>> {
         // GET signs an EMPTY idempotency key and an EMPTY body.
-        let payload = self.request("GET", WEBHOOKS_PATH, "", "")?;
-        parse_array(payload, "webhook endpoint")
+        self.request_reply("GET", WEBHOOKS_PATH, "", "", "")?
+            .array("webhook endpoint")
     }
 
     /// Deletes a webhook endpoint. It stops receiving deliveries.
@@ -1084,7 +1076,7 @@ impl Client {
         let path = webhook_endpoint_path(webhook_id)?;
         // DELETE signs an EMPTY idempotency key and an EMPTY body; the answer
         // is a 204 with no body.
-        self.request("DELETE", &path, "", "")?;
+        self.request_reply("DELETE", &path, "", "", "")?;
         Ok(())
     }
 
@@ -1171,54 +1163,15 @@ impl Client {
         }
         // GET signs the path only, with an EMPTY idempotency key and an EMPTY
         // body. The query string is not signed.
-        let (_, payload) = self.request_with_query("GET", TRANSACTIONS_PATH, &query, "", "")?;
-        parse_object(payload, 200, "transaction page")
+        self.request_reply("GET", TRANSACTIONS_PATH, &query, "", "")?
+            .object("transaction page")
     }
 
     /// Signs and sends one call, and maps the response onto the error taxonomy:
     /// [`Client::send`] plus the generic rejection for any 4xx or 5xx. The
-    /// unwrapped `data` comes back on success (an empty object for a 204).
-    /// `body` and `idempotency_key` are both empty for GET and DELETE.
-    fn request(
-        &self,
-        method: &str,
-        path: &str,
-        body: &str,
-        idempotency_key: &str,
-    ) -> Result<Value> {
-        self.request_with_status(method, path, body, idempotency_key)
-            .map(|(_, payload)| payload)
-    }
-
-    /// [`Client::request`], plus the HTTP status of the answer, for the routes
-    /// that answer a create and its replay with different statuses.
-    fn request_with_status(
-        &self,
-        method: &str,
-        path: &str,
-        body: &str,
-        idempotency_key: &str,
-    ) -> Result<(u16, Value)> {
-        self.request_with_query(method, path, "", body, idempotency_key)
-    }
-
-    /// [`Client::request_with_status`] with a query string. The query goes
-    /// into the URL and never into the signature. `query` is already
-    /// encoded, without the `?`.
-    fn request_with_query(
-        &self,
-        method: &str,
-        path: &str,
-        query: &str,
-        body: &str,
-        idempotency_key: &str,
-    ) -> Result<(u16, Value)> {
-        let reply = self.request_reply(method, path, query, body, idempotency_key)?;
-        Ok((reply.status, reply.payload().clone()))
-    }
-
-    /// [`Client::send`] plus the generic rejection for any 4xx or 5xx, for
-    /// the routes that read more of the answer than the unwrapped `data`.
+    /// reply carries the unwrapped `data` (an empty object for a 204) and the
+    /// request id. `query` is already encoded, without the `?`, and is never
+    /// signed. `body` and `idempotency_key` are both empty for GET and DELETE.
     fn request_reply(
         &self,
         method: &str,
@@ -1343,11 +1296,14 @@ impl Client {
 
         let http_status = response.status().as_u16();
         exchange.status = Some(http_status);
-        exchange.request_id = response
+        // The header first. Not every deployment sends it yet, so the body's
+        // metadata.requestId (the same id) fills in below once it is read.
+        let header_request_id = response
             .headers()
             .get(REQUEST_ID_HEADER)
             .map(|value| clean_header(value.as_bytes(), REQUEST_ID_MAX_CHARS))
             .filter(|value| !value.is_empty());
+        exchange.request_id = header_request_id.clone();
         // Every status, before anything below can return: a deprecated SDK
         // hears about it on its errors as well as on its successes.
         if let Some(notice) = response.headers().get(NOTICE_HEADER) {
@@ -1357,7 +1313,7 @@ impl Client {
         // Stop before reading the body: a redirect's body is whatever the
         // redirecting host wanted to say, and none of it is an API response.
         if is_redirect(http_status) {
-            return Err(redirect_error(http_status));
+            return Err(redirect_error(http_status).with_request_id(header_request_id.as_deref()));
         }
 
         // Read Retry-After off the response, which means before the body is
@@ -1376,10 +1332,13 @@ impl Client {
             let code = raw
                 .get("error")
                 .and_then(|error| string_field(error, "code"));
+            let request_id = header_request_id.or_else(|| body_request_id(&raw));
+            exchange.request_id = request_id.clone();
             return Err(Error::RateLimited {
                 retry_after_seconds,
                 code,
                 raw,
+                request_id,
             });
         }
 
@@ -1388,6 +1347,7 @@ impl Client {
             return Ok(Reply::new(
                 http_status,
                 Value::Object(serde_json::Map::new()),
+                header_request_id,
             ));
         }
 
@@ -1403,6 +1363,7 @@ impl Client {
                 format!("Could not read the Dominaite API response: {error}"),
                 Some(Box::new(error)),
             )
+            .with_request_id(header_request_id.as_deref())
         })?;
 
         // A body that is not a JSON object is classified on the STATUS. A
@@ -1416,17 +1377,19 @@ impl Client {
         let envelope = match serde_json::from_str::<Value>(&raw) {
             Ok(envelope) if envelope.is_object() => envelope,
             _ if http_status >= 500 => {
-                return Err(classify_status(http_status, None, None, Value::Null))
+                return Err(classify_status(http_status, None, None, Value::Null)
+                    .with_request_id(header_request_id.as_deref()))
             }
             _ => {
-                return Err(Error::api(
-                    http_status,
-                    "The API returned a non-JSON response",
-                ))
+                return Err(
+                    Error::api(http_status, "The API returned a non-JSON response")
+                        .with_request_id(header_request_id.as_deref()),
+                )
             }
         };
 
-        let reply = Reply::new(http_status, envelope);
+        let reply = Reply::new(http_status, envelope, header_request_id);
+        exchange.request_id = reply.request_id.clone();
         // Credentials and scopes are refused the same way on every route.
         if matches!(http_status, 401 | 403) {
             return Err(reply.rejection());
@@ -1447,11 +1410,34 @@ struct Reply {
     status: u16,
     /// The whole body: `{ success, data?, error?, metadata }`.
     envelope: Value,
+    /// The `Dominaite-Request-Id` header, else `metadata.requestId`.
+    request_id: Option<String>,
 }
 
 impl Reply {
-    fn new(status: u16, envelope: Value) -> Reply {
-        Reply { status, envelope }
+    /// The header's request id wins; the body's is the fallback.
+    fn new(status: u16, envelope: Value, header_request_id: Option<String>) -> Reply {
+        let request_id = header_request_id.or_else(|| body_request_id(&envelope));
+        Reply {
+            status,
+            envelope,
+            request_id,
+        }
+    }
+
+    fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
+
+    /// One `T` from the unwrapped `data`, with `raw` and `request_id` filled
+    /// in. `what` names the object in the error.
+    fn object<T: KeepsRaw>(&self, what: &str) -> Result<T> {
+        parse_object(self.payload().clone(), self.status, what, self.request_id())
+    }
+
+    /// Every `T` of a list route, whose `data` is a JSON array.
+    fn array<T: KeepsRaw>(&self, what: &str) -> Result<Vec<T>> {
+        parse_array(self.payload().clone(), what, self.request_id())
     }
 
     /// The envelope's own `success` flag, true only when it is literally true.
@@ -1480,6 +1466,7 @@ impl Reply {
         string_field(data, "chargeId")?;
         let mut charge: PaymentMethodCharge = serde_json::from_value(data.clone()).ok()?;
         charge.raw = data.clone();
+        charge.request_id = self.request_id.clone();
         Some(charge)
     }
 
@@ -1504,6 +1491,7 @@ impl Reply {
     fn rejection(self) -> Error {
         let (code, message) = (self.error_code(), self.error_message());
         classify_status(self.status, code, message, self.envelope)
+            .with_request_id(self.request_id.as_deref())
     }
 }
 
@@ -1623,6 +1611,7 @@ fn classify_status(
             retry_after_seconds: None,
             code,
             raw,
+            request_id: None,
         },
         // The clock hint is for 401 only. A 403 was signed correctly, so the
         // key id, the secret and the clock are fine.
@@ -1712,79 +1701,107 @@ fn prepare_refund_request(request: &RefundRequest) -> Result<(String, String)> {
     Ok((idempotency_key, body))
 }
 
-/// The refund object in `data`, on the 202 and the status read alike.
-fn parse_refund(payload: Value, http_status: u16) -> Result<Refund> {
-    let mut refund: Refund = serde_json::from_value(payload.clone()).map_err(|_| {
-        Error::api(
-            http_status,
-            "The API returned an unexpected refund response",
-        )
-    })?;
-    refund.raw = payload;
-    Ok(refund)
-}
-
-/// A response type that keeps the object it was parsed from in `raw`.
+/// A response type that keeps the object it was parsed from in `raw`, and the
+/// id of the call that answered it in `request_id`.
 trait KeepsRaw: DeserializeOwned {
-    fn keep_raw(&mut self, raw: Value);
+    fn keep_raw(&mut self, raw: Value, request_id: Option<&str>);
 }
 
-impl KeepsRaw for Plan {
-    fn keep_raw(&mut self, raw: Value) {
-        self.raw = raw;
-    }
+/// [`KeepsRaw`] for a type whose `raw` and `request_id` are all there is to
+/// fill in.
+macro_rules! keeps_raw {
+    ($($ty:ty),*) => {$(
+        impl KeepsRaw for $ty {
+            fn keep_raw(&mut self, raw: Value, request_id: Option<&str>) {
+                self.raw = raw;
+                self.request_id = request_id.map(str::to_string);
+            }
+        }
+    )*};
 }
 
-impl KeepsRaw for Agreement {
-    fn keep_raw(&mut self, raw: Value) {
-        self.raw = raw;
-    }
-}
+keeps_raw!(
+    Ping,
+    IntegrationContract,
+    CheckoutSession,
+    CheckoutStatus,
+    Refund,
+    Plan,
+    Agreement,
+    WebhookEndpoint
+);
 
-impl KeepsRaw for WebhookEndpoint {
-    fn keep_raw(&mut self, raw: Value) {
+impl KeepsRaw for RefundList {
+    /// The list and each refund keep their own object and the request id.
+    fn keep_raw(&mut self, raw: Value, request_id: Option<&str>) {
+        if let Some(items) = raw.get("refunds").and_then(Value::as_array) {
+            for (refund, item_raw) in self.refunds.iter_mut().zip(items) {
+                refund.keep_raw(item_raw.clone(), request_id);
+            }
+        }
         self.raw = raw;
+        self.request_id = request_id.map(str::to_string);
     }
 }
 
 impl KeepsRaw for TransactionPage {
     /// The page keeps its own object, and each item keeps its own.
-    fn keep_raw(&mut self, raw: Value) {
+    fn keep_raw(&mut self, raw: Value, request_id: Option<&str>) {
         if let Some(items) = raw.get("items").and_then(Value::as_array) {
             for (item, item_raw) in self.items.iter_mut().zip(items) {
                 item.raw = item_raw.clone();
             }
         }
         self.raw = raw;
+        self.request_id = request_id.map(str::to_string);
     }
 }
 
-/// One `T` from the unwrapped `data`, with `raw` filled in. `what` names the
-/// object in the error.
-fn parse_object<T: KeepsRaw>(payload: Value, http_status: u16, what: &str) -> Result<T> {
+/// One `T` from `payload`, with `raw` and `request_id` filled in. `what` names
+/// the object in the error.
+fn parse_object<T: KeepsRaw>(
+    payload: Value,
+    http_status: u16,
+    what: &str,
+    request_id: Option<&str>,
+) -> Result<T> {
     let mut parsed: T = serde_json::from_value(payload.clone()).map_err(|_| {
         Error::api(
             http_status,
             format!("The API returned an unexpected {what} response"),
         )
+        .with_request_id(request_id)
     })?;
-    parsed.keep_raw(payload);
+    parsed.keep_raw(payload, request_id);
     Ok(parsed)
 }
 
 /// Every `T` of a list route, whose `data` is a JSON array. Each item keeps
-/// its own object in `raw`.
-fn parse_array<T: KeepsRaw>(payload: Value, what: &str) -> Result<Vec<T>> {
+/// its own object in `raw`, and the request id of the list.
+fn parse_array<T: KeepsRaw>(
+    payload: Value,
+    what: &str,
+    request_id: Option<&str>,
+) -> Result<Vec<T>> {
     let Value::Array(items) = payload else {
-        return Err(Error::api(
-            200,
-            format!("The API returned an unexpected {what} list"),
-        ));
+        return Err(
+            Error::api(200, format!("The API returned an unexpected {what} list"))
+                .with_request_id(request_id),
+        );
     };
     items
         .into_iter()
-        .map(|item| parse_object(item, 200, what))
+        .map(|item| parse_object(item, 200, what, request_id))
         .collect()
+}
+
+/// `metadata.requestId` in a response body.
+fn body_request_id(envelope: &Value) -> Option<String> {
+    envelope
+        .get("metadata")
+        .and_then(|metadata| string_field(metadata, "requestId"))
+        .map(|id| clean_header(id.as_bytes(), REQUEST_ID_MAX_CHARS))
+        .filter(|id| !id.is_empty())
 }
 
 /// The JSON body of a request, the exact text that gets signed.
