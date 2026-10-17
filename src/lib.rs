@@ -55,8 +55,9 @@ pub use client::{
     SESSIONS_PATH, TRANSACTIONS_PATH, VERSION, WEBHOOKS_PATH,
 };
 pub use error::{
-    auth_error_code, charge_error_code, rate_limit_error_code, refund_error_code,
-    revoke_error_code, session_error_code, Error, Result,
+    auth_error_code, charge_error_code, rate_limit_error_code, recurring_error_code,
+    refund_error_code, revoke_error_code, session_error_code, transient_error_code,
+    validation_error_code, webhook_error_code, Error, Result,
 };
 pub use idempotency::IdempotencyKey;
 pub use money::{currency_exponent, to_minor_units};
