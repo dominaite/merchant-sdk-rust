@@ -27,6 +27,11 @@ pub enum Reply {
     /// Accept the connection and hang up without answering, which is what a
     /// network failure looks like to the client.
     HangUp,
+    /// A JSON response with this status and these extra headers, verbatim.
+    /// Only the logging tests send it; tests/client.rs includes this module
+    /// without a dead_code allowance.
+    #[allow(dead_code)]
+    JsonWithHeaders(u16, String, Vec<(String, String)>),
 }
 
 impl Reply {
@@ -168,6 +173,13 @@ fn serve_one(mut stream: TcpStream, reply: Reply, recorder: &Arc<Mutex<Vec<Recor
         }
         Reply::Json(status, payload) => {
             write_body(&mut stream, status, "application/json", "", &payload);
+        }
+        Reply::JsonWithHeaders(status, payload, headers) => {
+            let extra: String = headers
+                .iter()
+                .map(|(name, value)| format!("{name}: {value}\r\n"))
+                .collect();
+            write_body(&mut stream, status, "application/json", &extra, &payload);
         }
         Reply::Html(status, payload) => {
             write_body(&mut stream, status, "text/html", "", &payload);

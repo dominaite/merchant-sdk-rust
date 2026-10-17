@@ -1012,11 +1012,11 @@ fn a_malformed_transaction_id_never_reaches_the_network() {
 #[test]
 fn credentials_with_the_wrong_prefix_are_rejected_at_construction() {
     assert!(matches!(
-        Client::new("nope", SECRET).expect_err("bad key id"),
+        Client::new("nope", SECRET, dominaite::SANDBOX_BASE_URL).expect_err("bad key id"),
         Error::Validation { .. }
     ));
     assert!(matches!(
-        Client::new(KEY_ID, "nope").expect_err("bad secret"),
+        Client::new(KEY_ID, "nope", dominaite::SANDBOX_BASE_URL).expect_err("bad secret"),
         Error::Validation { .. }
     ));
 }
@@ -1025,8 +1025,8 @@ fn credentials_with_the_wrong_prefix_are_rejected_at_construction() {
 /// travel with it.
 #[test]
 fn debug_output_never_carries_the_secret() {
-    let builder = Client::builder(KEY_ID, SECRET);
-    let client = Client::builder(KEY_ID, SECRET).build().expect("built");
+    let builder = Client::builder(KEY_ID, SECRET).base_url(dominaite::SANDBOX_BASE_URL);
+    let client = builder.clone().build().expect("built");
     let signing = SignRequest {
         secret: SECRET,
         timestamp: "1755302400",
@@ -1057,15 +1057,83 @@ fn debug_output_never_carries_the_secret() {
     }
 }
 
-#[test]
-fn an_empty_base_url_keeps_the_production_default() {
-    let client = Client::builder(KEY_ID, SECRET)
-        .base_url("")
-        .base_url("   ")
-        .build()
-        .expect("built");
+const BASE_URL_REQUIRED: &str = "base_url is required. Use https://api.staging.dominaite.com/payments for the sandbox or https://api.dominaite.com/payments for production.";
 
-    assert_eq!(client.base_url(), dominaite::DEFAULT_BASE_URL);
+fn assert_base_url_required(error: Error) {
+    match error {
+        Error::Validation { message } => assert_eq!(message, BASE_URL_REQUIRED),
+        other => panic!("expected Error::Validation, got {other:?}"),
+    }
+}
+
+/// There is no default: an unset environment variable must not send sandbox
+/// credentials to production.
+#[test]
+fn a_missing_base_url_is_rejected_at_construction() {
+    assert_base_url_required(
+        Client::builder(KEY_ID, SECRET)
+            .build()
+            .expect_err("no base URL must be rejected"),
+    );
+}
+
+#[test]
+fn an_empty_or_blank_base_url_is_rejected_at_construction() {
+    for blank in ["", "   ", "\t\n", "/", " // "] {
+        assert_base_url_required(
+            Client::builder(KEY_ID, SECRET)
+                .base_url(blank)
+                .build()
+                .expect_err(&format!("{blank:?} must be rejected")),
+        );
+        assert_base_url_required(
+            Client::new(KEY_ID, SECRET, blank).expect_err(&format!("{blank:?} must be rejected")),
+        );
+    }
+}
+
+/// The last value wins, so blanking an earlier URL does not fall back to it.
+#[test]
+fn a_blank_base_url_replaces_an_earlier_one() {
+    assert_base_url_required(
+        Client::builder(KEY_ID, SECRET)
+            .base_url(dominaite::SANDBOX_BASE_URL)
+            .base_url("")
+            .build()
+            .expect_err("a blanked base URL must be rejected"),
+    );
+}
+
+#[test]
+fn the_named_base_urls_build_and_are_reported_back() {
+    assert_eq!(
+        dominaite::SANDBOX_BASE_URL,
+        "https://api.staging.dominaite.com/payments"
+    );
+    assert_eq!(
+        dominaite::PRODUCTION_BASE_URL,
+        "https://api.dominaite.com/payments"
+    );
+    for base_url in [dominaite::SANDBOX_BASE_URL, dominaite::PRODUCTION_BASE_URL] {
+        let built = Client::builder(KEY_ID, SECRET)
+            .base_url(base_url)
+            .build()
+            .expect("built");
+        assert_eq!(built.base_url(), base_url);
+        let new = Client::new(KEY_ID, SECRET, base_url).expect("built");
+        assert_eq!(new.base_url(), base_url);
+    }
+}
+
+#[test]
+fn a_base_url_is_trimmed_of_whitespace_and_trailing_slashes() {
+    let client = Client::new(
+        KEY_ID,
+        SECRET,
+        "  https://api.staging.dominaite.com/payments//  ",
+    )
+    .expect("built");
+    assert_eq!(client.base_url(), dominaite::SANDBOX_BASE_URL);
 }
 
 /// Plaintext puts the signed headers and the cashier token on the wire for

@@ -1,7 +1,9 @@
 //! The client: signing, sending, and mapping responses onto the error taxonomy.
 
 use std::fmt;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -16,8 +18,14 @@ use crate::types::{
     WebhookEndpointRequest,
 };
 
-/// The production merchant API.
-pub const DEFAULT_BASE_URL: &str = "https://api.dominaite.com/payments";
+/// The sandbox merchant API. Use it with sandbox credentials.
+pub const SANDBOX_BASE_URL: &str = "https://api.staging.dominaite.com/payments";
+
+/// The production merchant API. Use it with production credentials.
+pub const PRODUCTION_BASE_URL: &str = "https://api.dominaite.com/payments";
+
+/// What [`ClientBuilder::build`] says when no base URL was set.
+const BASE_URL_REQUIRED: &str = "base_url is required. Use https://api.staging.dominaite.com/payments for the sandbox or https://api.dominaite.com/payments for production.";
 
 /// The canonical path that gets signed. POST creates a session; GET
 /// `SESSIONS_PATH/{transaction_id}` reads its status.
@@ -60,6 +68,9 @@ pub const TRANSACTIONS_PATH: &str = "/merchant-api/transactions";
 /// This SDK's version, reported in the User-Agent.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The compiler version, from `build.rs`, reported in the User-Agent.
+const RUSTC_VERSION: &str = env!("DOMINAITE_RUSTC_VERSION");
+
 /// Serverless cold starts hit 10+ seconds outside prod, so 45s is the floor that
 /// does not turn a cold start into a false transport failure.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(45);
@@ -85,6 +96,31 @@ impl Default for RetryOptions {
 /// What every `Debug` in this crate prints instead of the API secret.
 pub(crate) const REDACTED_SECRET: &str = "dms_***redacted***";
 
+/// What every `Debug` in this crate prints for a hook you set.
+const HOOK_SET: &str = "<fn>";
+
+/// A warning or debug sink. Shared, so a clone of the client keeps it.
+type Sink = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// The response header that tells an old SDK version to upgrade.
+const NOTICE_HEADER: &str = "dominaite-sdk-notice";
+
+/// The response header that names the call for Dominaite support.
+const REQUEST_ID_HEADER: &str = "dominaite-request-id";
+
+/// A notice header longer than this is cut before it is read.
+const NOTICE_MAX_CHARS: usize = 512;
+
+/// A request id longer than this is cut before it is logged.
+const REQUEST_ID_MAX_CHARS: usize = 128;
+
+/// How many distinct notice values one client remembers. A new value after
+/// that is not warned about, so a misbehaving server cannot grow the set.
+const NOTICE_MEMORY: usize = 32;
+
+/// A ping clock skew above this many seconds, either way, is warned about.
+const CLOCK_SKEW_WARNING_SECONDS: u64 = 60;
+
 /// Builds a [`Client`]. Start with [`Client::builder`].
 // SECURITY: do not derive Serialize. The secret field would be emitted by any
 // serde-based logger, which is how the Go SDK leaked it through json.Marshal.
@@ -92,10 +128,12 @@ pub(crate) const REDACTED_SECRET: &str = "dms_***redacted***";
 pub struct ClientBuilder {
     key_id: String,
     secret: String,
-    base_url: String,
+    base_url: Option<String>,
     timeout: Duration,
     user_agent: Option<String>,
     agent: Option<ureq::Agent>,
+    on_warning: Option<Sink>,
+    on_debug: Option<Sink>,
 }
 
 /// Hand-written so a debug-logged builder cannot leak the secret. A derived one
@@ -109,24 +147,25 @@ impl fmt::Debug for ClientBuilder {
             .field("timeout", &self.timeout)
             .field("user_agent", &self.user_agent)
             .field("agent", &self.agent)
+            .field("on_warning", &self.on_warning.as_ref().map(|_| HOOK_SET))
+            .field("on_debug", &self.on_debug.as_ref().map(|_| HOOK_SET))
             .finish()
     }
 }
 
 impl ClientBuilder {
-    /// Points the client at a non-production environment. Empty and
-    /// whitespace-only values are ignored, so you can pass an unset environment
-    /// variable straight through and still get production. Trailing slashes are
-    /// trimmed.
+    /// Sets the API the client calls: [`SANDBOX_BASE_URL`],
+    /// [`PRODUCTION_BASE_URL`] or your own value. Required: there is no default,
+    /// so an unset environment variable cannot send sandbox credentials to
+    /// production. Whitespace and trailing slashes are trimmed.
     ///
-    /// The URL has to be `https://`. [`ClientBuilder::build`] rejects anything
-    /// else with [`Error::Validation`], except plain `http://` on a loopback
-    /// host (`localhost`, `127.0.0.1`, `[::1]`) so a local mock still works.
+    /// [`ClientBuilder::build`] rejects a missing, empty or whitespace-only value
+    /// with [`Error::Validation`]. The URL also has to be `https://`, except
+    /// plain `http://` on a loopback host (`localhost`, `127.0.0.1`, `[::1]`) so
+    /// a local mock still works.
     pub fn base_url(mut self, base_url: impl AsRef<str>) -> Self {
         let trimmed = base_url.as_ref().trim().trim_end_matches('/');
-        if !trimmed.is_empty() {
-            self.base_url = trimmed.to_string();
-        }
+        self.base_url = Some(trimmed.to_string());
         self
     }
 
@@ -139,12 +178,49 @@ impl ClientBuilder {
     }
 
     /// Appends your own identifier to the SDK's User-Agent, which helps when
-    /// Dominaite support reads the access logs for your integration.
+    /// Dominaite support reads the access logs for your integration. The
+    /// User-Agent is `dominaite-rust/<version> (rust <rustc version>)`, then a
+    /// space and this suffix. Whitespace is trimmed and a blank value is
+    /// ignored. [`ClientBuilder::build`] rejects a suffix with a control
+    /// character with [`Error::Validation`].
     pub fn user_agent(mut self, user_agent: impl Into<String>) -> Self {
         let value = user_agent.into();
         if !value.trim().is_empty() {
             self.user_agent = Some(value);
         }
+        self
+    }
+
+    /// Receives the SDK's warnings, one line each: a `Dominaite-Sdk-Notice`
+    /// from the API (your SDK version is deprecated), a retry in
+    /// [`Client::create_checkout_session_with_retry`], and a ping clock skew
+    /// over 60 seconds.
+    ///
+    /// Without it, warnings go nowhere: a library must not write to your
+    /// stderr. Forward them to your logger, for example
+    /// `.on_warning(|message| log::warn!("{message}"))`.
+    ///
+    /// A line never holds the secret, the signature, a cashier token, a
+    /// request or response body, or a query string. A panic in the hook is
+    /// caught and dropped, so it cannot fail the call that triggered it.
+    pub fn on_warning(mut self, hook: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        self.on_warning = Some(Arc::new(hook));
+        self
+    }
+
+    /// Turns the debug log on: one line per HTTP request, after the answer or
+    /// the transport failure. Off by default.
+    ///
+    /// A line reads
+    /// `dominaite-rust: POST /merchant-api/checkout/sessions 201 84ms request_id=<id> idempotency_key=<key>`:
+    /// the method, the signed path without the query string, the HTTP status
+    /// (`error` when nothing came back), the time in milliseconds, the
+    /// `Dominaite-Request-Id` the API answered with, and the idempotency key
+    /// when the request sent one. Give the request id to Dominaite support to
+    /// find the call. The same never-logged list as [`ClientBuilder::on_warning`]
+    /// applies, and a panic in the hook is caught and dropped.
+    pub fn on_debug(mut self, hook: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        self.on_debug = Some(Arc::new(hook));
         self
     }
 
@@ -167,8 +243,9 @@ impl ClientBuilder {
     /// Validates the credentials and the base URL, and builds the client.
     ///
     /// Returns [`Error::Validation`] when either credential has the wrong prefix,
-    /// which catches a swapped key id and secret before anything is sent, and
-    /// when the base URL is not `https://` on a non-loopback host.
+    /// which catches a swapped key id and secret before anything is sent, when
+    /// the base URL is missing, empty or whitespace-only, and when the base URL
+    /// is not `https://` on a non-loopback host.
     pub fn build(self) -> Result<Client> {
         if !self.key_id.starts_with("dmk_") {
             return Err(Error::validation("key_id must start with dmk_"));
@@ -176,12 +253,23 @@ impl ClientBuilder {
         if !self.secret.starts_with("dms_") {
             return Err(Error::validation("secret must start with dms_"));
         }
-        if let Some(problem) = base_url_problem(&self.base_url) {
+        let base_url = match self.base_url {
+            Some(base_url) if !base_url.is_empty() => base_url,
+            _ => return Err(Error::validation(BASE_URL_REQUIRED)),
+        };
+        if let Some(problem) = base_url_problem(&base_url) {
             return Err(Error::validation(problem));
         }
 
-        let mut user_agent = format!("dominaite-rust/{VERSION}");
+        let mut user_agent = format!("dominaite-rust/{VERSION} (rust {RUSTC_VERSION})");
         if let Some(extra) = self.user_agent {
+            // Checked before the trim, so a stray "\n" is a bug you hear about,
+            // not one that is quietly cut off.
+            if extra.chars().any(char::is_control) {
+                return Err(Error::validation(
+                    "user_agent must not contain control characters",
+                ));
+            }
             user_agent.push(' ');
             user_agent.push_str(extra.trim());
         }
@@ -204,9 +292,14 @@ impl ClientBuilder {
         Ok(Client {
             key_id: self.key_id,
             secret: self.secret,
-            base_url: self.base_url,
+            base_url,
             user_agent,
             agent,
+            hooks: Hooks {
+                on_warning: self.on_warning,
+                on_debug: self.on_debug,
+                seen_notices: Arc::new(Mutex::new(Vec::new())),
+            },
         })
     }
 }
@@ -214,7 +307,8 @@ impl ClientBuilder {
 /// A server-side client for the Dominaite merchant API.
 ///
 /// Cloning is cheap and shares the underlying connection pool, so one client per
-/// process is the normal shape.
+/// process is the normal shape. A clone also shares the hooks and the record of
+/// which notices were already warned about.
 // SECURITY: do not derive Serialize. The secret field would be emitted by any
 // serde-based logger, which is how the Go SDK leaked it through json.Marshal.
 #[derive(Clone)]
@@ -224,6 +318,23 @@ pub struct Client {
     base_url: String,
     user_agent: String,
     agent: ureq::Agent,
+    hooks: Hooks,
+}
+
+/// The warning and debug sinks of one client, and the notices it already
+/// warned about.
+#[derive(Clone)]
+struct Hooks {
+    on_warning: Option<Sink>,
+    on_debug: Option<Sink>,
+    seen_notices: Arc<Mutex<Vec<String>>>,
+}
+
+/// What [`Client::send`] learned about an exchange, for the debug line.
+#[derive(Default)]
+struct Exchange {
+    status: Option<u16>,
+    request_id: Option<String>,
 }
 
 /// Hand-written so a debug-logged client cannot leak the secret. A derived one
@@ -236,28 +347,41 @@ impl fmt::Debug for Client {
             .field("base_url", &self.base_url)
             .field("user_agent", &self.user_agent)
             .field("agent", &self.agent)
+            .field(
+                "on_warning",
+                &self.hooks.on_warning.as_ref().map(|_| HOOK_SET),
+            )
+            .field("on_debug", &self.hooks.on_debug.as_ref().map(|_| HOOK_SET))
             .finish()
     }
 }
 
 impl Client {
-    /// A client on the production base URL with the default 45s timeout.
+    /// A client on `base_url` with the default 45s timeout.
     ///
-    /// Both credentials come from the dashboard's Website integration tab.
-    pub fn new(key_id: impl Into<String>, secret: impl Into<String>) -> Result<Client> {
-        Client::builder(key_id, secret).build()
+    /// Both credentials come from the dashboard's Website integration tab. Pass
+    /// [`SANDBOX_BASE_URL`] or [`PRODUCTION_BASE_URL`] to match them. A missing
+    /// or blank base URL fails with [`Error::Validation`].
+    pub fn new(
+        key_id: impl Into<String>,
+        secret: impl Into<String>,
+        base_url: impl AsRef<str>,
+    ) -> Result<Client> {
+        Client::builder(key_id, secret).base_url(base_url).build()
     }
 
-    /// A builder, for a non-production base URL, a different timeout, or your own
-    /// HTTP agent.
+    /// A builder, for a different timeout, a User-Agent suffix, or your own HTTP
+    /// agent. Set [`ClientBuilder::base_url`] before [`ClientBuilder::build`].
     pub fn builder(key_id: impl Into<String>, secret: impl Into<String>) -> ClientBuilder {
         ClientBuilder {
             key_id: key_id.into(),
             secret: secret.into(),
-            base_url: DEFAULT_BASE_URL.to_string(),
+            base_url: None,
             timeout: DEFAULT_TIMEOUT,
             user_agent: None,
             agent: None,
+            on_warning: None,
+            on_debug: None,
         }
     }
 
@@ -266,17 +390,60 @@ impl Client {
         &self.base_url
     }
 
+    /// The User-Agent this client sends:
+    /// `dominaite-rust/<version> (rust <rustc version>)`, then your suffix.
+    pub fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    /// Hands one warning to [`ClientBuilder::on_warning`], when set.
+    fn warn(&self, message: &str) {
+        if let Some(hook) = &self.hooks.on_warning {
+            call_hook(hook, message);
+        }
+    }
+
+    /// Warns about a `Dominaite-Sdk-Notice` value, once per distinct value.
+    fn notice(&self, value: &str) {
+        if value.is_empty() {
+            return;
+        }
+        {
+            // A poisoned lock only means another thread's hook panicked while it
+            // was held, which it never is: the set itself is still sound.
+            let mut seen = self
+                .hooks
+                .seen_notices
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if seen.iter().any(|known| known == value) || seen.len() >= NOTICE_MEMORY {
+                return;
+            }
+            seen.push(value.to_string());
+        }
+        // Outside the lock: the hook may take as long as it likes.
+        self.warn(&notice_message(value));
+    }
+
     /// Verifies your credentials, your signing, and your clock without creating
     /// anything. Make this your first live call: a 401 here means the key id, the
     /// secret, or the signing, and a 503 means retry later - never both at once.
     ///
-    /// Check [`Ping::clock_skew_seconds`]. Requests start failing at 300.
+    /// Check [`Ping::clock_skew_seconds`]. Requests start failing at 300. A
+    /// skew over 60 seconds either way also goes to
+    /// [`ClientBuilder::on_warning`].
     pub fn ping(&self) -> Result<Ping> {
         // GET signs an EMPTY idempotency key and an EMPTY body.
         let payload = self.request("GET", PING_PATH, "", "")?;
         let mut ping: Ping = serde_json::from_value(payload.clone())
             .map_err(|_| Error::api(200, "The API returned an unexpected ping response"))?;
         ping.raw = payload;
+        if ping.clock_skew_seconds.unsigned_abs() > CLOCK_SKEW_WARNING_SECONDS {
+            self.warn(&format!(
+                "dominaite-rust: clock skew is {} s; requests fail at 300 s. Sync this server's clock.",
+                ping.clock_skew_seconds
+            ));
+        }
         Ok(ping)
     }
 
@@ -384,10 +551,16 @@ impl Client {
             match self.create_checkout_session(request) {
                 Ok(session) => return Ok(session),
                 Err(error) if error.is_retryable() || is_processing_unavailable(&error) => {
-                    last_error = Some(error);
                     if attempt + 1 < options.attempts {
+                        self.warn(&format!(
+                            "dominaite-rust: retrying create_checkout_session_with_retry after {} (attempt {} of {})",
+                            retry_reason(&error),
+                            attempt + 2,
+                            options.attempts
+                        ));
                         std::thread::sleep(options.base_delay * 2u32.pow(attempt.min(16)));
                     }
+                    last_error = Some(error);
                 }
                 Err(error) => return Err(error),
             }
@@ -920,7 +1093,7 @@ impl Client {
     /// use dominaite::{Client, TransactionListParams};
     ///
     /// # fn main() -> Result<(), dominaite::Error> {
-    /// # let client = Client::new("dmk_0123456789abcdef0123456789abcdef", "dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")?;
+    /// # let client = Client::new("dmk_0123456789abcdef0123456789abcdef", "dms_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", dominaite::SANDBOX_BASE_URL)?;
     /// let mut params =
     ///     TransactionListParams::new("2026-10-01T00:00:00Z", "2026-10-08T00:00:00Z").limit(100);
     /// loop {
@@ -1039,6 +1212,8 @@ impl Client {
     /// error). Every other status comes back as a reply, so the payment method
     /// routes can read a 402 decline or a coded 502 as the typed answers they
     /// are, while [`Client::request`] rejects them generically.
+    ///
+    /// Writes the debug line when [`ClientBuilder::on_debug`] is set.
     fn send(
         &self,
         method: &str,
@@ -1046,6 +1221,29 @@ impl Client {
         query: &str,
         body: &str,
         idempotency_key: &str,
+    ) -> Result<Reply> {
+        let started = Instant::now();
+        let mut exchange = Exchange::default();
+        let result = self.exchange(method, path, query, body, idempotency_key, &mut exchange);
+        if let Some(hook) = &self.hooks.on_debug {
+            call_hook(
+                hook,
+                &debug_line(method, path, &exchange, started.elapsed(), idempotency_key),
+            );
+        }
+        result
+    }
+
+    /// The body of [`Client::send`]. Records the status and the request id in
+    /// `exchange`, and reads the notice header off every response.
+    fn exchange(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &str,
+        idempotency_key: &str,
+        exchange: &mut Exchange,
     ) -> Result<Reply> {
         let timestamp = unix_seconds().to_string();
         let signature = sign_request(SignRequest {
@@ -1102,6 +1300,7 @@ impl Client {
             // agent - surfaces the status here instead of as a response. Same
             // taxonomy, minus the API's message.
             Err(ureq::Error::StatusCode(status)) => {
+                exchange.status = Some(status);
                 return Err(classify_status(status, None, None, Value::Null));
             }
             Err(error) => {
@@ -1113,6 +1312,18 @@ impl Client {
         };
 
         let http_status = response.status().as_u16();
+        exchange.status = Some(http_status);
+        exchange.request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .map(|value| clean_header(value.as_bytes(), REQUEST_ID_MAX_CHARS))
+            .filter(|value| !value.is_empty());
+        // Every status, before anything below can return: a deprecated SDK
+        // hears about it on its errors as well as on its successes.
+        if let Some(notice) = response.headers().get(NOTICE_HEADER) {
+            self.notice(&clean_header(notice.as_bytes(), NOTICE_MAX_CHARS));
+        }
+
         // Stop before reading the body: a redirect's body is whatever the
         // redirecting host wanted to say, and none of it is an API response.
         if is_redirect(http_status) {
@@ -1659,6 +1870,111 @@ fn normalize_transaction_id(transaction_id: &str) -> Result<String> {
         ));
     }
     Ok(normalized)
+}
+
+/// Calls a hook and drops a panic, so a broken log sink never fails a payment
+/// call.
+fn call_hook(hook: &Sink, message: &str) {
+    let _ = catch_unwind(AssertUnwindSafe(|| hook(message)));
+}
+
+/// A header value as text: at most `max_chars` characters, control characters
+/// removed, surrounding whitespace trimmed.
+fn clean_header(bytes: &[u8], max_chars: usize) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .take(max_chars)
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// The warning for a `Dominaite-Sdk-Notice` value such as
+/// `deprecated; current="0.7.0"; sunset="2027-01-31"; info="https://..."`.
+fn notice_message(value: &str) -> String {
+    let mut parts = value.split(';').map(str::trim);
+    if !parts
+        .next()
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("deprecated"))
+    {
+        return format!("dominaite-rust {VERSION}: {value}");
+    }
+
+    let (mut current, mut sunset, mut info) = (None, None, None);
+    for part in parts {
+        let Some((key, raw)) = part.split_once('=') else {
+            continue;
+        };
+        let raw = raw.trim();
+        let raw = raw
+            .strip_prefix('"')
+            .and_then(|inner| inner.strip_suffix('"'))
+            .unwrap_or(raw)
+            .trim();
+        if raw.is_empty() {
+            continue;
+        }
+        match key.trim().to_ascii_lowercase().as_str() {
+            "current" => current = Some(raw),
+            "sunset" => sunset = Some(raw),
+            "info" => info = Some(raw),
+            _ => {}
+        }
+    }
+
+    let mut message = format!("dominaite-rust {VERSION} is deprecated");
+    if let Some(current) = current {
+        message.push_str(&format!("; upgrade to {current}"));
+    }
+    if let Some(sunset) = sunset {
+        message.push_str(&format!(" (sunset {sunset})"));
+    }
+    message.push('.');
+    if let Some(info) = info {
+        message.push_str(&format!(" {info}"));
+    }
+    message
+}
+
+/// The debug line for one exchange. Never a body, a query string or a header
+/// that signs or authenticates.
+fn debug_line(
+    method: &str,
+    path: &str,
+    exchange: &Exchange,
+    elapsed: Duration,
+    idempotency_key: &str,
+) -> String {
+    let status = exchange
+        .status
+        .map_or_else(|| "error".to_string(), |status| status.to_string());
+    let mut line = format!(
+        "dominaite-rust: {method} {path} {status} {}ms",
+        elapsed.as_millis()
+    );
+    if let Some(request_id) = &exchange.request_id {
+        line.push_str(&format!(" request_id={request_id}"));
+    }
+    if !idempotency_key.is_empty() {
+        line.push_str(&format!(" idempotency_key={idempotency_key}"));
+    }
+    line
+}
+
+/// Why a retry happens, for the warning: the error code, else the HTTP
+/// status, else the kind of error. Never the message, which may quote a body.
+fn retry_reason(error: &Error) -> String {
+    if let Some(code) = error.code() {
+        return code.to_string();
+    }
+    if let Some(status) = error.http_status() {
+        return format!("HTTP {status}");
+    }
+    match error {
+        Error::Transport { .. } => "Transport".to_string(),
+        _ => "Error".to_string(),
+    }
 }
 
 fn string_field(value: &Value, field: &str) -> Option<String> {

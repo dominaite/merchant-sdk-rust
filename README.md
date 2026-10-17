@@ -16,7 +16,7 @@ through. A git dependency works today:
 
 ```toml
 [dependencies]
-dominaite = { git = "https://github.com/dominaite/merchant-sdk-rust", tag = "v0.5.2" }
+dominaite = { git = "https://github.com/dominaite/merchant-sdk-rust", tag = "v0.6.0" }
 ```
 
 To work on the SDK itself:
@@ -86,7 +86,7 @@ Everything below is copy-paste. It assumes an empty directory and nothing instal
 
 ```sh
 cargo new my-checkout && cd my-checkout
-cargo add --git https://github.com/dominaite/merchant-sdk-rust --tag v0.5.2 dominaite
+cargo add --git https://github.com/dominaite/merchant-sdk-rust --tag v0.6.0 dominaite
 ```
 
 Set your credentials and the environment you are pointing at:
@@ -94,11 +94,16 @@ Set your credentials and the environment you are pointing at:
 ```sh
 export DOMINAITE_KEY_ID=dmk_...      # Website integration tab
 export DOMINAITE_SECRET=dms_...      # shown once when you generated the key
-# Production needs no DOMINAITE_BASE_URL - the SDK defaults to
-# https://api.dominaite.com/payments
-# For a test environment, set it to that environment's base URL:
-# export DOMINAITE_BASE_URL=https://...
+# Required. The SDK has no default base URL.
+export DOMINAITE_BASE_URL=https://api.staging.dominaite.com/payments   # sandbox
+# export DOMINAITE_BASE_URL=https://api.dominaite.com/payments         # production
 ```
+
+`DOMINAITE_BASE_URL` is required. Use `https://api.staging.dominaite.com/payments` for the
+sandbox or `https://api.dominaite.com/payments` for production. The constants
+`dominaite::SANDBOX_BASE_URL` and `dominaite::PRODUCTION_BASE_URL` hold the same two values.
+
+`DEFAULT_BASE_URL` is removed in 0.6.0. Use `PRODUCTION_BASE_URL`.
 
 A dev key against production is a guaranteed `INVALID_API_KEY`: keys are issued per
 environment.
@@ -109,13 +114,12 @@ environment.
 use dominaite::{CheckoutSessionRequest, Client, Customer, Error, IdempotencyKey};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = Client::builder(
+    let client = Client::new(
         std::env::var("DOMINAITE_KEY_ID")?,
         std::env::var("DOMINAITE_SECRET")?,
-    )
-    // An unset variable is empty, and an empty value keeps the production default.
-    .base_url(std::env::var("DOMINAITE_BASE_URL").unwrap_or_default())
-    .build()?;
+        // Required. A missing or blank value fails here with Error::Validation.
+        std::env::var("DOMINAITE_BASE_URL")?,
+    )?;
 
     // First live call: proves key, secret, signing and clock without creating anything.
     let ping = client.ping()?;
@@ -251,17 +255,51 @@ signing; a 503 means retry later. Never both at once.
 
 ## Client options
 
-`Client::new(key_id, secret)` gives you production with a 45s timeout.
+`Client::new(key_id, secret, base_url)` gives you a client on `base_url` with a 45s timeout.
 `Client::builder(key_id, secret)` takes more:
 
 | Method | What |
 |---|---|
-| `.base_url(url)` | Point at a non-production environment. Empty and whitespace-only values are ignored, so an unset env var still gives you production. |
+| `.base_url(url)` | Required. `dominaite::SANDBOX_BASE_URL` (`https://api.staging.dominaite.com/payments`), `dominaite::PRODUCTION_BASE_URL` (`https://api.dominaite.com/payments`) or your own `https://` value. `.build()` returns `Error::Validation` when it is missing, empty or whitespace-only. |
 | `.timeout(d)` | Per-request timeout. Defaults to 45s (serverless cold starts can take 10+s). |
 | `.agent(a)` | Your own `ureq::Agent`: proxy-aware transport, custom TLS, a test double. Replaces `.timeout(d)`. Redirects stay off regardless of how the agent is configured: the SDK forces `max_redirects(0)` on every request, so signed headers never cross to another host. |
-| `.user_agent(s)` | Appends your identifier to the SDK's User-Agent, which helps when support reads the access logs. |
+| `.user_agent(s)` | Appends your identifier to the SDK's User-Agent, which helps when support reads the access logs. The User-Agent is `dominaite-rust/<version> (rust <rustc version>)`, then a space and your suffix. A suffix with a control character fails `.build()` with `Error::Validation`. |
+| `.on_warning(f)` | Receives the SDK's warnings. See [Logging and warnings](#logging-and-warnings). |
+| `.on_debug(f)` | Turns on the debug log, one line per request. Off by default. |
 
-`Client` is `Clone` and cheap to clone; one per process is the normal shape.
+`Client` is `Clone` and cheap to clone; one per process is the normal shape. A clone shares the
+hooks.
+
+## Logging and warnings
+
+The SDK has two optional hooks. Each takes a closure that gets one line of text.
+
+```rust
+let client = dominaite::Client::builder(key_id, secret)
+    .base_url(dominaite::SANDBOX_BASE_URL)
+    .on_warning(|message| eprintln!("warning: {message}"))
+    .on_debug(|line| eprintln!("{line}"))
+    .build()?;
+```
+
+- `.on_warning(f)` gets three kinds of warning: a `Dominaite-Sdk-Notice` from the API, a retry
+  in `create_checkout_session_with_retry`, and a ping clock skew over 60 seconds. Without the
+  hook, warnings go nowhere, because a library must not write to your stderr. Forward them to
+  your logger.
+- `.on_debug(f)` is off by default. With it, every HTTP request writes one line: the method,
+  the signed path without the query string, the HTTP status (`error` when nothing came back),
+  the time in milliseconds, the `Dominaite-Request-Id` the API answered with, and the
+  idempotency key when the request sent one:
+  `dominaite-rust: POST /merchant-api/checkout/sessions 201 84ms request_id=<id> idempotency_key=<key>`.
+  Give the request id to Dominaite support to find the call.
+- No line ever holds the secret, the signature, a cashier token, a request or response body,
+  or a query string.
+- A panic in a hook is caught and dropped, so a broken logger cannot fail a payment call.
+
+When your SDK version is deprecated, every API response carries a `Dominaite-Sdk-Notice` header,
+on errors as well. The client warns once per distinct header value:
+`dominaite-rust 0.6.0 is deprecated; upgrade to 0.7.0 (sunset 2027-01-31). <info URL>`. An
+API that sends no header changes nothing.
 
 ## Amounts are minor units
 
