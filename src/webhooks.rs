@@ -233,7 +233,8 @@ impl WebhookEvent {
 
     /// `data` of a `payment.*` or a `verification.*` event, typed. `None` on
     /// every other event type, and when `data` does not have the documented
-    /// shape.
+    /// shape. One field of the wrong type makes the whole typed object `None`;
+    /// [`WebhookEvent::data`] still holds every field as sent.
     ///
     /// A `verification.*` event carries the payment fields of the verify-only
     /// session, with [`PaymentEventData::verify_only`] true. A verify-only
@@ -248,7 +249,10 @@ impl WebhookEvent {
     }
 
     /// `data` of a `charge.*` event, typed. `None` on every other event type,
-    /// and when `data` does not have the documented shape.
+    /// and when `data` does not have the documented shape. One field of the
+    /// wrong type, for example a string where an object belongs, makes the
+    /// whole typed object `None`; [`WebhookEvent::data`] still holds every
+    /// field as sent.
     pub fn charge_data(&self) -> Option<ChargeEventData> {
         if !self.event_type.starts_with("charge.") {
             return None;
@@ -257,7 +261,9 @@ impl WebhookEvent {
     }
 
     /// `data` of an `agreement.*` event, typed. `None` on every other event
-    /// type, and when `data` does not have the documented shape.
+    /// type, and when `data` does not have the documented shape. One field of
+    /// the wrong type makes the whole typed object `None`;
+    /// [`WebhookEvent::data`] still holds every field as sent.
     pub fn agreement_data(&self) -> Option<AgreementEventData> {
         if !self.event_type.starts_with("agreement.") {
             return None;

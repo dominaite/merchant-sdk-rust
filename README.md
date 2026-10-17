@@ -910,6 +910,11 @@ then `plan_id`, `customer_reference`, `stored_payment_method_id`, `status`, `pre
 `next_charge_at`, `activated_at`, `cancelled_at`, `version`, `sequence`). Every field but the id
 is an `Option`. Both return `None` on other event types.
 
+A typed view never fails the delivery. When one field has an unexpected type, for example
+`"paymentMethod":"visa"` where an object belongs, `payment_data()`, `charge_data()` or
+`agreement_data()` returns `None` for the whole object, not for that one field. The signature
+still verifies, and `event.data` keeps every field as sent, so read what you need from it.
+
 `payment.succeeded` (and `payment.requires_capture` for an authorization) can carry
 `data.storedPaymentMethod`, the card the payment kept on file. `stored_payment_method` (also
 `event.stored_payment_method()`) is the same `StoredPaymentMethod` that `get_status` returns

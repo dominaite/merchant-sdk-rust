@@ -51,7 +51,9 @@
   time between 0 and min(8 s, 500 ms x 2^n).
 - `WebhookEvent::charge_data()` and `WebhookEvent::agreement_data()`, with `ChargeEventData`,
   `ChargeEventPaymentMethod` and `AgreementEventData`. Every field but the id is an `Option`,
-  so explicit nulls read as `None`. `charge_outcome` holds the `outcome` values.
+  so explicit nulls read as `None`. `charge_outcome` holds the `outcome` values. One field of
+  the wrong type makes the whole typed object `None`; `WebhookEvent::data` keeps the raw data,
+  and the signature still verifies.
 - Error code constants for every code in the wire contract: the subscription refusals and
   `IDEMPOTENCY_KEY_REQUIRED` in `session_error_code`, the rest of the charge codes in
   `charge_error_code`, and the new modules `recurring_error_code`, `webhook_error_code`,
