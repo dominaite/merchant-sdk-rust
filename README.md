@@ -1186,3 +1186,23 @@ and use a fresh key.
 - `order_id` (`dom_...`) - the provider-facing correlation id. You never need it.
 - `psp_reference` - the payment processor's reference for the transaction, on `get_status` and
   `payment.*` webhooks. `None` until known; refund and cancel events carry the original sale's.
+
+## Versioning and support
+
+The crate is 0.x on purpose, and it follows Cargo's rules for 0.x versions:
+
+- A minor release (0.6 to 0.7) can contain breaking changes. `CHANGELOG.md` lists them under
+  "Breaking", with what to change.
+- A patch release (0.6.0 to 0.6.1) contains fixes and additions only.
+
+The minimum supported Rust version is 1.85 (`rust-version` in `Cargo.toml`). CI tests every
+change on 1.85 and on stable. A raise of the minimum version is a breaking change and comes in
+a minor release.
+
+The API tells you when to upgrade. When your SDK version is deprecated, API responses carry a
+`Dominaite-Sdk-Notice` header with the current version and a sunset date. The client sends it
+to your `.on_warning` hook once per distinct value (see
+[Logging and warnings](#logging-and-warnings)). Forward that hook to your logs, so the notice
+reaches someone before the sunset date. When the header is absent, nothing changes.
+
+Report security problems privately, as [SECURITY.md](SECURITY.md) says.
