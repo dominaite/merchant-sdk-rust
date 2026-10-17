@@ -17,3 +17,10 @@ updates:
     groups:
       cargo:
         patterns: ["*"]
+    ignore:
+      # sha2 0.11 needs rustc 1.88 and hmac 0.13 changes the API. Both break the MSRV (1.85).
+      # Lift these when the MSRV moves.
+      - dependency-name: sha2
+        versions: [">= 0.11"]
+      - dependency-name: hmac
+        versions: [">= 0.13"]
