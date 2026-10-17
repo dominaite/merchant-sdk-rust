@@ -65,6 +65,8 @@ fn client_for(server: &MockServer) -> Client {
     Client::builder(KEY_ID, SECRET)
         .base_url(format!("{}/api", server.base_url()))
         .timeout(Duration::from_secs(5))
+        // Retries stay on; the waits between them cost no time here.
+        .retry_sleep(|_| {})
         .build()
         .expect("valid credentials")
 }
@@ -527,6 +529,7 @@ fn charge_outcome_unknown_carries_the_transaction_to_poll() {
             charge,
             transaction_id,
             raw,
+            ..
         } => {
             assert_eq!(status, 502);
             assert_eq!(code, charge_error_code::CHARGE_OUTCOME_UNKNOWN);

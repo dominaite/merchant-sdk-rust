@@ -1,6 +1,10 @@
 //! The warning hook, the `Dominaite-Sdk-Notice` header and the debug log. What
 //! the hooks receive is the contract; none of it may carry a secret.
 
+// The deprecated create_checkout_session_with_retry keeps its tests until it
+// is removed.
+#![allow(deprecated)]
+
 #[allow(dead_code)]
 mod support;
 
@@ -228,7 +232,11 @@ fn the_debug_log_writes_one_line_per_request() {
 fn the_debug_log_reports_a_transport_failure() {
     let server = MockServer::start(vec![Reply::HangUp]);
     let debug = Lines::default();
-    let client = builder(&server).on_debug(debug.sink()).build().unwrap();
+    let client = builder(&server)
+        .on_debug(debug.sink())
+        .max_retries(0)
+        .build()
+        .unwrap();
     assert!(client.ping().is_err());
 
     let lines = debug.all();
@@ -338,8 +346,25 @@ fn a_retry_is_warned_about() {
 
     assert_eq!(
         warnings.all(),
-        vec!["dominaite-rust: retrying create_checkout_session_with_retry after HTTP 503 (attempt 2 of 3)".to_string()]
+        vec!["dominaite-rust: retrying POST /merchant-api/checkout/sessions after HTTP 503 (attempt 2 of 3)".to_string()]
     );
+}
+
+#[test]
+fn every_attempt_gets_its_own_debug_line() {
+    let server = MockServer::start(vec![Reply::HangUp, with_headers(200, ping_body(0), &[])]);
+    let debug = Lines::default();
+    let client = builder(&server)
+        .on_debug(debug.sink())
+        .retry_sleep(|_| {})
+        .build()
+        .unwrap();
+    client.ping().unwrap();
+
+    let lines = debug.all();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].starts_with("dominaite-rust: GET /merchant-api/ping error "));
+    assert!(lines[1].starts_with("dominaite-rust: GET /merchant-api/ping 200 "));
 }
 
 #[test]

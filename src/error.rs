@@ -548,9 +548,9 @@ pub enum Error {
     /// `IDEMPOTENCY_KEY_REUSED`).
     ///
     /// Never blind-retry a refusal. It will not change on its own. The one
-    /// exception is `PAYMENT_PROCESSING_UNAVAILABLE`, which is temporary:
-    /// [`create_checkout_session_with_retry`](crate::Client::create_checkout_session_with_retry)
-    /// retries it with the same key.
+    /// exception is `PAYMENT_PROCESSING_UNAVAILABLE`, which is temporary: the
+    /// client already retried it with the same key
+    /// ([`ClientBuilder::max_retries`](crate::ClientBuilder::max_retries)).
     Refusal {
         /// The machine-readable reason, e.g. `PAYMENT_PROCESSING_UNAVAILABLE`.
         code: String,
@@ -582,6 +582,9 @@ pub enum Error {
         /// # }
         /// ```
         transaction_id: Option<String>,
+        /// The id of the API call, for Dominaite support. See
+        /// [`Error::request_id`].
+        request_id: Option<String>,
     },
 
     /// The API rejected your credentials or signature (HTTP 401). Not
@@ -594,6 +597,9 @@ pub enum Error {
         code: String,
         /// The human-readable reason.
         message: String,
+        /// The id of the API call, for Dominaite support. See
+        /// [`Error::request_id`].
+        request_id: Option<String>,
     },
 
     /// The request was signed correctly, but this key may not do this (HTTP
@@ -612,6 +618,9 @@ pub enum Error {
         code: String,
         /// The reason, with what to do about it.
         message: String,
+        /// The id of the API call, for Dominaite support. See
+        /// [`Error::request_id`].
+        request_id: Option<String>,
     },
 
     /// The API answered, but with an unexpected or rejecting response. A 422
@@ -641,6 +650,9 @@ pub enum Error {
         /// `Value::Null` when the body was not JSON, and for the errors this
         /// crate raises itself.
         raw: Value,
+        /// The id of the API call, for Dominaite support. See
+        /// [`Error::request_id`].
+        request_id: Option<String>,
     },
 
     /// The gateway answered a charge with an error code instead of a charge
@@ -690,6 +702,9 @@ pub enum Error {
         transaction_id: Option<String>,
         /// The whole envelope, for fields not modelled above.
         raw: Value,
+        /// The id of the API call, for Dominaite support. See
+        /// [`Error::request_id`].
+        request_id: Option<String>,
     },
 
     /// The gateway refused to revoke a stored payment method. Nothing changed
@@ -706,6 +721,9 @@ pub enum Error {
         message: String,
         /// The whole envelope, for fields not modelled above.
         raw: Value,
+        /// The id of the API call, for Dominaite support. See
+        /// [`Error::request_id`].
+        request_id: Option<String>,
     },
 
     /// The API is rate limiting you (HTTP 429).
@@ -735,6 +753,9 @@ pub enum Error {
         /// The whole envelope, for fields not modelled above (a charge limit's
         /// `error.params`). `Value::Null` when the body was not JSON.
         raw: Value,
+        /// The id of the API call, for Dominaite support. See
+        /// [`Error::request_id`].
+        request_id: Option<String>,
     },
 
     /// A network-level failure, a timeout, or a 5xx. The request may or may not
@@ -756,6 +777,9 @@ pub enum Error {
         raw: Value,
         /// The underlying cause, when there was one.
         source: Option<Box<dyn StdError + Send + Sync>>,
+        /// The id of the API call, for Dominaite support. See
+        /// [`Error::request_id`].
+        request_id: Option<String>,
     },
 }
 
@@ -795,13 +819,63 @@ impl Error {
 
     /// True only for [`Error::Transport`], the one kind that is safe to retry
     /// blindly - and only with the SAME idempotency key.
-    /// [`create_checkout_session_with_retry`](crate::Client::create_checkout_session_with_retry)
-    /// does exactly that, and also retries the `PAYMENT_PROCESSING_UNAVAILABLE`
-    /// refusal, which this answers false for. False for [`Error::Charge`] even on a 503: those
+    /// The client already does that on every call that is safe to replay
+    /// ([`ClientBuilder::max_retries`](crate::ClientBuilder::max_retries)), so
+    /// this error means the retries ran out. The client also retries the
+    /// `PAYMENT_PROCESSING_UNAVAILABLE` refusal, which this answers false for. False for [`Error::Charge`] even on a 503: those
     /// codes each carry their own advice, and `CHARGE_OUTCOME_UNKNOWN` must be
     /// polled, never resent.
     pub fn is_retryable(&self) -> bool {
         matches!(self, Error::Transport { .. })
+    }
+
+    /// The id of the API call that answered with this error. Give it to
+    /// Dominaite support to find the call.
+    ///
+    /// It is the `Dominaite-Request-Id` response header, else `metadata.requestId`
+    /// in the body. `None` when the API sent neither, when no answer came back,
+    /// and on [`Error::Validation`], which never reached the network.
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            Error::Validation { .. } => None,
+            Error::Refusal { request_id, .. }
+            | Error::Auth { request_id, .. }
+            | Error::Forbidden { request_id, .. }
+            | Error::Api { request_id, .. }
+            | Error::Charge { request_id, .. }
+            | Error::Revoke { request_id, .. }
+            | Error::RateLimited { request_id, .. }
+            | Error::Transport { request_id, .. } => request_id.as_deref(),
+        }
+    }
+
+    /// Sets the request id, unless the error already has one. A charge
+    /// attached to the error gets it too.
+    pub(crate) fn with_request_id(mut self, id: Option<&str>) -> Error {
+        let Some(id) = id else {
+            return self;
+        };
+        match &mut self {
+            Error::Validation { .. } => {}
+            Error::Charge {
+                request_id, charge, ..
+            } => {
+                if let Some(charge) = charge {
+                    charge.request_id.get_or_insert_with(|| id.to_string());
+                }
+                request_id.get_or_insert_with(|| id.to_string());
+            }
+            Error::Refusal { request_id, .. }
+            | Error::Auth { request_id, .. }
+            | Error::Forbidden { request_id, .. }
+            | Error::Api { request_id, .. }
+            | Error::Revoke { request_id, .. }
+            | Error::RateLimited { request_id, .. }
+            | Error::Transport { request_id, .. } => {
+                request_id.get_or_insert_with(|| id.to_string());
+            }
+        }
+        self
     }
 
     pub(crate) fn validation(message: impl Into<String>) -> Error {
@@ -819,6 +893,7 @@ impl Error {
             code: code.into(),
             message: message.into(),
             transaction_id,
+            request_id: None,
         }
     }
 
@@ -826,6 +901,7 @@ impl Error {
         Error::Auth {
             code: code.into(),
             message: message.into(),
+            request_id: None,
         }
     }
 
@@ -852,7 +928,11 @@ impl Error {
                 "Access denied: this API key may not call this route.".to_string()
             }),
         };
-        Error::Forbidden { code, message }
+        Error::Forbidden {
+            code,
+            message,
+            request_id: None,
+        }
     }
 
     /// An API error with no machine-readable code: the responses this crate
@@ -863,6 +943,7 @@ impl Error {
             code: None,
             message: message.into(),
             raw: Value::Null,
+            request_id: None,
         }
     }
 
@@ -877,6 +958,7 @@ impl Error {
             code,
             message: message.into(),
             raw,
+            request_id: None,
         }
     }
 
@@ -897,6 +979,7 @@ impl Error {
                 .filter(|id| !id.is_empty()),
             charge: charge.map(Box::new),
             raw,
+            request_id: None,
         }
     }
 
@@ -911,6 +994,7 @@ impl Error {
             code: code.into(),
             message: message.into(),
             raw,
+            request_id: None,
         }
     }
 
@@ -926,6 +1010,7 @@ impl Error {
             code: None,
             raw: Value::Null,
             source,
+            request_id: None,
         }
     }
 
@@ -954,6 +1039,7 @@ impl Error {
             code,
             raw,
             source: None,
+            request_id: None,
         }
     }
 }
@@ -965,10 +1051,10 @@ impl fmt::Display for Error {
             Error::Refusal { code, message, .. } => {
                 write!(f, "checkout refused ({code}): {message}")
             }
-            Error::Auth { code, message } => {
+            Error::Auth { code, message, .. } => {
                 write!(f, "authentication failed ({code}): {message}")
             }
-            Error::Forbidden { code, message } => {
+            Error::Forbidden { code, message, .. } => {
                 write!(f, "access denied (HTTP 403, {code}): {message}")
             }
             Error::Api {

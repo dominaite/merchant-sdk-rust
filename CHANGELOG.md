@@ -4,10 +4,20 @@
 
 ### Breaking
 
-- `Error::Transport` has new `status`, `code` and `raw` fields. A `match` that lists every
-  field of the variant needs a trailing `..`. Code that builds `Error::Transport` itself, for
-  example a test double, must set the new fields. For a network failure, use `status: None`,
-  `code: None` and `raw: Value::Null`.
+- The client retries for you. Every GET and every POST that carries an idempotency key is
+  retried after a transport failure, a 5xx or `PAYMENT_PROCESSING_UNAVAILABLE`, up to 2 times
+  by default, with the same key and body. Set `ClientBuilder::max_retries(0)` for the old
+  behaviour. Webhook endpoint create, PATCH and DELETE are never retried, and neither is a
+  429.
+- The timeout is per attempt. With retries on, one call can take up to (max retries + 1) x
+  timeout, plus the waits between attempts: 3 x 45 s plus up to 1.5 s with the defaults.
+- Every `Error` variant except `Validation` has a new `request_id` field, and
+  `Error::Transport` also has `status`, `code` and `raw`. A `match` that lists every field of a
+  variant needs a trailing `..`. Code that builds an `Error` itself, for example a test double,
+  must set the new fields. For a network failure, use `status: None`, `code: None`,
+  `raw: Value::Null` and `request_id: None`.
+- Every result type has a new `request_id` field. Code that builds one with a struct literal
+  must set it.
 - A 5xx with a gateway code keeps the code: `Error::Transport` now answers `code()` and
   `http_status()`. On `charge_payment_method`, a coded 500 or 504 is now `Error::Transport`
   instead of `Error::Charge`; 502 and 503 stay `Error::Charge`. On `revoke_payment_method`, a
@@ -23,11 +33,17 @@
   is now `Error::Charge` instead of `Error::Api`.
 - `STOREFRONT_MISMATCH` on a checkout replay (an HTTP 200 refusal) is now `Error::Api` with
   `status` 200, like the 400, instead of `Error::Refusal`.
-- The retry warning of `create_checkout_session_with_retry` reads `after HTTP 503` instead of
-  `after Transport` when a 5xx without a code is retried, because the error keeps its status.
+- The retry warning names the method and the path:
+  `dominaite-rust: retrying POST /merchant-api/checkout/sessions after HTTP 503 (attempt 2 of 3)`.
 
 ### Added
 
+- `request_id` on every result and `Error::request_id()` on every error. It is the
+  `Dominaite-Request-Id` header, else `metadata.requestId` in the body. The debug line uses
+  the same fallback.
+- `ClientBuilder::max_retries(n)` (default 2), and `retry_sleep(f)` and `retry_random(f)` to
+  replace the wait and the jitter in tests. Before retry n (from 0) the client waits a random
+  time between 0 and min(8 s, 500 ms x 2^n).
 - `WebhookEvent::charge_data()` and `WebhookEvent::agreement_data()`, with `ChargeEventData`,
   `ChargeEventPaymentMethod` and `AgreementEventData`. Every field but the id is an `Option`,
   so explicit nulls read as `None`. `charge_outcome` holds the `outcome` values.
@@ -36,6 +52,12 @@
   `charge_error_code`, and the new modules `recurring_error_code`, `webhook_error_code`,
   `validation_error_code` and `transient_error_code`. A test pins them to the contract. The
   larger `REFUSALS` and `charge_error_code::ALL` arrays are listed under Breaking.
+
+### Deprecated
+
+- `Client::create_checkout_session_with_retry`. `create_checkout_session` retries on its own.
+  The wrapper still runs, with `attempts - 1` retries and its own `base_delay`; its waits are
+  now jittered and capped at 8 seconds. `RetryOptions` only serves this wrapper.
 
 ### Fixed
 

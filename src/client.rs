@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::error::{session_error_code, Error, Result};
+use crate::error::{charge_error_code, session_error_code, transient_error_code, Error, Result};
 use crate::signing::{sign_request, SignRequest};
 use crate::types::{
     Agreement, AgreementRequest, ChargeRequest, CheckoutSession, CheckoutSessionRequest,
@@ -75,12 +75,15 @@ const RUSTC_VERSION: &str = env!("DOMINAITE_RUSTC_VERSION");
 /// does not turn a cold start into a false transport failure.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// How [`Client::create_checkout_session_with_retry`] backs off.
+/// How the deprecated [`Client::create_checkout_session_with_retry`] backs off.
+/// Use [`ClientBuilder::max_retries`] instead: every call that is safe to
+/// replay is retried for you.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryOptions {
     /// Total attempts including the first. Defaults to 3.
     pub attempts: u32,
-    /// The wait before the first retry; it doubles each attempt. Defaults to 500ms.
+    /// The ceiling of the first retry's wait; it doubles on each retry, up to
+    /// 8 seconds. Defaults to 500ms.
     pub base_delay: Duration,
 }
 
@@ -93,6 +96,22 @@ impl Default for RetryOptions {
     }
 }
 
+/// How many times a call that is safe to replay is retried by default.
+const DEFAULT_MAX_RETRIES: u32 = 2;
+
+/// The ceiling of the first retry's wait. It doubles on each retry after that.
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+
+/// No retry waits longer than this.
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(8);
+
+/// How many times one call is retried, and the first wait's ceiling.
+#[derive(Debug, Clone, Copy)]
+struct RetryPolicy {
+    max_retries: u32,
+    base_delay: Duration,
+}
+
 /// What every `Debug` in this crate prints instead of the API secret.
 pub(crate) const REDACTED_SECRET: &str = "dms_***redacted***";
 
@@ -101,6 +120,12 @@ const HOOK_SET: &str = "<fn>";
 
 /// A warning or debug sink. Shared, so a clone of the client keeps it.
 type Sink = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// The wait between two attempts, injectable for tests.
+type Sleeper = Arc<dyn Fn(Duration) + Send + Sync>;
+
+/// The random number in `[0, 1)` behind the retry jitter, injectable for tests.
+type Random = Arc<dyn Fn() -> f64 + Send + Sync>;
 
 /// The response header that tells an old SDK version to upgrade.
 const NOTICE_HEADER: &str = "dominaite-sdk-notice";
@@ -134,6 +159,9 @@ pub struct ClientBuilder {
     agent: Option<ureq::Agent>,
     on_warning: Option<Sink>,
     on_debug: Option<Sink>,
+    max_retries: u32,
+    retry_sleep: Option<Sleeper>,
+    retry_random: Option<Random>,
 }
 
 /// Hand-written so a debug-logged builder cannot leak the secret. A derived one
@@ -149,6 +177,12 @@ impl fmt::Debug for ClientBuilder {
             .field("agent", &self.agent)
             .field("on_warning", &self.on_warning.as_ref().map(|_| HOOK_SET))
             .field("on_debug", &self.on_debug.as_ref().map(|_| HOOK_SET))
+            .field("max_retries", &self.max_retries)
+            .field("retry_sleep", &self.retry_sleep.as_ref().map(|_| HOOK_SET))
+            .field(
+                "retry_random",
+                &self.retry_random.as_ref().map(|_| HOOK_SET),
+            )
             .finish()
     }
 }
@@ -169,11 +203,53 @@ impl ClientBuilder {
         self
     }
 
-    /// Sets the per-request timeout. Defaults to 45 seconds. Ignored when you
-    /// supply your own [`ClientBuilder::agent`]; set the timeout on that agent's
-    /// config instead.
+    /// Sets the timeout of one attempt. Defaults to 45 seconds. Ignored when
+    /// you supply your own [`ClientBuilder::agent`]; set the timeout on that
+    /// agent's config instead.
+    ///
+    /// The timeout applies to each attempt, not to the whole call. With
+    /// retries on, one call can take up to (max retries + 1) x timeout, plus
+    /// the waits between attempts. See [`ClientBuilder::max_retries`].
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Sets how many times the client retries a call that is safe to replay.
+    /// Defaults to 2, so one call sends at most 3 requests. 0 turns retries
+    /// off.
+    ///
+    /// Safe to replay means every GET and every POST that carries an
+    /// idempotency key, except [`Client::create_webhook_endpoint`]. Every
+    /// attempt sends the same key and the same body, so a request that did
+    /// land is replayed, never repeated. PATCH and DELETE are never retried.
+    ///
+    /// The client retries a transport failure, a 5xx, and
+    /// `PAYMENT_PROCESSING_UNAVAILABLE` in both its forms (the 503 and the
+    /// checkout's HTTP 200 refusal). It never retries a 429: wait out
+    /// [`Error::RateLimited`]'s `retry_after_seconds` yourself. A charge that
+    /// answers `CHARGE_OUTCOME_UNKNOWN` or `CHARGE_FAILED` is not retried
+    /// either: read the charge back instead.
+    ///
+    /// Before retry n (counted from 0), the client waits a random time between
+    /// 0 and min(8 s, 500 ms x 2^n). Each retry goes to
+    /// [`ClientBuilder::on_warning`].
+    pub fn max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
+    /// Replaces the wait between two attempts. Defaults to
+    /// [`std::thread::sleep`]. Useful in tests, and to record or cap the waits.
+    pub fn retry_sleep(mut self, sleep: impl Fn(Duration) + Send + Sync + 'static) -> Self {
+        self.retry_sleep = Some(Arc::new(sleep));
+        self
+    }
+
+    /// Replaces the random number behind the retry jitter. Return a value in
+    /// `[0, 1)`; the client clamps anything outside it. Useful in tests.
+    pub fn retry_random(mut self, random: impl Fn() -> f64 + Send + Sync + 'static) -> Self {
+        self.retry_random = Some(Arc::new(random));
         self
     }
 
@@ -192,9 +268,8 @@ impl ClientBuilder {
     }
 
     /// Receives the SDK's warnings, one line each: a `Dominaite-Sdk-Notice`
-    /// from the API (your SDK version is deprecated), a retry in
-    /// [`Client::create_checkout_session_with_retry`], and a ping clock skew
-    /// over 60 seconds.
+    /// from the API (your SDK version is deprecated), a retry (see
+    /// [`ClientBuilder::max_retries`]), and a ping clock skew over 60 seconds.
     ///
     /// Without it, warnings go nowhere: a library must not write to your
     /// stderr. Forward them to your logger, for example
@@ -295,9 +370,15 @@ impl ClientBuilder {
             base_url,
             user_agent,
             agent,
+            retry: RetryPolicy {
+                max_retries: self.max_retries,
+                base_delay: RETRY_BASE_DELAY,
+            },
             hooks: Hooks {
                 on_warning: self.on_warning,
                 on_debug: self.on_debug,
+                retry_sleep: self.retry_sleep,
+                retry_random: self.retry_random,
                 seen_notices: Arc::new(Mutex::new(Vec::new())),
             },
         })
@@ -318,15 +399,18 @@ pub struct Client {
     base_url: String,
     user_agent: String,
     agent: ureq::Agent,
+    retry: RetryPolicy,
     hooks: Hooks,
 }
 
-/// The warning and debug sinks of one client, and the notices it already
-/// warned about.
+/// The warning and debug sinks of one client, its retry clock and dice, and
+/// the notices it already warned about.
 #[derive(Clone)]
 struct Hooks {
     on_warning: Option<Sink>,
     on_debug: Option<Sink>,
+    retry_sleep: Option<Sleeper>,
+    retry_random: Option<Random>,
     seen_notices: Arc<Mutex<Vec<String>>>,
 }
 
@@ -352,6 +436,7 @@ impl fmt::Debug for Client {
                 &self.hooks.on_warning.as_ref().map(|_| HOOK_SET),
             )
             .field("on_debug", &self.hooks.on_debug.as_ref().map(|_| HOOK_SET))
+            .field("max_retries", &self.retry.max_retries)
             .finish()
     }
 }
@@ -382,6 +467,9 @@ impl Client {
             agent: None,
             on_warning: None,
             on_debug: None,
+            max_retries: DEFAULT_MAX_RETRIES,
+            retry_sleep: None,
+            retry_random: None,
         }
     }
 
@@ -434,10 +522,9 @@ impl Client {
     /// [`ClientBuilder::on_warning`].
     pub fn ping(&self) -> Result<Ping> {
         // GET signs an EMPTY idempotency key and an EMPTY body.
-        let payload = self.request("GET", PING_PATH, "", "")?;
-        let mut ping: Ping = serde_json::from_value(payload.clone())
-            .map_err(|_| Error::api(200, "The API returned an unexpected ping response"))?;
-        ping.raw = payload;
+        let ping: Ping = self
+            .request_reply("GET", PING_PATH, "", "", "")?
+            .object("ping")?;
         if ping.clock_skew_seconds.unsigned_abs() > CLOCK_SKEW_WARNING_SECONDS {
             self.warn(&format!(
                 "dominaite-rust: clock skew is {} s; requests fail at 300 s. Sync this server's clock.",
@@ -456,11 +543,8 @@ impl Client {
     /// credentials on this route at all, so a successful read proves nothing
     /// about them: use [`Client::ping`] for that.
     pub fn get_integration_contract(&self) -> Result<IntegrationContract> {
-        let payload = self.request("GET", INTEGRATION_CONTRACT_PATH, "", "")?;
-        let mut contract: IntegrationContract = serde_json::from_value(payload.clone())
-            .map_err(|_| Error::api(200, "The API returned an unexpected integration contract"))?;
-        contract.raw = payload;
-        Ok(contract)
+        self.request_reply("GET", INTEGRATION_CONTRACT_PATH, "", "", "")?
+            .object("integration contract")
     }
 
     /// Opens a hosted checkout session for one payment.
@@ -478,14 +562,24 @@ impl Client {
     ///   and `code`. The storefront codes arrive here, e.g. a 409 with
     ///   [`session_error_code::STOREFRONT_NOT_WHITELISTED`](crate::session_error_code::STOREFRONT_NOT_WHITELISTED).
     /// - [`Error::Transport`]: network failure or 5xx. Safe to retry WITH the same
-    ///   idempotency key, which is what [`Client::create_checkout_session_with_retry`]
-    ///   does.
+    ///   idempotency key, which the client already did
+    ///   ([`ClientBuilder::max_retries`]) before it returned this.
     pub fn create_checkout_session(
         &self,
         request: &CheckoutSessionRequest,
     ) -> Result<CheckoutSession> {
+        self.checkout_session(request, self.retry)
+    }
+
+    /// [`Client::create_checkout_session`] under `policy`.
+    fn checkout_session(
+        &self,
+        request: &CheckoutSessionRequest,
+        policy: RetryPolicy,
+    ) -> Result<CheckoutSession> {
         let (idempotency_key, body) = prepare_session_request(request)?;
-        let reply = self.request_reply("POST", SESSIONS_PATH, "", &body, &idempotency_key)?;
+        let reply =
+            self.request_reply_with(policy, "POST", SESSIONS_PATH, "", &body, &idempotency_key)?;
         let payload = reply.payload();
 
         // Create is the nested shape: an inner `success` next to `checkout`.
@@ -493,14 +587,12 @@ impl Client {
         let checkout = payload.get("checkout").filter(|value| value.is_object());
 
         match (succeeded, checkout) {
-            (true, Some(checkout)) => {
-                let mut session: CheckoutSession = serde_json::from_value(checkout.clone())
-                    .map_err(|_| {
-                        Error::api(200, "The API returned an unexpected checkout object")
-                    })?;
-                session.raw = checkout.clone();
-                Ok(session)
-            }
+            (true, Some(checkout)) => parse_object(
+                checkout.clone(),
+                reply.status,
+                "checkout",
+                reply.request_id(),
+            ),
             // A storefront mismatch on a replay comes back as a 200 refusal, but
             // it is the same storefront error as the 400: one class for one code.
             _ if string_field(payload, "errorCode").as_deref()
@@ -508,12 +600,14 @@ impl Client {
             {
                 let message = string_field(payload, "errorMessage")
                     .unwrap_or_else(|| "The API key is bound to another storefront.".to_string());
+                let request_id = reply.request_id.clone();
                 Err(Error::api_with_code(
                     reply.status,
                     Some(session_error_code::STOREFRONT_MISMATCH.to_string()),
                     message,
                     reply.envelope,
-                ))
+                )
+                .with_request_id(request_id.as_deref()))
             }
             // A replay refusal names the transaction the key collided with. Carry
             // it so the caller can reconcile with get_status instead of minting a
@@ -523,19 +617,19 @@ impl Client {
                 string_field(payload, "errorMessage")
                     .unwrap_or_else(|| "The checkout session was refused.".to_string()),
                 string_field(payload, "transactionId"),
-            )),
+            )
+            .with_request_id(reply.request_id())),
         }
     }
 
-    /// Creates a session, retrying [`Error::Transport`] and the
-    /// `PAYMENT_PROCESSING_UNAVAILABLE` refusal, with THE SAME idempotency key
-    /// across every attempt.
+    /// Creates a session with its own retry settings, with THE SAME
+    /// idempotency key across every attempt.
     ///
-    /// Reusing the key is what makes the retry safe. A transport failure leaves
-    /// you not knowing whether the request landed; a key the API has already seen
-    /// never opens a second session. Every attempt sends the request's own key,
-    /// never a fresh one: a new key per attempt would be exactly the
-    /// double-charge bug this method exists to prevent.
+    /// Deprecated: [`Client::create_checkout_session`] now retries on its own
+    /// under [`ClientBuilder::max_retries`], with the same rules. This wrapper
+    /// runs that same retry loop with `options.attempts - 1` retries and
+    /// `options.base_delay` as the first wait's ceiling, whatever the client's
+    /// own setting. The waits are now jittered and capped at 8 seconds.
     ///
     /// When the first attempt did land, the retry is a replay. A clean replay of
     /// a session that is still open returns the ORIGINAL session, with the same
@@ -546,12 +640,10 @@ impl Client {
     /// and `DUPLICATE_REQUEST` means the open session cannot be handed back just
     /// yet. When the refusal names a transaction id, read it back with
     /// [`Client::get_status`] to find out what the earlier attempt did.
-    ///
-    /// `PAYMENT_PROCESSING_UNAVAILABLE` is retried in both of its forms: a 503
-    /// (already a transport error) and the HTTP 200 refusal. Card payments being
-    /// off is temporary, and nothing was created, so the same key is safe.
-    /// Every other refusal, and every authentication failure, is returned
-    /// immediately. They will not change on a retry.
+    #[deprecated(
+        since = "0.7.0",
+        note = "create_checkout_session retries on its own; set ClientBuilder::max_retries"
+    )]
     pub fn create_checkout_session_with_retry(
         &self,
         request: &CheckoutSessionRequest,
@@ -560,28 +652,11 @@ impl Client {
         if options.attempts < 1 {
             return Err(Error::validation("attempts must be at least 1"));
         }
-
-        let mut last_error = None;
-        for attempt in 0..options.attempts {
-            match self.create_checkout_session(request) {
-                Ok(session) => return Ok(session),
-                Err(error) if error.is_retryable() || is_processing_unavailable(&error) => {
-                    if attempt + 1 < options.attempts {
-                        self.warn(&format!(
-                            "dominaite-rust: retrying create_checkout_session_with_retry after {} (attempt {} of {})",
-                            retry_reason(&error),
-                            attempt + 2,
-                            options.attempts
-                        ));
-                        std::thread::sleep(options.base_delay * 2u32.pow(attempt.min(16)));
-                    }
-                    last_error = Some(error);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| Error::transport("Retrying gave up", None)))
+        let policy = RetryPolicy {
+            max_retries: options.attempts - 1,
+            base_delay: options.base_delay,
+        };
+        self.checkout_session(request, policy)
     }
 
     /// Reads the payment status of one of your checkout sessions.
@@ -602,12 +677,8 @@ impl Client {
         // GET signs an EMPTY idempotency key and an EMPTY body, and sends no
         // Idempotency-Key header.
         let path = format!("{SESSIONS_PATH}/{normalized}");
-        let payload = self.request("GET", &path, "", "")?;
-
-        let mut status: CheckoutStatus = serde_json::from_value(payload.clone())
-            .map_err(|_| Error::api(200, "The API returned an unexpected status response"))?;
-        status.raw = payload;
-        Ok(status)
+        self.request_reply("GET", &path, "", "", "")?
+            .object("status")
     }
 
     /// Charges a card kept on file, off-session: no widget, no payer present.
@@ -675,13 +746,11 @@ impl Client {
                 let message = reply
                     .error_message()
                     .unwrap_or_else(|| "The charge was refused.".to_string());
-                return Err(Error::charge(
-                    reply.status,
-                    code,
-                    message,
-                    charge,
-                    reply.envelope,
-                ));
+                let request_id = reply.request_id.clone();
+                return Err(
+                    Error::charge(reply.status, code, message, charge, reply.envelope)
+                        .with_request_id(request_id.as_deref()),
+                );
             }
             return Err(reply.rejection());
         }
@@ -689,7 +758,8 @@ impl Client {
         Err(Error::api(
             reply.status,
             "The API answered the charge without a charge body",
-        ))
+        )
+        .with_request_id(reply.request_id()))
     }
 
     /// Revokes a card kept on file. The saved credential is deleted at the
@@ -725,7 +795,9 @@ impl Client {
             let message = reply
                 .error_message()
                 .unwrap_or_else(|| "The revoke was refused.".to_string());
-            return Err(Error::revoke(reply.status, code, message, reply.envelope));
+            let request_id = reply.request_id.clone();
+            return Err(Error::revoke(reply.status, code, message, reply.envelope)
+                .with_request_id(request_id.as_deref()));
         }
         Err(reply.rejection())
     }
@@ -759,8 +831,8 @@ impl Client {
         let transaction_id = normalize_transaction_id(transaction_id)?;
         let (idempotency_key, body) = prepare_refund_request(request)?;
         let path = format!("{PAYMENTS_PATH}/{transaction_id}/refunds");
-        let payload = self.request("POST", &path, &body, &idempotency_key)?;
-        parse_refund(payload, 202)
+        self.request_reply("POST", &path, "", &body, &idempotency_key)?
+            .object("refund")
     }
 
     /// Reads one refund of a payment: `transaction_id` is the payment,
@@ -783,8 +855,8 @@ impl Client {
         // GET signs an EMPTY idempotency key and an EMPTY body, and sends no
         // Idempotency-Key header.
         let path = format!("{PAYMENTS_PATH}/{transaction_id}/refunds/{refund_id}");
-        let payload = self.request("GET", &path, "", "")?;
-        parse_refund(payload, 200)
+        self.request_reply("GET", &path, "", "", "")?
+            .object("refund")
     }
 
     /// Lists the refunds of one payment that you created through the API,
@@ -806,16 +878,8 @@ impl Client {
     pub fn list_refunds(&self, transaction_id: &str) -> Result<RefundList> {
         let transaction_id = normalize_transaction_id(transaction_id)?;
         let path = format!("{PAYMENTS_PATH}/{transaction_id}/refunds");
-        let payload = self.request("GET", &path, "", "")?;
-        let mut list: RefundList = serde_json::from_value(payload.clone())
-            .map_err(|_| Error::api(200, "The API returned an unexpected refund list"))?;
-        if let Some(items) = payload.get("refunds").and_then(Value::as_array) {
-            for (refund, raw) in list.refunds.iter_mut().zip(items) {
-                refund.raw = raw.clone();
-            }
-        }
-        list.raw = payload;
-        Ok(list)
+        self.request_reply("GET", &path, "", "", "")?
+            .object("refund list")
     }
 
     /// Creates a subscription plan: a price and a billing interval you sell.
@@ -860,9 +924,14 @@ impl Client {
             ));
         }
         let body = json_body(request)?;
-        let (status, payload) =
-            self.request_with_status("POST", PLANS_PATH, &body, request.idempotency_key.as_str())?;
-        parse_object(payload, status, "plan")
+        self.request_reply(
+            "POST",
+            PLANS_PATH,
+            "",
+            &body,
+            request.idempotency_key.as_str(),
+        )?
+        .object("plan")
     }
 
     /// Lists your plans: at most 200, active first, and the newest first
@@ -872,8 +941,8 @@ impl Client {
     /// Errors it returns: as [`Client::get_plan`], without the 404.
     pub fn list_plans(&self) -> Result<Vec<Plan>> {
         // GET signs an EMPTY idempotency key and an EMPTY body.
-        let payload = self.request("GET", PLANS_PATH, "", "")?;
-        parse_array(payload, "plan")
+        self.request_reply("GET", PLANS_PATH, "", "", "")?
+            .array("plan")
     }
 
     /// Reads one plan, archived ones too.
@@ -889,8 +958,7 @@ impl Client {
     ///   again.
     pub fn get_plan(&self, plan_id: &str) -> Result<Plan> {
         let path = plan_path(plan_id)?;
-        let payload = self.request("GET", &path, "", "")?;
-        parse_object(payload, 200, "plan")
+        self.request_reply("GET", &path, "", "", "")?.object("plan")
     }
 
     /// Changes the name, the trial or the cancel page of a plan, and answers
@@ -907,8 +975,8 @@ impl Client {
         let path = plan_path(plan_id)?;
         let body = json_body(update)?;
         // PATCH signs an EMPTY idempotency key, like GET, but signs its body.
-        let payload = self.request("PATCH", &path, &body, "")?;
-        parse_object(payload, 200, "plan")
+        self.request_reply("PATCH", &path, "", &body, "")?
+            .object("plan")
     }
 
     /// Archives a plan: it accepts no new agreements, and the agreements it
@@ -921,7 +989,7 @@ impl Client {
         let path = plan_path(plan_id)?;
         // DELETE signs an EMPTY idempotency key and an EMPTY body; the answer
         // is a 204 with no body.
-        self.request("DELETE", &path, "", "")?;
+        self.request_reply("DELETE", &path, "", "", "")?;
         Ok(())
     }
 
@@ -961,13 +1029,14 @@ impl Client {
             ));
         }
         let body = json_body(request)?;
-        let (status, payload) = self.request_with_status(
+        self.request_reply(
             "POST",
             AGREEMENTS_PATH,
+            "",
             &body,
             request.idempotency_key.as_str(),
-        )?;
-        parse_object(payload, status, "agreement")
+        )?
+        .object("agreement")
     }
 
     /// Reads one agreement: its status, its next charge, why it is past due,
@@ -984,8 +1053,8 @@ impl Client {
     ///   again.
     pub fn get_agreement(&self, agreement_id: &str) -> Result<Agreement> {
         let path = agreement_path(agreement_id)?;
-        let payload = self.request("GET", &path, "", "")?;
-        parse_object(payload, 200, "agreement")
+        self.request_reply("GET", &path, "", "", "")?
+            .object("agreement")
     }
 
     /// Cancels an agreement that is pending, active or past due. No further
@@ -999,7 +1068,7 @@ impl Client {
         let path = agreement_path(agreement_id)?;
         // DELETE signs an EMPTY idempotency key and an EMPTY body; the answer
         // is a 204 with no body.
-        self.request("DELETE", &path, "", "")?;
+        self.request_reply("DELETE", &path, "", "", "")?;
         Ok(())
     }
 
@@ -1013,9 +1082,10 @@ impl Client {
     ///
     /// The endpoint carries the request's required `Idempotency-Key`. The same
     /// key with the same url and events answers the same endpoint without its
-    /// secret, and registers nothing new. After a timeout or a 503, send it
-    /// again WITH THE SAME KEY: the retry replaces an endpoint that the lost
-    /// attempt registered, and answers a new endpoint with a new secret.
+    /// secret, and registers nothing new. The client never retries this call
+    /// (see [`ClientBuilder::max_retries`]). After a timeout or a 503, send it
+    /// again yourself WITH THE SAME KEY. If the answer has no secret, delete
+    /// that endpoint and create it again with a new key.
     ///
     /// Errors it returns:
     /// - [`Error::Validation`]: an empty url or no events; nothing was sent.
@@ -1048,13 +1118,14 @@ impl Client {
             ));
         }
         let body = json_body(request)?;
-        let (status, payload) = self.request_with_status(
+        self.request_reply(
             "POST",
             WEBHOOKS_PATH,
+            "",
             &body,
             request.idempotency_key.as_str(),
-        )?;
-        parse_object(payload, status, "webhook endpoint")
+        )?
+        .object("webhook endpoint")
     }
 
     /// Lists your webhook endpoints, the newest first: every active endpoint
@@ -1065,8 +1136,8 @@ impl Client {
     /// 404.
     pub fn list_webhook_endpoints(&self) -> Result<Vec<WebhookEndpoint>> {
         // GET signs an EMPTY idempotency key and an EMPTY body.
-        let payload = self.request("GET", WEBHOOKS_PATH, "", "")?;
-        parse_array(payload, "webhook endpoint")
+        self.request_reply("GET", WEBHOOKS_PATH, "", "", "")?
+            .array("webhook endpoint")
     }
 
     /// Deletes a webhook endpoint. It stops receiving deliveries.
@@ -1084,7 +1155,7 @@ impl Client {
         let path = webhook_endpoint_path(webhook_id)?;
         // DELETE signs an EMPTY idempotency key and an EMPTY body; the answer
         // is a 204 with no body.
-        self.request("DELETE", &path, "", "")?;
+        self.request_reply("DELETE", &path, "", "", "")?;
         Ok(())
     }
 
@@ -1171,54 +1242,15 @@ impl Client {
         }
         // GET signs the path only, with an EMPTY idempotency key and an EMPTY
         // body. The query string is not signed.
-        let (_, payload) = self.request_with_query("GET", TRANSACTIONS_PATH, &query, "", "")?;
-        parse_object(payload, 200, "transaction page")
+        self.request_reply("GET", TRANSACTIONS_PATH, &query, "", "")?
+            .object("transaction page")
     }
 
     /// Signs and sends one call, and maps the response onto the error taxonomy:
     /// [`Client::send`] plus the generic rejection for any 4xx or 5xx. The
-    /// unwrapped `data` comes back on success (an empty object for a 204).
-    /// `body` and `idempotency_key` are both empty for GET and DELETE.
-    fn request(
-        &self,
-        method: &str,
-        path: &str,
-        body: &str,
-        idempotency_key: &str,
-    ) -> Result<Value> {
-        self.request_with_status(method, path, body, idempotency_key)
-            .map(|(_, payload)| payload)
-    }
-
-    /// [`Client::request`], plus the HTTP status of the answer, for the routes
-    /// that answer a create and its replay with different statuses.
-    fn request_with_status(
-        &self,
-        method: &str,
-        path: &str,
-        body: &str,
-        idempotency_key: &str,
-    ) -> Result<(u16, Value)> {
-        self.request_with_query(method, path, "", body, idempotency_key)
-    }
-
-    /// [`Client::request_with_status`] with a query string. The query goes
-    /// into the URL and never into the signature. `query` is already
-    /// encoded, without the `?`.
-    fn request_with_query(
-        &self,
-        method: &str,
-        path: &str,
-        query: &str,
-        body: &str,
-        idempotency_key: &str,
-    ) -> Result<(u16, Value)> {
-        let reply = self.request_reply(method, path, query, body, idempotency_key)?;
-        Ok((reply.status, reply.payload().clone()))
-    }
-
-    /// [`Client::send`] plus the generic rejection for any 4xx or 5xx, for
-    /// the routes that read more of the answer than the unwrapped `data`.
+    /// reply carries the unwrapped `data` (an empty object for a 204) and the
+    /// request id. `query` is already encoded, without the `?`, and is never
+    /// signed. `body` and `idempotency_key` are both empty for GET and DELETE.
     fn request_reply(
         &self,
         method: &str,
@@ -1227,11 +1259,108 @@ impl Client {
         body: &str,
         idempotency_key: &str,
     ) -> Result<Reply> {
-        let reply = self.send(method, path, query, body, idempotency_key)?;
+        let policy = self.policy_for(method, path, idempotency_key);
+        self.request_reply_with(policy, method, path, query, body, idempotency_key)
+    }
+
+    /// [`Client::request_reply`] under `policy`.
+    fn request_reply_with(
+        &self,
+        policy: RetryPolicy,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &str,
+        idempotency_key: &str,
+    ) -> Result<Reply> {
+        let reply = self.send_with(policy, method, path, query, body, idempotency_key)?;
         if reply.status >= 400 {
             return Err(reply.rejection());
         }
         Ok(reply)
+    }
+
+    /// The client's retry policy when the call is safe to replay, else none.
+    ///
+    /// Safe means a GET, or a POST with an idempotency key: the API answers a
+    /// key it has seen with the first answer. Webhook endpoint create is the
+    /// exception. The API keeps its first answer without the signing secret,
+    /// so a replay after a lost answer comes back with no secret. The caller
+    /// must see the timeout to know that the secret is lost.
+    fn policy_for(&self, method: &str, path: &str, idempotency_key: &str) -> RetryPolicy {
+        let replayable = method == "GET"
+            || (method == "POST" && !idempotency_key.is_empty() && path != WEBHOOKS_PATH);
+        RetryPolicy {
+            max_retries: if replayable {
+                self.retry.max_retries
+            } else {
+                0
+            },
+            ..self.retry
+        }
+    }
+
+    /// [`Client::send`] under the client's policy for this call.
+    fn send(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &str,
+        idempotency_key: &str,
+    ) -> Result<Reply> {
+        let policy = self.policy_for(method, path, idempotency_key);
+        self.send_with(policy, method, path, query, body, idempotency_key)
+    }
+
+    /// Sends the call, and again while the answer is worth retrying and
+    /// `policy` allows. Every attempt is signed afresh over the same method,
+    /// path, idempotency key and body; only the timestamp moves. Returns the
+    /// last answer, whatever it is.
+    fn send_with(
+        &self,
+        policy: RetryPolicy,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: &str,
+        idempotency_key: &str,
+    ) -> Result<Reply> {
+        let mut retry = 0;
+        loop {
+            let result = self.send_once(method, path, query, body, idempotency_key);
+            let reason = match &result {
+                Ok(reply) => reply_retry_reason(reply),
+                Err(error @ Error::Transport { .. }) => Some(retry_reason(error)),
+                Err(_) => None,
+            };
+            match reason {
+                Some(reason) if retry < policy.max_retries => {
+                    self.warn(&format!(
+                        "dominaite-rust: retrying {method} {path} after {reason} (attempt {} of {})",
+                        retry + 2,
+                        policy.max_retries + 1
+                    ));
+                    self.pause(retry, policy.base_delay);
+                    retry += 1;
+                }
+                _ => return result,
+            }
+        }
+    }
+
+    /// Waits before retry `retry` (counted from 0): full jitter under a
+    /// doubling ceiling.
+    fn pause(&self, retry: u32, base_delay: Duration) {
+        let random = match &self.hooks.retry_random {
+            Some(random) => random(),
+            None => default_random(),
+        };
+        let delay = backoff_delay(retry, base_delay, random);
+        match &self.hooks.retry_sleep {
+            Some(sleep) => sleep(delay),
+            None => std::thread::sleep(delay),
+        }
     }
 
     /// Signs and sends one call, and parses whatever came back into a [`Reply`].
@@ -1241,10 +1370,10 @@ impl Client {
     /// of that kind is a retryable transport error; anything else is an API
     /// error). Every other status comes back as a reply, so the payment method
     /// routes can read a 402 decline or a coded 502 as the typed answers they
-    /// are, while [`Client::request`] rejects them generically.
+    /// are, while [`Client::request_reply`] rejects them generically.
     ///
     /// Writes the debug line when [`ClientBuilder::on_debug`] is set.
-    fn send(
+    fn send_once(
         &self,
         method: &str,
         path: &str,
@@ -1343,11 +1472,14 @@ impl Client {
 
         let http_status = response.status().as_u16();
         exchange.status = Some(http_status);
-        exchange.request_id = response
+        // The header first. Not every deployment sends it yet, so the body's
+        // metadata.requestId (the same id) fills in below once it is read.
+        let header_request_id = response
             .headers()
             .get(REQUEST_ID_HEADER)
             .map(|value| clean_header(value.as_bytes(), REQUEST_ID_MAX_CHARS))
             .filter(|value| !value.is_empty());
+        exchange.request_id = header_request_id.clone();
         // Every status, before anything below can return: a deprecated SDK
         // hears about it on its errors as well as on its successes.
         if let Some(notice) = response.headers().get(NOTICE_HEADER) {
@@ -1357,7 +1489,7 @@ impl Client {
         // Stop before reading the body: a redirect's body is whatever the
         // redirecting host wanted to say, and none of it is an API response.
         if is_redirect(http_status) {
-            return Err(redirect_error(http_status));
+            return Err(redirect_error(http_status).with_request_id(header_request_id.as_deref()));
         }
 
         // Read Retry-After off the response, which means before the body is
@@ -1376,10 +1508,13 @@ impl Client {
             let code = raw
                 .get("error")
                 .and_then(|error| string_field(error, "code"));
+            let request_id = header_request_id.or_else(|| body_request_id(&raw));
+            exchange.request_id = request_id.clone();
             return Err(Error::RateLimited {
                 retry_after_seconds,
                 code,
                 raw,
+                request_id,
             });
         }
 
@@ -1388,6 +1523,7 @@ impl Client {
             return Ok(Reply::new(
                 http_status,
                 Value::Object(serde_json::Map::new()),
+                header_request_id,
             ));
         }
 
@@ -1403,6 +1539,7 @@ impl Client {
                 format!("Could not read the Dominaite API response: {error}"),
                 Some(Box::new(error)),
             )
+            .with_request_id(header_request_id.as_deref())
         })?;
 
         // A body that is not a JSON object is classified on the STATUS. A
@@ -1410,23 +1547,25 @@ impl Client {
         // host, not from the API, so the body is an HTML error page or empty;
         // reading it as "the API returned a non-JSON response" would make a
         // non-retryable Api error out of what is plainly a retryable outage,
-        // and the with_retry helper would give up on the first attempt. A JSON
+        // and the client's retries would give up on the first attempt. A JSON
         // 5xx is different: that is the gateway itself talking, and the payment
         // method routes need its code.
         let envelope = match serde_json::from_str::<Value>(&raw) {
             Ok(envelope) if envelope.is_object() => envelope,
             _ if http_status >= 500 => {
-                return Err(classify_status(http_status, None, None, Value::Null))
+                return Err(classify_status(http_status, None, None, Value::Null)
+                    .with_request_id(header_request_id.as_deref()))
             }
             _ => {
-                return Err(Error::api(
-                    http_status,
-                    "The API returned a non-JSON response",
-                ))
+                return Err(
+                    Error::api(http_status, "The API returned a non-JSON response")
+                        .with_request_id(header_request_id.as_deref()),
+                )
             }
         };
 
-        let reply = Reply::new(http_status, envelope);
+        let reply = Reply::new(http_status, envelope, header_request_id);
+        exchange.request_id = reply.request_id.clone();
         // Credentials and scopes are refused the same way on every route.
         if matches!(http_status, 401 | 403) {
             return Err(reply.rejection());
@@ -1447,11 +1586,34 @@ struct Reply {
     status: u16,
     /// The whole body: `{ success, data?, error?, metadata }`.
     envelope: Value,
+    /// The `Dominaite-Request-Id` header, else `metadata.requestId`.
+    request_id: Option<String>,
 }
 
 impl Reply {
-    fn new(status: u16, envelope: Value) -> Reply {
-        Reply { status, envelope }
+    /// The header's request id wins; the body's is the fallback.
+    fn new(status: u16, envelope: Value, header_request_id: Option<String>) -> Reply {
+        let request_id = header_request_id.or_else(|| body_request_id(&envelope));
+        Reply {
+            status,
+            envelope,
+            request_id,
+        }
+    }
+
+    fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
+
+    /// One `T` from the unwrapped `data`, with `raw` and `request_id` filled
+    /// in. `what` names the object in the error.
+    fn object<T: KeepsRaw>(&self, what: &str) -> Result<T> {
+        parse_object(self.payload().clone(), self.status, what, self.request_id())
+    }
+
+    /// Every `T` of a list route, whose `data` is a JSON array.
+    fn array<T: KeepsRaw>(&self, what: &str) -> Result<Vec<T>> {
+        parse_array(self.payload().clone(), what, self.request_id())
     }
 
     /// The envelope's own `success` flag, true only when it is literally true.
@@ -1480,6 +1642,7 @@ impl Reply {
         string_field(data, "chargeId")?;
         let mut charge: PaymentMethodCharge = serde_json::from_value(data.clone()).ok()?;
         charge.raw = data.clone();
+        charge.request_id = self.request_id.clone();
         Some(charge)
     }
 
@@ -1504,16 +1667,8 @@ impl Reply {
     fn rejection(self) -> Error {
         let (code, message) = (self.error_code(), self.error_message());
         classify_status(self.status, code, message, self.envelope)
+            .with_request_id(self.request_id.as_deref())
     }
-}
-
-/// The one refusal the session retry helper sends again: card payments are off
-/// for now and nothing was created, so the same key comes back safely later.
-fn is_processing_unavailable(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::Refusal { code, .. } if code == session_error_code::PAYMENT_PROCESSING_UNAVAILABLE
-    )
 }
 
 /// Whether a coded answer on the charge route is a charge outcome
@@ -1623,6 +1778,7 @@ fn classify_status(
             retry_after_seconds: None,
             code,
             raw,
+            request_id: None,
         },
         // The clock hint is for 401 only. A 403 was signed correctly, so the
         // key id, the secret and the clock are fine.
@@ -1712,79 +1868,107 @@ fn prepare_refund_request(request: &RefundRequest) -> Result<(String, String)> {
     Ok((idempotency_key, body))
 }
 
-/// The refund object in `data`, on the 202 and the status read alike.
-fn parse_refund(payload: Value, http_status: u16) -> Result<Refund> {
-    let mut refund: Refund = serde_json::from_value(payload.clone()).map_err(|_| {
-        Error::api(
-            http_status,
-            "The API returned an unexpected refund response",
-        )
-    })?;
-    refund.raw = payload;
-    Ok(refund)
-}
-
-/// A response type that keeps the object it was parsed from in `raw`.
+/// A response type that keeps the object it was parsed from in `raw`, and the
+/// id of the call that answered it in `request_id`.
 trait KeepsRaw: DeserializeOwned {
-    fn keep_raw(&mut self, raw: Value);
+    fn keep_raw(&mut self, raw: Value, request_id: Option<&str>);
 }
 
-impl KeepsRaw for Plan {
-    fn keep_raw(&mut self, raw: Value) {
-        self.raw = raw;
-    }
+/// [`KeepsRaw`] for a type whose `raw` and `request_id` are all there is to
+/// fill in.
+macro_rules! keeps_raw {
+    ($($ty:ty),*) => {$(
+        impl KeepsRaw for $ty {
+            fn keep_raw(&mut self, raw: Value, request_id: Option<&str>) {
+                self.raw = raw;
+                self.request_id = request_id.map(str::to_string);
+            }
+        }
+    )*};
 }
 
-impl KeepsRaw for Agreement {
-    fn keep_raw(&mut self, raw: Value) {
-        self.raw = raw;
-    }
-}
+keeps_raw!(
+    Ping,
+    IntegrationContract,
+    CheckoutSession,
+    CheckoutStatus,
+    Refund,
+    Plan,
+    Agreement,
+    WebhookEndpoint
+);
 
-impl KeepsRaw for WebhookEndpoint {
-    fn keep_raw(&mut self, raw: Value) {
+impl KeepsRaw for RefundList {
+    /// The list and each refund keep their own object and the request id.
+    fn keep_raw(&mut self, raw: Value, request_id: Option<&str>) {
+        if let Some(items) = raw.get("refunds").and_then(Value::as_array) {
+            for (refund, item_raw) in self.refunds.iter_mut().zip(items) {
+                refund.keep_raw(item_raw.clone(), request_id);
+            }
+        }
         self.raw = raw;
+        self.request_id = request_id.map(str::to_string);
     }
 }
 
 impl KeepsRaw for TransactionPage {
     /// The page keeps its own object, and each item keeps its own.
-    fn keep_raw(&mut self, raw: Value) {
+    fn keep_raw(&mut self, raw: Value, request_id: Option<&str>) {
         if let Some(items) = raw.get("items").and_then(Value::as_array) {
             for (item, item_raw) in self.items.iter_mut().zip(items) {
                 item.raw = item_raw.clone();
             }
         }
         self.raw = raw;
+        self.request_id = request_id.map(str::to_string);
     }
 }
 
-/// One `T` from the unwrapped `data`, with `raw` filled in. `what` names the
-/// object in the error.
-fn parse_object<T: KeepsRaw>(payload: Value, http_status: u16, what: &str) -> Result<T> {
+/// One `T` from `payload`, with `raw` and `request_id` filled in. `what` names
+/// the object in the error.
+fn parse_object<T: KeepsRaw>(
+    payload: Value,
+    http_status: u16,
+    what: &str,
+    request_id: Option<&str>,
+) -> Result<T> {
     let mut parsed: T = serde_json::from_value(payload.clone()).map_err(|_| {
         Error::api(
             http_status,
             format!("The API returned an unexpected {what} response"),
         )
+        .with_request_id(request_id)
     })?;
-    parsed.keep_raw(payload);
+    parsed.keep_raw(payload, request_id);
     Ok(parsed)
 }
 
 /// Every `T` of a list route, whose `data` is a JSON array. Each item keeps
-/// its own object in `raw`.
-fn parse_array<T: KeepsRaw>(payload: Value, what: &str) -> Result<Vec<T>> {
+/// its own object in `raw`, and the request id of the list.
+fn parse_array<T: KeepsRaw>(
+    payload: Value,
+    what: &str,
+    request_id: Option<&str>,
+) -> Result<Vec<T>> {
     let Value::Array(items) = payload else {
-        return Err(Error::api(
-            200,
-            format!("The API returned an unexpected {what} list"),
-        ));
+        return Err(
+            Error::api(200, format!("The API returned an unexpected {what} list"))
+                .with_request_id(request_id),
+        );
     };
     items
         .into_iter()
-        .map(|item| parse_object(item, 200, what))
+        .map(|item| parse_object(item, 200, what, request_id))
         .collect()
+}
+
+/// `metadata.requestId` in a response body.
+fn body_request_id(envelope: &Value) -> Option<String> {
+    envelope
+        .get("metadata")
+        .and_then(|metadata| string_field(metadata, "requestId"))
+        .map(|id| clean_header(id.as_bytes(), REQUEST_ID_MAX_CHARS))
+        .filter(|id| !id.is_empty())
 }
 
 /// The JSON body of a request, the exact text that gets signed.
@@ -2013,6 +2197,53 @@ fn debug_line(
 
 /// Why a retry happens, for the warning: the error code, else the HTTP
 /// status, else the kind of error. Never the message, which may quote a body.
+/// Why an answer is worth sending again, or `None` when it is final: a 5xx,
+/// or `PAYMENT_PROCESSING_UNAVAILABLE` in any form. A charge whose outcome is
+/// unknown or failed is final: it is read back, never resent.
+fn reply_retry_reason(reply: &Reply) -> Option<String> {
+    let code = reply.error_code();
+    if code.as_deref() == Some(transient_error_code::PAYMENT_PROCESSING_UNAVAILABLE) {
+        return code;
+    }
+    if reply.status < 500 {
+        return None;
+    }
+    match code.as_deref() {
+        Some(charge_error_code::CHARGE_OUTCOME_UNKNOWN | charge_error_code::CHARGE_FAILED) => None,
+        Some(code) => Some(code.to_string()),
+        None => Some(format!("HTTP {}", reply.status)),
+    }
+}
+
+/// The wait before retry `retry` (counted from 0): `random` times
+/// min(8 s, base x 2^retry). `random` is clamped to `[0, 1]`.
+fn backoff_delay(retry: u32, base_delay: Duration, random: f64) -> Duration {
+    let ceiling = base_delay
+        .saturating_mul(1u32 << retry.min(16))
+        .min(RETRY_MAX_DELAY);
+    let random = if random.is_finite() {
+        random.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    ceiling.mul_f64(random)
+}
+
+/// A random number in `[0, 1)` for the jitter, without a dependency. Each
+/// `RandomState` is keyed differently, and the clock mixes in the moment. Not
+/// for anything secret.
+fn default_random() -> f64 {
+    use std::hash::{BuildHasher, Hasher};
+
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    hasher.write_u128(nanos);
+    (hasher.finish() >> 11) as f64 / (1u64 << 53) as f64
+}
+
 fn retry_reason(error: &Error) -> String {
     if let Some(code) = error.code() {
         return code.to_string();

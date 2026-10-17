@@ -23,6 +23,8 @@ fn client_for(server: &MockServer) -> Client {
     Client::builder(KEY_ID, SECRET)
         .base_url(server.base_url())
         .timeout(Duration::from_secs(5))
+        // Retries stay on; the waits between them cost no time here.
+        .retry_sleep(|_| {})
         .build()
         .expect("valid credentials")
 }
@@ -167,6 +169,7 @@ fn a_storefront_mismatch_on_a_replay_is_a_storefront_error() {
             code,
             message,
             raw,
+            ..
         } => {
             assert_eq!(*status, 200);
             assert_eq!(code.as_deref(), Some(mismatch));

@@ -422,6 +422,12 @@ pub struct CheckoutSession {
     /// The unparsed payload, for fields this struct does not model yet.
     #[serde(skip)]
     pub raw: Value,
+
+    /// The id of the API call that answered with this, for Dominaite support:
+    /// the `Dominaite-Request-Id` header, else `metadata.requestId` in the
+    /// body. `None` when the API sent neither.
+    #[serde(skip)]
+    pub request_id: Option<String>,
 }
 
 /// How the payer enters the card on a checkout session.
@@ -626,6 +632,12 @@ pub struct CheckoutStatus {
     /// The unparsed payload, for fields this struct does not model yet.
     #[serde(skip)]
     pub raw: Value,
+
+    /// The id of the API call that answered with this, for Dominaite support:
+    /// the `Dominaite-Request-Id` header, else `metadata.requestId` in the
+    /// body. `None` when the API sent neither.
+    #[serde(skip)]
+    pub request_id: Option<String>,
 }
 
 impl CheckoutStatus {
@@ -688,6 +700,12 @@ pub struct Ping {
     /// The unparsed payload, for fields this struct does not model yet.
     #[serde(skip)]
     pub raw: Value,
+
+    /// The id of the API call that answered with this, for Dominaite support:
+    /// the `Dominaite-Request-Id` header, else `metadata.requestId` in the
+    /// body. `None` when the API sent neither.
+    #[serde(skip)]
+    pub request_id: Option<String>,
 }
 
 /// What [`Client::get_integration_contract`](crate::Client::get_integration_contract)
@@ -717,6 +735,12 @@ pub struct IntegrationContract {
     /// The whole contract as sent.
     #[serde(skip)]
     pub raw: Value,
+
+    /// The id of the API call that answered with this, for Dominaite support:
+    /// the `Dominaite-Request-Id` header, else `metadata.requestId` in the
+    /// body. `None` when the API sent neither.
+    #[serde(skip)]
+    pub request_id: Option<String>,
 }
 
 /// Stored payment method status wire values, on [`StoredPaymentMethod::status`].
@@ -983,6 +1007,12 @@ pub struct PaymentMethodCharge {
     /// struct does not model yet.
     #[serde(skip)]
     pub raw: Value,
+
+    /// The id of the API call that answered with this, for Dominaite support:
+    /// the `Dominaite-Request-Id` header, else `metadata.requestId` in the
+    /// body. `None` when the API sent neither.
+    #[serde(skip)]
+    pub request_id: Option<String>,
 }
 
 impl PaymentMethodCharge {
@@ -1164,6 +1194,12 @@ pub struct Refund {
     /// struct does not model yet.
     #[serde(skip)]
     pub raw: Value,
+
+    /// The id of the API call that answered with this, for Dominaite support:
+    /// the `Dominaite-Request-Id` header, else `metadata.requestId` in the
+    /// body. `None` when the API sent neither.
+    #[serde(skip)]
+    pub request_id: Option<String>,
 }
 
 impl Refund {
@@ -1232,6 +1268,12 @@ pub struct RefundList {
     /// not model yet.
     #[serde(skip)]
     pub raw: Value,
+
+    /// The id of the API call that answered with this, for Dominaite support:
+    /// the `Dominaite-Request-Id` header, else `metadata.requestId` in the
+    /// body. `None` when the API sent neither.
+    #[serde(skip)]
+    pub request_id: Option<String>,
 }
 
 /// The parameters for [`Client::create_plan`](crate::Client::create_plan): a
@@ -1471,6 +1513,12 @@ pub struct Plan {
     /// struct does not model yet.
     #[serde(skip)]
     pub raw: Value,
+
+    /// The id of the API call that answered with this, for Dominaite support:
+    /// the `Dominaite-Request-Id` header, else `metadata.requestId` in the
+    /// body. `None` when the API sent neither.
+    #[serde(skip)]
+    pub request_id: Option<String>,
 }
 
 impl Plan {
@@ -1709,6 +1757,12 @@ pub struct Agreement {
     /// struct does not model yet.
     #[serde(skip)]
     pub raw: Value,
+
+    /// The id of the API call that answered with this, for Dominaite support:
+    /// the `Dominaite-Request-Id` header, else `metadata.requestId` in the
+    /// body. `None` when the API sent neither.
+    #[serde(skip)]
+    pub request_id: Option<String>,
 }
 
 impl Agreement {
@@ -1858,8 +1912,8 @@ pub struct WebhookEndpointRequest {
 
     /// Required. It travels in the header and in the signature, never in the
     /// body. After a timeout or a 503, send the request again WITH THE SAME
-    /// KEY: the retry replaces an endpoint that the lost attempt registered. A
-    /// new key cannot do that. Use a fresh key for each new endpoint.
+    /// KEY. If the answer has no secret, delete that endpoint and create it
+    /// again with a new key. Use a fresh key for each new endpoint.
     #[serde(skip)]
     pub idempotency_key: IdempotencyKey,
 
@@ -1931,6 +1985,12 @@ pub struct WebhookEndpoint {
     /// struct does not model yet. It holds the secret too, when there is one.
     #[serde(skip)]
     pub raw: Value,
+
+    /// The id of the API call that answered with this, for Dominaite support:
+    /// the `Dominaite-Request-Id` header, else `metadata.requestId` in the
+    /// body. `None` when the API sent neither.
+    #[serde(skip)]
+    pub request_id: Option<String>,
 }
 
 impl fmt::Debug for WebhookEndpoint {
@@ -1950,6 +2010,7 @@ impl fmt::Debug for WebhookEndpoint {
                 &self.secret.as_ref().map(|_| REDACTED_WEBHOOK_SECRET),
             )
             .field("raw", &raw)
+            .field("request_id", &self.request_id)
             .finish()
     }
 }
@@ -2134,6 +2195,12 @@ pub struct TransactionPage {
     /// not model yet.
     #[serde(skip)]
     pub raw: Value,
+
+    /// The id of the API call that answered with this, for Dominaite support:
+    /// the `Dominaite-Request-Id` header, else `metadata.requestId` in the
+    /// body. `None` when the API sent neither.
+    #[serde(skip)]
+    pub request_id: Option<String>,
 }
 
 /// One payment in a [`TransactionPage`]. The fields and values agree with the

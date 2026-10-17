@@ -163,6 +163,8 @@ fn client_for(server: &MockServer) -> Client {
     Client::builder(KEY_ID, SECRET)
         .base_url(server.base_url())
         .timeout(Duration::from_secs(5))
+        // Retries stay on; the waits between them cost no time here.
+        .retry_sleep(|_| {})
         .build()
         .expect("valid credentials")
 }
@@ -377,6 +379,7 @@ fn the_refusal_example_comes_back_as_a_refusal_with_its_transaction() {
             code,
             message,
             transaction_id,
+            ..
         } => {
             assert_eq!(code, "DUPLICATE_REQUEST");
             assert_eq!(message, "An identical request was already processed.");
@@ -888,6 +891,7 @@ fn every_charge_error_example_comes_back_as_a_charge_error() {
                     charge,
                     transaction_id,
                     raw,
+                    ..
                 } => {
                     assert_eq!(status, http_status, "{label}");
                     assert_eq!(got, code, "{label}");
@@ -1008,6 +1012,7 @@ fn every_revoke_error_example_comes_back_as_a_revoke_error() {
                     code: got,
                     message,
                     raw,
+                    ..
                 } => {
                     assert_eq!(status, http_status, "{label}");
                     assert_eq!(got, code, "{label}");
